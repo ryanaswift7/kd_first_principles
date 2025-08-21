@@ -1,0 +1,80 @@
+teacher_name: EleutherAI/pythia-1.4b-deduped
+students: 
+  layer_reduction:
+    name: EleutherAI/pythia-1.4b-deduped
+    factor: 0.33
+  dim_reduction:
+    name: EleutherAI/pythia-410m-deduped
+
+hook_points:
+  single:
+    - "hook_embed"
+  per_layer:
+    - "attn.hook_attn_scores"
+    - "hook_attn_out"
+    - "hook_mlp_out"
+    - "hook_resid_post"
+
+projection:
+  directions: ["up", "down"]
+  training_methods: ["online", "offline"]
+
+objective_weight_variants:
+  - "only_outputs"
+  - "balanced"
+  - "no_embed"
+  - "no_attn"
+  - "no_mlp"
+  - "no_resid"
+  - "with_embed"
+  - "with_attn"
+  - "with_mlp"
+  - "with_resid"
+
+jsd_betas: [0.0, 0.25, 0.5, 0.75, 1.0]
+
+hyperparams:
+  lr:
+    min: 1e-8
+    max: 1e-4
+    log: true
+  weight_decay:
+    min: 1e-6
+    max: 1.0
+    log: true
+  temperature:
+    min: 1e-2
+    max: 2.0
+    log: false
+  max_grad_norm:
+    min: 0.1
+    max: 2.0
+    log: false
+
+
+
+tasks:
+  hellaswag:
+    dataset: Rowan/hellaswag
+  boolq:
+    dataset: google/boolq
+  piqa:
+    dataset: ybisk/piqa
+  triviaqa:
+    dataset: mandarjoshi/trivia_qa
+  arc_easy:
+    dataset: allenai/ai2_arc
+    subset: ARC-Easy
+  arc_challenge:
+    dataset: allenai/ai2_arc
+    subset: ARC-Challenge
+  winogrande:
+    dataset: allenai/winogrande
+    subset: winogrande_debiased
+  sciq:
+    dataset: allenai/sciq
+  logiqa:
+    dataset: lucasmccabe/logiqa
+
+
+  
