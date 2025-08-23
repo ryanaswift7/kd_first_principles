@@ -1,22 +1,66 @@
 from argparse import ArgumentParser
-from schemas.globalConfig import GlobalConfig
-def parse_args():
-    parser = ArgumentParser("Run experiment pipeline.")
-    parser.add_argument(
-        "--config", "-c",
-        required=True,
-        help="Path to YAML configuration file",
-    )
+from kdfp.schemas.globalConfig import GlobalConfig
+import pandas as pd
+# from core.initalization import init_teacher, init_offline_projector
+# from core.analysis import analyze
+
+DEFAULT_CONFIG = 'kdfp/config.yaml'
+
+def parse_cli_args():
+    """Parse CLI arguments for the kdfp command"""
+    parser = ArgumentParser(description='KDFP Command Line Interface')
+    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    
+    # Add 'run' command
+    run_parser = subparsers.add_parser('run', help='Run the main application')
+    run_parser.add_argument('-c', '--config', default=DEFAULT_CONFIG, 
+                            help=f"Path to config file (default: {DEFAULT_CONFIG})")
+    
     return parser.parse_args()
 
 
+# def init_teacher_and_offline_projector():
+#     init_teacher()
+#     init_offline_projector()
+#     return
+
 def main(config_path: str):
-
+    # grab config and set root save dir
     config = GlobalConfig.from_yaml(config_path)
+    save_dir = "./results"
 
-    experiment_list = config.generate_experiment_list()
+    columns = ["experiment"]
+    columns.extend(config.tasks.keys())
+    result_df = pd.DataFrame(columns=columns)
 
+    experiment_list, experiment_names = config.generate_experiment_list()
+    print(f"A total of {len(experiment_names)} experiments have been specified:")
+    for i, name in enumerate(experiment_names):
+        print(f"    {i+1}: {name}")
+
+    # init_teacher_and_offline_projector()
+
+    # for i, experiment in enumerate(experiment_list):
+    #     print(f"Starting experiment {i}: {experiment.name.upper()}")
+    #     results = experiment.run(save_dir=f"{save_dir}/{experiment.name}")
+
+    #     new_row = pd.DataFrame([dict(zip(result_df.columns.tolist(), results))])
+    #     result_df = pd.concat([result_df, new_row], ignore_index=True)
+
+    #     print(f"Finished experiment {i}: {experiment.name.upper()}")
+
+    # columns.extend(["average", "relative lift over baseline"])
+    # analyze(result_df)
+
+def cli_main():
+    """Entry point for the kdfp command"""
+    args = parse_cli_args()
+    
+    if args.command == 'run':
+        main(config_path=args.config)
+    else:
+        print("Usage: kdfp run [--config CONFIG_FILE]")
+        print("Run 'kdfp run --help' for more options")
 
 if __name__ == "__main__":
-    args = parse_args
-    main(config_path=args.config)
+    cli_main()

@@ -14,3 +14,6 @@ dependencies = [
 
 [tool.setuptools]
 packages = {find = {}}
+
+[project.scripts]
+kdfp = "kdfp.cli:main"
