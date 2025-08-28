@@ -1,14 +1,13 @@
 import os
 import torch
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, ConcatDataset, Subset, random_split
 from datasets import load_dataset
 from functools import partial
 import pandas as pd
 from tqdm.auto import tqdm
-from typing import Optional, List
+from typing import Optional, List, Literal, Dict
 from pydantic import BaseModel, field_validator, model_validator
-
 
 def _preprocess(examples, seq_len, tokenizer, token_rename: bool):
     # Preprocess the examples
@@ -31,7 +30,8 @@ def load_data(tokenizer,
               dataset_name: str,
               subset: Optional[str] = None,
               split: str = "train",
-              token_rename: bool = False) -> Dataset:
+              token_rename: bool = False,
+              n_samples: Optional[int] = None,) -> Dataset:
     if subset:
         dataset = load_dataset(
             dataset_name,
@@ -51,6 +51,9 @@ def load_data(tokenizer,
                             seq_len=seq_len,
                             tokenizer=tokenizer,
                             token_rename=token_rename)
+
+    if n_samples:
+        dataset.select(range(min(n_samples, len(dataset))))
 
     dataset = dataset.map(
         preprocess_fn,
@@ -154,13 +157,17 @@ class CachedActivationsDataset(Dataset):
         else:
             return activation
 
+
 class HookCache(BaseModel):
     cache_dir: str
     hook_list: List[str]
-    resid: Optional[CachedActivationsDataset] = None
-    resid_attn: Optional[CachedActivationsDataset] = None
-    embed_attn: Optional[CachedActivationsDataset] = None
+    embed: Optional[CachedActivationsDataset] = None
+    attn_scores: Optional[List[CachedActivationsDataset]] = None
+    attn_out: Optional[List[CachedActivationsDataset]] = None
+    mlp_out: Optional[List[CachedActivationsDataset]] = None
+    resid: Optional[List[CachedActivationsDataset]] = None
     output_logits: Optional[CachedActivationsDataset] = None
+
     model_config = {
         "extra": "forbid",  # Raises error on unrecognized fields
         "arbitrary_types_allowed": True,
@@ -188,33 +195,122 @@ class HookCache(BaseModel):
     @model_validator(mode='after')
     def setup_datasets(self) -> 'HookCache':
         """Initialize the dataset objects after validation."""
-        # Validate we have exactly 3 hook points in the expected order
-        if len(self.hook_list) not in [1, 3]:
-            raise ValueError(
-                "hook_list must contain either exactly 3 hook points in this order: resid, resid_attn, embed_attn"
-                + "OR it must be a list with only the resid hook point (i.e. list of length 1 -> for SAE caching)"
-            )
+
+        # collect and organize hooks
+        hook_dict = {
+            "embed": [],
+            "attn_scores": [],
+            "attn_out": [],
+            "mlp_out": [],
+            "resid": [],
+            "output_logits": [],
+        }
+
+        for hook_name in hook_dict.keys():
+            matches = [s for s in self.hook_list if hook_name in s]
+            if not matches:
+                raise ValueError(f"No hook points found for hook {hook_name}")
+            hook_dict[hook_name] = matches
+
+        # run verifications
+        all_matched_hooks = [hook for hook_list in hook_dict.values() for hook in hook_list]
+
+        if len(all_matched_hooks) != len(self.hook_list):
+            unrecognized_hooks = set(self.hook_list) - set(all_matched_hooks)
+            raise ValueError(f"Some hooks were not recognized: {unrecognized_hooks}")
+        
+        def get_layer_from_hook_name(hook_name: str) -> int:
+            # ex) blocks.0.hook_resid_post, or blocks.0.attn.hook_attn_scores
+            return hook_name.split('.')[1]
+        
+        def form_cached_dataset_lists(hook_type: str, hook_field) -> None:
+            if hook_dict[hook_type]:
+                hook_field = []
+                for layer_hook_name in hook_dict[hook_type]:
+                    # i = get_layer_from_hook_name(layer_hook_name)
+                    hook_field.append(CachedActivationsDataset(
+                        cache_dir=os.path.join(self.cache_dir, layer_hook_name),
+                        batch_mapping_location=self.cache_dir))
         
         try:
-            self.resid = CachedActivationsDataset(
-                cache_dir=os.path.join(self.cache_dir, self.hook_list[0]),
-                batch_mapping_location=self.cache_dir
-            )
-            if len(self.hook_list) == 3:
+            layer_hook_type_map = {
+                "attn_scores": self.attn_scores,
+                "attn_out": self.attn_out,
+                "mlp_out": self.mlp_out,
+                "resid": self.resid,
+            }
+            for hook_type, hook_field in layer_hook_type_map.items():
+                form_cached_dataset_lists(hook_type=hook_type, hook_field=hook_field)
+
+            if hook_dict["embed"]:
+                self.embed = CachedActivationsDataset(
+                        cache_dir=os.path.join(self.cache_dir, "hook_embed"),
+                        batch_mapping_location=self.cache_dir)
+                
+            if hook_dict["output_logits"]:
                 self.output_logits = CachedActivationsDataset(
-                    cache_dir=os.path.join(self.cache_dir, "output_logits"),
-                    batch_mapping_location=self.cache_dir
-                )
-                self.resid_attn = CachedActivationsDataset(
-                    cache_dir=os.path.join(self.cache_dir, self.hook_list[1]),
-                    batch_mapping_location=self.cache_dir
-                )
-                self.embed_attn = CachedActivationsDataset(
-                    cache_dir=os.path.join(self.cache_dir, self.hook_list[2]),
-                    batch_mapping_location=self.cache_dir
-                )
+                        cache_dir=os.path.join(self.cache_dir, "output_logits"),
+                        batch_mapping_location=self.cache_dir)
+            n = len(self.attn_scores)
+            for k, v in layer_hook_type_map.items():
+                assert len(v) == n, f"Hook type {k} contains {len(v)} layers/datasets, expected {n}"
+
         except Exception as e:
             raise ValueError(f"Failed to initialize datasets: {str(e)}")
         
         return self
     
+
+
+class ProjectorDataset(Dataset):
+    def __init__(self, teacher_cache_dir: str, student_cache_dir: str):
+        teacher_ds = self._get_projector_dataset(teacher_cache_dir)
+        student_ds = self._get_projector_dataset(student_cache_dir)
+        teacher_len = len(teacher_ds)
+        student_len = len(student_ds)
+        num_rows = min(teacher_len, student_len)
+        # indices = list(range(num_rows))
+
+        self.num_rows = num_rows
+        self.teacher_ds = teacher_ds
+        self.student_ds = student_ds
+
+
+    def _get_projector_dataset(cache_dir: str):
+        # ignore attn_scores and output_logits bc they are not in the embedding space
+        hook_cache = HookCache(cache_dir=cache_dir)
+        dataset_list = []
+        if hook_cache.embed:
+            dataset_list.append(hook_cache.embed)
+        for act_list in [hook_cache.attn_out, hook_cache.mlp_out, hook_cache.resid]:
+            if act_list:
+                for layer in act_list:
+                    dataset_list.append(layer)
+        return ConcatDataset(datasets=dataset_list)
+    
+    def __len__(self):
+        return self.num_rows
+    
+    def __getitem__(self, index):
+        X_teacher = self.teacher_ds[index]
+        X_student = self.student_ds[index]
+        return X_teacher, X_student
+    
+
+# def generate_projector_ds_splits(teacher_cache_dir: str,
+#                               student_cache_dir: str,
+#                               train_size: float = 0.8,
+#                               ) -> Dict[Literal['train', 'val', 'test'], Dataset]:
+    
+#     projector_ds = ProjectorDataset(teacher_cache_dir=teacher_cache_dir,
+#                                     student_cache_dir=student_cache_dir)
+    
+#     val_and_test_size = round((1.0 - train_size) / 2)
+#     n_train = round(train_size * len(projector_ds))
+#     n_val_and_test = round(val_and_test_size * len(projector_ds))
+
+#     train_ds, val_ds, test_ds = random_split(
+#         projector_ds, [n_train, n_val_and_test, n_val_and_test]
+#     )
+
+#     return train_ds, val_ds, test_ds

@@ -8,7 +8,7 @@ students:
 
 projector_training:
   dataset: common-pile/comma_v0.1_training_dataset
-  n_examples: 20000
+  n_examples: 10  # 20000
 
 training_params:
   seq_len: 128
