@@ -38,10 +38,10 @@ def main(config_path: str):
     for i, name in enumerate(experiment_names):
         print(f"    {i+1}: {name}")
 
-    # init_teacher_and_offline_projector()
 
     # for i, experiment in enumerate(experiment_list):
     #     print(f"Starting experiment {i}: {experiment.name.upper()}")
+    #     experiment.init()
     #     results = experiment.run(save_dir=f"{save_dir}/{experiment.name}")
 
     #     new_row = pd.DataFrame([dict(zip(result_df.columns.tolist(), results))])

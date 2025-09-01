@@ -163,7 +163,8 @@ def prepare_lm_and_dataloader(lm_name: str,
                               total_tokens: Optional[int] = None,
                               num_workers: Optional[int] = None,):
     """Load model, sae, and dataset based on args."""
-    print(f"Loading model {lm_name} from {lm_dir}")
+    if lm_dir:
+        print(f"Loading model {lm_name} from local version in {lm_dir}")
 
     # N_DEVICES = 1
 
@@ -355,22 +356,22 @@ def is_cache_complete(
     return True
 
 
-def main(lm_hook_points: List[str],
-         lm_name: str,
-         dataset_name: str,
-         dataset_subset: Optional[str],
-         split: str,
-         seq_len: int,
-         batch_size: int,
-         lm_act_cache_dir: str,
-         token_rename: bool = False,
-         shuffle: bool = False,
-         lm_dir: Optional[str] = None,
-         total_tokens: Optional[int] = None,
-         num_workers: Optional[int] = None,
-         force_cache_all: bool = False,
-         cache_outputs: bool = False,
-         device: str = "cuda" if torch.cuda.is_available() else 'cpu',):
+def activation_caching(lm_name: str,
+                       lm_hook_points: List[str],
+                       dataset_name: str,
+                       dataset_subset: Optional[str],
+                       split: str,
+                       seq_len: int,
+                       batch_size: int,
+                       cache_dir: str,
+                       token_rename: bool = False,
+                       shuffle: bool = False,
+                       lm_dir: Optional[str] = None,
+                       total_tokens: Optional[int] = None,
+                       num_workers: Optional[int] = None,
+                       force_cache_all: bool = False,
+                       cache_outputs: bool = False,
+                       device: str = "cuda" if torch.cuda.is_available() else 'cpu') -> str:
     
     # resid_hooks = list(filter(lambda s: "hook_resid_post" in s , lm_hook_points))
     # sae_resid_hook_item = resid_hooks[round(len(resid_hooks) / 2)]
@@ -380,6 +381,7 @@ def main(lm_hook_points: List[str],
     # else:
     #     mdir = Path(args.model_dir)
     #     args.cache_dir = str(mdir.parent / "cache")
+    lm_act_cache_dir = f"{cache_dir}/{lm_name.split('/')[1]}/{dataset_name.split('/')[1]}"
 
     lm, token_dl, n_samples = prepare_lm_and_dataloader(
         lm_name,
@@ -524,7 +526,7 @@ def main(lm_hook_points: List[str],
     with open(f"{lm_act_cache_dir}/caching_summary.json", 'w') as f:
         json.dump(summary, f, indent=4)
 
-    return lm_act_cache_dir  #, args.sae_act_cache_dir
+    return lm_act_cache_dir, lm.cfg.d_model  #, args.sae_act_cache_dir
 
 if __name__ == "__main__":
     args = parse_args()
@@ -540,7 +542,7 @@ if __name__ == "__main__":
     num_workers = args.dl_num_workers
 
 
-    main(lm_hook_points=all_lm_hook_points,
+    activation_caching(lm_hook_points=all_lm_hook_points,
          lm_name=args.lm_name,
          dataset_name=args.dataset_name,
          dataset_subset=args.dataset_subset,

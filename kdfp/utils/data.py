@@ -1,12 +1,11 @@
 import os
 import torch
-import numpy as np
-from torch.utils.data import Dataset, ConcatDataset, Subset, random_split
+from torch.utils.data import Dataset, ConcatDataset
 from datasets import load_dataset
 from functools import partial
 import pandas as pd
 from tqdm.auto import tqdm
-from typing import Optional, List, Literal, Dict
+from typing import Optional, List
 from pydantic import BaseModel, field_validator, model_validator
 
 def _preprocess(examples, seq_len, tokenizer, token_rename: bool):
@@ -296,21 +295,3 @@ class ProjectorDataset(Dataset):
         X_student = self.student_ds[index]
         return X_teacher, X_student
     
-
-# def generate_projector_ds_splits(teacher_cache_dir: str,
-#                               student_cache_dir: str,
-#                               train_size: float = 0.8,
-#                               ) -> Dict[Literal['train', 'val', 'test'], Dataset]:
-    
-#     projector_ds = ProjectorDataset(teacher_cache_dir=teacher_cache_dir,
-#                                     student_cache_dir=student_cache_dir)
-    
-#     val_and_test_size = round((1.0 - train_size) / 2)
-#     n_train = round(train_size * len(projector_ds))
-#     n_val_and_test = round(val_and_test_size * len(projector_ds))
-
-#     train_ds, val_ds, test_ds = random_split(
-#         projector_ds, [n_train, n_val_and_test, n_val_and_test]
-#     )
-
-#     return train_ds, val_ds, test_ds

@@ -7,13 +7,16 @@ from kdfp.utils.data import ProjectorDataset
 
 class ProjectorDataModule(pl.LightningDataModule):
     def __init__(self, dataset: ProjectorDataset, batch_size: int, seed: int,
-                 val_split: float = 0.1, test_split: float = 0.1):
+                 val_split: float = 0.1, test_split: float = 0.1,
+                 num_workers: int = 4, pin_memory: bool = True):
         super().__init__()
         self.dataset = dataset
         self.batch_size = batch_size
         self.val_split = val_split
         self.test_split = test_split
         self.seed = seed
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
         
     def setup(self, stage: Optional[str] = None):
         total_size = len(self.dataset)
@@ -33,8 +36,8 @@ class ProjectorDataModule(pl.LightningDataModule):
             self.train_ds,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=4,
-            pin_memory=True
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory
         )
 
     def val_dataloader(self):
@@ -42,8 +45,8 @@ class ProjectorDataModule(pl.LightningDataModule):
             self.val_ds,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=4,
-            pin_memory=True
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory
         )
 
     def test_dataloader(self):
@@ -51,6 +54,6 @@ class ProjectorDataModule(pl.LightningDataModule):
             self.test_ds,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=4,
-            pin_memory=True
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory
         )

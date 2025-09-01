@@ -4,7 +4,9 @@ import os
 import json
 from typing import Optional, Dict, Literal
 from pytorch_lightning import LightningModule
-from .create import create_with_raytune
+from kdfp.core.projector.create import create_with_raytune
+from argparse import Namespace
+from pathlib import Path
 
 """
 TODO: FIX THE MESS I JUST CREATED
@@ -17,11 +19,19 @@ TODO: FIX THE MESS I JUST CREATED
 """
 
 class Projector(LightningModule):
-    def __init__(self, teacher_dim: int, student_dim: int, lr: float, weight_decay: float,
-                 loss_weights: Dict[Literal["reconstruction", "alignment"], float], tied_weights: bool = False):
+    def __init__(self,
+                 teacher_dim: int,
+                 student_dim: int,
+                 alignment_beta: float,
+                #  hparams: Namespace,
+                 lr: float,
+                 weight_decay: float,
+                 tied_weights: bool = False):
         super().__init__()
         self.create = classmethod(create_with_raytune)
-        self.save_hyperparameters()
+        self.save_hyperparameters()  #hparams)
+        self.lr = lr
+        self.weight_decay = weight_decay
         
         self.teacher_dim = teacher_dim
         self.student_dim = student_dim
@@ -38,7 +48,7 @@ class Projector(LightningModule):
             self.decoder.weight = nn.Parameter(self.encoder.weight.t())
         
         # Default loss weights
-        self.loss_weights = loss_weights
+        self.alignment_beta = alignment_beta
         
         self.criterion = nn.MSELoss()
 
@@ -83,8 +93,8 @@ class Projector(LightningModule):
         
         # Total weighted loss
         total_loss = (
-            self.loss_weights['reconstruction'] * recon_loss +
-            self.loss_weights['alignment'] * align_loss
+            (1.0 - self.alignment_beta) * recon_loss +
+            self.alignment_beta * align_loss
         )
         
         return {
@@ -128,7 +138,7 @@ class Projector(LightningModule):
             recon_cosine = torch.nn.functional.cosine_similarity(reconstructed, X_teacher, dim=-1).mean()
             
             # Alignment quality
-            align_mae = nn.L1Loss()(latent, X_student)
+            align_l1 = nn.L1Loss()(latent, X_student)
             align_cosine = torch.nn.functional.cosine_similarity(latent, X_student, dim=-1).mean()
             
         # Log all metrics
@@ -136,7 +146,7 @@ class Projector(LightningModule):
             **losses,
             'recon_mae': recon_mae,
             'recon_cosine': recon_cosine,
-            'align_mae': align_mae,
+            'align_l1': align_l1,
             'align_cosine': align_cosine,
         }
         
@@ -146,10 +156,10 @@ class Projector(LightningModule):
         return metrics
 
     def configure_optimizers(self):
-        return torch.optim.Adam(
+        return torch.optim.AdamW(
             self.parameters(), 
-            lr=self.hparams.lr, 
-            weight_decay=self.hparams.weight_decay
+            lr=self.lr, 
+            weight_decay=self.weight_decay
         )
 
     # def project(self, x, projection_direction: str):
@@ -165,21 +175,55 @@ class Projector(LightningModule):
 
     def save_pretrained(self, save_path: str):
         """Save model with configuration"""
-        os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
+        # Create directory if it doesn't exist
+        Path(save_path).mkdir(parents=True, exist_ok=True)
         
-        torch.save(self.state_dict(), save_path)
+        # Save model state dict
+        torch.save(self.state_dict(), f"{save_path}/projector.bin")
         
-        config_path = save_path + '_config.json'
+        # Save configuration
         config = {
             'teacher_dim': self.teacher_dim,
             'student_dim': self.student_dim,
             'tied_weights': self.tied_weights,
-            'lr': self.hparams.lr,
-            'weight_decay': self.hparams.weight_decay,
-            'loss_weights': self.loss_weights
+            'alignment_beta': self.alignment_beta,
+            'lr': self.lr,
+            'weight_decay': self.weight_decay,
+            # 'hparams': vars(self.hparams) if isinstance(self.hparams, Namespace) else dict(self.hparams),
         }
-        with open(config_path, 'w') as f:
-            json.dump(config, f, indent=2)
+        
+        with open(f"{save_path}/config.json", "w") as f:
+            json.dump(config, f, indent=4)
+        
+        print(f"Model saved to {save_path}")
+    
+    @classmethod
+    def load_pretrained(cls, save_path: str, map_location=None):
+        """Load model from saved configuration"""
+        # Load configuration
+        with open(f"{save_path}/config.json", "r") as f:
+            config = json.load(f)
+        
+        # # Extract hparams and convert back to Namespace if needed
+        # hparams_dict = config.pop('hparams')
+        # hparams = Namespace(**hparams_dict)
+        
+        # # Create model instance
+        # model = cls(hparams=hparams, **config)
+        model = cls(**config)
+        
+        # Load weights
+        model_path = f"{save_path}/projector.bin"
+        if map_location:
+            state_dict = torch.load(model_path, map_location=map_location)
+        else:
+            state_dict = torch.load(model_path)
+        
+        model.load_state_dict(state_dict)
+        model.eval()
+        
+        print(f"Model loaded from {save_path}")
+        return model
 
 
 # Add as class method

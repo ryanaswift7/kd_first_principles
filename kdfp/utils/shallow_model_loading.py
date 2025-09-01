@@ -1,32 +1,44 @@
 from transformer_lens import HookedTransformer
 import torch
-from typing import Literal, Tuple
+from typing import Literal, Tuple, List
 from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
 import copy
 
-def get_indices_and_layers_to_keep(total_layers: int,
+def get_indices_and_num_layers_to_keep(total_layers: int,
                                    layer_reduction_factor: float,
-                                   ) -> Tuple[torch.Tensor, int]:
+                                   selection_method: Literal['linspace', 'first_n'] = 'linspace') -> Tuple[List[int], int]:
     # ensure at least 1 and maximum all are kept
-    layers_to_keep = max(1, round(total_layers * layer_reduction_factor))
-    layers_to_keep = min(layers_to_keep, total_layers)
+    n_layers_to_keep = max(1, round(total_layers * layer_reduction_factor))
+    n_layers_to_keep = min(n_layers_to_keep, total_layers)
     # Select layers evenly spaced
-    keep_indices = torch.linspace(0, total_layers-1, layers_to_keep).round().int().tolist()
-    return keep_indices, layers_to_keep
+    if selection_method == 'linspace':
+        keep_indices = torch.linspace(0, total_layers-1, n_layers_to_keep).round().int().tolist()
+    # take the first N layers
+    elif selection_method == 'first_n':
+        keep_indices = list(range(n_layers_to_keep))
+    else:
+        raise ValueError(f"Invalid selection method: {selection_method}. Must be one of: 'linspace' or 'first_n'")
+    return keep_indices, n_layers_to_keep
 
 def load_shallow(model_name: str,
                  mode: Literal["tl", "hf"], 
                  layer_reduction_factor: float,
-                 ):
+                 selection_method: Literal['linspace', 'first_n']):
     if mode == "tl":
-        return _load_shallow_tl(model_name=model_name, layer_reduction_factor=layer_reduction_factor)
+        return _load_shallow_tl(model_name=model_name,
+                                layer_reduction_factor=layer_reduction_factor,
+                                selection_method=selection_method)
     elif mode == "hf":
-        return _load_shallow_hf(model_name=model_name, layer_reduction_factor=layer_reduction_factor)
+        return _load_shallow_hf(model_name=model_name,
+                                layer_reduction_factor=layer_reduction_factor,
+                                selection_method=selection_method)
     else:
         raise ValueError("I don't know how you did it, but you provided an invalid mode. Must be either 'tl' or 'hf'.")
     
 
-def _load_shallow_tl(model_name: str, layer_reduction_factor: float):
+def _load_shallow_tl(model_name: str,
+                     layer_reduction_factor: float,
+                     selection_method: Literal['linspace', 'first_n']):
     # Load original model
     original_model = HookedTransformer.from_pretrained(model_name)
     tokenizer = original_model.tokenizer
@@ -34,7 +46,9 @@ def _load_shallow_tl(model_name: str, layer_reduction_factor: float):
     # Calculate which layers to keep
     total_layers = original_model.cfg.n_layers
 
-    keep_indices, layers_to_keep = get_indices_and_layers_to_keep(total_layers=total_layers, layer_reduction_factor=layer_reduction_factor)
+    keep_indices, layers_to_keep = get_indices_and_num_layers_to_keep(total_layers=total_layers,
+                                                                  layer_reduction_factor=layer_reduction_factor,
+                                                                  selection_method=selection_method)
     
     # Create new config with fewer layers
     new_cfg = original_model.cfg.copy()
@@ -118,7 +132,9 @@ def detect_model_family(model_name: str) -> str:
         f"(total: {len(supported_models)})"
     )
 
-def _load_shallow_hf(model_name: str, layer_reduction_factor: float):
+def _load_shallow_hf(model_name: str,
+                     layer_reduction_factor: float,
+                     selection_method: Literal['linspace', 'first_n']):
     """
     Create shallow causal LM by keeping evenly spaced layers.
     
@@ -141,8 +157,10 @@ def _load_shallow_hf(model_name: str, layer_reduction_factor: float):
     # Calculate layers to keep
     total_layers = getattr(original_config, config['layer_count_attr'])
 
-    keep_indices, layers_to_keep = get_indices_and_layers_to_keep(total_layers=total_layers, layer_reduction_factor=layer_reduction_factor)
-
+    keep_indices, layers_to_keep = get_indices_and_num_layers_to_keep(total_layers=total_layers,
+                                                                  layer_reduction_factor=layer_reduction_factor,
+                                                                  selection_method=selection_method)
+    
     # Create shallow config and model
     new_config = copy.deepcopy(original_config)
     setattr(new_config, config['layer_count_attr'], layers_to_keep)

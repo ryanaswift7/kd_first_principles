@@ -6,8 +6,8 @@ from kdfp.schemas.configBase import ConfigBase
 from pathlib import Path
 import json
 from pydantic import model_validator
-from kdfp.schemas.globalConfig import TrainingParamsConfig, HyperparamsConfig
-
+from kdfp.schemas.subConfigs import (TrainingParamsConfig,
+                                       HyperparamsConfig)
 
 class ExperimentConfig(ConfigBase):
     name: str
@@ -18,7 +18,6 @@ class ExperimentConfig(ConfigBase):
     projection_direction: Optional[Literal["up", "down"]]
     projection_training: Optional[Literal["online", "offline"]]
     offline_projector_alignment_beta: Optional[float]
-    hook_list: List[str]
     objective_weight_variant: str
     objective_weights: ObjectiveWeights
     jsd_beta: Optional[float]
@@ -52,7 +51,6 @@ class ExperimentConfig(ConfigBase):
             'projection_direction': self.projection_direction,
             'projection_training': self.projection_training,
             'offline_projector_alignment_beta': self.offline_projector_alignment_beta,
-            'hook_list': self.hook_list,
             'objective_weight_variant': self.objective_weight_variant,
             'objective_weights': self.objective_weights.to_config_dict(),
             'jsd_beta': self.jsd_beta,
@@ -87,8 +85,12 @@ class ExperimentConfig(ConfigBase):
         file_path = save_dir / 'config.json'
         
         with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(self.to_config_dict(), f, indent=2, ensure_ascii=False, default=str)
+            json.dump(self.to_config_dict(), f, indent=4, ensure_ascii=False, default=str)
         
         print(f"Configuration saved to: {file_path}")
         return file_path
+    
+    def init(self) -> None:
+        """Initialize teacher, student, and projector"""
+        pass
 

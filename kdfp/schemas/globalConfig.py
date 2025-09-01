@@ -1,49 +1,17 @@
-from typing import List, Optional, Dict, Union
+from typing import List, Optional, Dict, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 import yaml
 from kdfp.schemas.experimentConfig import ExperimentConfig, TaskSpec, LM
 from transformer_lens import HookedTransformer
-from kdfp.utils.shallow_model_loading import get_indices_and_layers_to_keep
+from kdfp.utils.shallow_model_loading import get_indices_and_num_layers_to_keep
 from kdfp.schemas.objective_weights import OBJECTIVE_WEIGHT_VARIANTS_MAP
-from fractions import Fraction
-
-
-class LayerReductionConfig(BaseModel):
-    name: str
-    factor: Union[str, float]
-
-    @field_validator('factor')
-    def convert_to_float(cls, v):
-        f = float(Fraction(v))
-        return f
-
-class DimReductionConfig(BaseModel):
-    name: str
-
-class StudentConfigs(BaseModel):
-    layer_reduction: LayerReductionConfig
-    dim_reduction: DimReductionConfig
-
-class HyperparamsConfig(BaseModel):
-    lr: List[float]
-    weight_decay: List[float]
-    temperature: List[float]
-    max_grad_norm: List[float]
-    num_epochs: List[int]
-    batch_size: List[int]
-
-class TaskConfig(BaseModel):
-    dataset: str
-    subset: Optional[str] = None
-
-class TrainingParamsConfig(BaseModel):
-    seq_len: int
-    seed: List[int]
-    reproducible_backend: bool
-
-class ProjectorTrainingConfig(BaseModel):
-    dataset: str
-    n_examples: int
+from kdfp.schemas.subConfigs import (StudentConfigs,
+                                       ProjectorTrainingConfig,
+                                       TrainingParamsConfig,
+                                       HyperparamsConfig,
+                                       TaskConfig,
+                                       DistillationHooks,
+                                       HookLists)
 
 
 class GlobalConfig(BaseModel):
@@ -51,29 +19,44 @@ class GlobalConfig(BaseModel):
     students: StudentConfigs
     projector_training: ProjectorTrainingConfig
     training_params: TrainingParamsConfig
-    hook_points: Dict[str, List[str]] = Field(..., description="Keys 'single' and 'per_layer' with lists of hook names")
+    hook_types: Dict[str, List[str]] = Field(..., description="Keys 'single' and 'per_layer' with lists of hook names")
     projection: Dict[str, List[str]] = Field(..., description="Keys 'directions' and 'training_methods'")
     offline_projector_alignment_betas: List[float]
     objective_weight_variants: List[str]
     jsd_betas: List[float]
     hyperparams: HyperparamsConfig
     tasks: Dict[str, TaskConfig] # A dictionary where the key is the task name (e.g., 'hellaswag') and the value is its config
-    shallow_hooks: Optional[List[str]] = None
-    narrow_hooks: Optional[List[str]] = None
+    hooks: Optional[DistillationHooks] = None
 
     # Optional: Validator to ensure hook point keys are expected
-    @field_validator('hook_points')
+    @field_validator('hook_types')
     def validate_hook_keys(cls, v):
         allowed_keys = {'single', 'per_layer'}
         if not all(key in allowed_keys for key in v.keys()):
-            raise ValueError(f'hook_points can only contain the keys: {allowed_keys}')
+            raise ValueError(f'hook_types can only contain the keys: {allowed_keys}')
         return v
     
     @model_validator(mode='after')
     def generate_both_hook_lists(self) -> 'GlobalConfig':
-        self.narrow_hooks = self._generate_hook_list(student_name=self.students.dim_reduction.name)
-        self.shallow_hooks = self._generate_hook_list(student_name=self.students.layer_reduction.name,
-                                                      layer_reduction_factor=self.students.layer_reduction.factor)
+        # self.hooks = DistillationHooks()
+        tn = self._generate_hook_list(model_name=self.teacher_name)
+        ts = self._generate_hook_list(model_name=self.teacher_name,
+                                                      layer_reduction_factor=self.students.layer_reduction.factor,
+                                                      selection_method='linspace')
+        """
+        - The shallow student is first n layers because once we actually load in the shallow student,
+          the first n layers will be the entire student model.
+        - This way, the linspaced teacher layers match up with all of the student layers
+        """
+        sn = self._generate_hook_list(model_name=self.students.dim_reduction.name)
+        ss = self._generate_hook_list(model_name=self.students.layer_reduction.name,
+                                                      layer_reduction_factor=self.students.layer_reduction.factor,
+                                                      selection_method='first_n')
+        
+        teacher_hooks = HookLists(narrow=tn, shallow=ts)
+        student_hooks = HookLists(narrow=sn, shallow=ss)
+
+        self.hooks = DistillationHooks(teacher=teacher_hooks, student=student_hooks)
         return self
 
     # Class method to load from a YAML file
@@ -96,25 +79,29 @@ class GlobalConfig(BaseModel):
             tasks.append(t)
         return tasks
     
-    def _generate_hook_list(self, student_name: str, layer_reduction_factor: Optional[float] = None) -> List[str]:
-        lm = HookedTransformer.from_pretrained(student_name)
+    def _generate_hook_list(self, model_name: str,
+                            layer_reduction_factor: Optional[float] = None,
+                            selection_method: Optional[Literal['linspace', 'first_n']] = None) -> List[str]:
+        lm = HookedTransformer.from_pretrained(model_name)
         if layer_reduction_factor is not None:
-            _, n_layers = get_indices_and_layers_to_keep(total_layers=lm.cfg.n_layers, layer_reduction_factor=layer_reduction_factor)
+            assert selection_method, "You must supply a selection method if performing layer reduction"
+            layer_idx_list, _ = get_indices_and_num_layers_to_keep(total_layers=lm.cfg.n_layers,
+                                                         layer_reduction_factor=layer_reduction_factor,
+                                                         selection_method=selection_method)
         else:
-            n_layers = lm.cfg.n_layers
+            layer_idx_list = list(range(lm.cfg.n_layers))
 
         hooks = []
-        hooks.extend(self.hook_points["single"])
-        for i in range(n_layers):
-            for hp in self.hook_points["per_layer"]:
-                hooks.append(f"blocks.{i}.{hp}")
+        hooks.extend(self.hook_types["single"])
+        for idx in layer_idx_list:
+            for hp in self.hook_types["per_layer"]:
+                hooks.append(f"blocks.{idx}.{hp}")
         return hooks
 
     def generate_experiment_list(self, debug: bool = False) -> List[ExperimentConfig]:
         tasks = self.generate_task_list()
 
         experiment_list = []
-        # exp_names = []
 
         for proj_dir in self.projection["directions"]:
             for proj_train in self.projection["training_methods"]: 
@@ -125,19 +112,23 @@ class GlobalConfig(BaseModel):
                                     if reduction == "narrow":
                                         proj_str = f"{proj_dir}_{proj_train}"
                                         if proj_train == "offline":
-                                            proj_str += f"_align{off_proj_align_beta}"
+                                            proj_str += f"_align_{off_proj_align_beta}"
                                         proj_str += '-'
-                                        student = LM(model_name=self.students.dim_reduction.name)
-                                        hook_list = self.narrow_hooks
+                                        teacher = LM(model_name=self.teacher_name,
+                                                     hook_list=self.hooks.teacher.narrow)
+                                        student = LM(model_name=self.students.dim_reduction.name,
+                                                     hook_list=self.hooks.student.narrow)
+                                        # hook_list = self.teacher_narrow_hooks
                                         projection_direction = proj_dir
                                         projection_training = proj_train
                                         offline_projector_alignment_beta = off_proj_align_beta
 
                                     elif reduction == "shallow":
                                         proj_str = ""
+                                        teacher = LM(model_name=self.teacher_name,
+                                                     hook_list=self.hooks.teacher.shallow)
                                         student = LM(model_name=self.students.layer_reduction.name,
-                                                    layer_reduction_factor=self.students.layer_reduction.factor)
-                                        hook_list = self.shallow_hooks
+                                                     hook_list=self.hooks.student.shallow)
                                         projection_direction = None
                                         projection_training = None
                                         offline_projector_alignment_beta = None
@@ -150,13 +141,13 @@ class GlobalConfig(BaseModel):
                                     exp = ExperimentConfig(
                                         name=exp_name,
                                         reduction=reduction,
-                                        teacher=LM(model_name=self.teacher_name),
+                                        teacher=teacher,
                                         student=student,
                                         training_params=self.training_params,
                                         projection_direction=projection_direction,
                                         projection_training=projection_training,
                                         offline_projector_alignment_beta=offline_projector_alignment_beta,
-                                        hook_list=hook_list,
+                                        # hook_list=hook_list,
                                         objective_weight_variant=obj_weight_variant,
                                         objective_weights=OBJECTIVE_WEIGHT_VARIANTS_MAP[obj_weight_variant],
                                         jsd_beta=jsd_beta,
@@ -177,7 +168,7 @@ class GlobalConfig(BaseModel):
             projection_direction=None,
             projection_training=None,
             offline_projector_alignment_beta=None,
-            hook_list=hook_list,
+            # hook_list=hook_list,
             objective_weight_variant="finetuning",
             objective_weights=OBJECTIVE_WEIGHT_VARIANTS_MAP["finetuning"],
             jsd_beta=None,
@@ -193,7 +184,7 @@ class GlobalConfig(BaseModel):
             projection_direction=None,
             projection_training=None,
             offline_projector_alignment_beta=None,
-            hook_list=hook_list,
+            # hook_list=hook_list,
             objective_weight_variant="finetuning",
             objective_weights=OBJECTIVE_WEIGHT_VARIANTS_MAP["finetuning"],
             jsd_beta=None,

@@ -9,6 +9,7 @@ def train_projector(config: Dict[str, Any],
                    dataset: ProjectorDataset,
                    teacher_dim: int,
                    student_dim: int,
+                   alignment_beta: float,
                    max_epochs: int = 10,
                    val_split: float = 0.1,
                    test_split: float = 0.1):
@@ -23,18 +24,19 @@ def train_projector(config: Dict[str, Any],
     datamodule.setup()
     
     # Optional: Tune loss weights if desired
-    loss_weights = {
-        'reconstruction': config.get("recon_weight"),
-        'alignment': config.get("align_weight"),
-    }
+    # loss_weights = {
+    #     'reconstruction': config.get("recon_weight"),
+    #     'alignment': config.get("align_weight"),
+    # }
     
     model = Projector(
         teacher_dim=teacher_dim,
         student_dim=student_dim,
+        alignment_beta=alignment_beta,
         tied_weights=config["tied_weights"],
         lr=config["learning_rate"],
         weight_decay=config["weight_decay"],
-        loss_weights=loss_weights
+        # loss_weights=loss_weights
     )
     
     tune_callback = TuneReportCheckpointCallback(

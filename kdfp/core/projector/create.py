@@ -2,6 +2,7 @@ import torch
 import os
 import json
 import wandb
+from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
 import pytorch_lightning as pl
 from ray import tune
@@ -11,40 +12,41 @@ from kdfp.utils.data import ProjectorDataset
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 
-from .train import train_projector
-from .projectorDataModule import ProjectorDataModule
-from .projector import Projector
+from kdfp.core.projector.train import train_projector
+from kdfp.core.projector.projectorDataModule import ProjectorDataModule
+from kdfp.core.projector.projector import Projector
 
 def create_with_raytune(
     teacher_cache_dir: str,
     student_cache_dir: str,
     teacher_dim: int,
     student_dim: int,
+    alignment_beta: float,
     max_epochs: int,
-    lr_choices: List[float],
     weight_decay_choices: List[float],
     max_grad_norm_choices: List[float],
     batch_size_choices: List[int],
-    project_name: str = "bidirectional_projector",
+    lr_choices: List[float] = [5e-5, 1e-4, 5e-4, 1e-3, 5e-3],
+    project_name: str = "kdfp_projector",
     n_trials: int = 15,
     val_split: float = 0.1,
     test_split: float = 0.1,
     save_dir: Optional[str] = None,
     seed: int = 44,
     num_gpus_per_trial: float = 1.0,
-    num_cpus_per_trial: int = 4,
+    num_cpus_per_trial: int = 8,
     verbose: bool = True,
-    wandb_project: Optional[str] = None,
-    wandb_entity: Optional[str] = None,
-    wandb_run_name: Optional[str] = None,
-    wandb_log_config: bool = True,
-    wandb_log_gradients: bool = False,
+    # wandb_project: Optional[str] = None,
+    # wandb_entity: Optional[str] = None,
+    # wandb_run_name: Optional[str] = 'projector',
+    # wandb_log_config: bool = True,
+    # wandb_log_gradients: bool = False,
     wandb_log_weights: bool = False,
-    early_stopping_patience: Optional[int] = 5,
-) -> Tuple[Any, Dict[str, Any], Any, Dict[str, float], Dict[str, float]]:
-    """Create and train bidirectional projector with multi-objective loss"""
+    early_stopping_patience: Optional[int] = 5,) -> Projector:  #Tuple[Any, Dict[str, Any], Any, Dict[str, float], Dict[str, float]]:
+    """Create and train projector with multi-objective loss"""
     
     pl.seed_everything(seed)
+    wandb_run_name = f'projector_{alignment_beta}'
     
     dataset = ProjectorDataset(teacher_cache_dir, student_cache_dir)
     
@@ -65,8 +67,6 @@ def create_with_raytune(
         "weight_decay": tune.choice(weight_decay_choices),
         "max_grad_norm": tune.choice(max_grad_norm_choices),
         "tied_weights": tune.choice([True, False]),
-        "recon_weight": tune.uniform(0.5, 2.0),
-        "align_weight": tune.uniform(0.1, 1.0),
     }
     
     scheduler = ASHAScheduler(
@@ -86,7 +86,7 @@ def create_with_raytune(
             dataset=dataset,
             teacher_dim=teacher_dim,
             student_dim=student_dim,
-            max_epochs=max_epochs,  # Use the fixed max_epochs value
+            max_epochs=max_epochs, 
             val_split=val_split,
             test_split=test_split
         ),
@@ -102,21 +102,21 @@ def create_with_raytune(
         progress_reporter=reporter,
         verbose=verbose,
         local_dir=save_dir,
-        name="bidirectional_projector_tuning"
+        name=f"projector_{alignment_beta}_tuning"
     )
     
     # Get best configuration
-    best_config = analysis.best_config
+    best_train_config = analysis.best_config
     best_val_loss = analysis.best_result["val_loss"]
     
     if verbose:
-        print(f"Best trial config: {best_config}")
+        print(f"Best trial config: {best_train_config}")
         print(f"Best trial validation loss: {best_val_loss:.6f}")
     
     # Prepare for final training
     datamodule = ProjectorDataModule(
         dataset=dataset,
-        batch_size=best_config["batch_size"],
+        batch_size=best_train_config["batch_size"],
         val_split=val_split,
         test_split=test_split,
         seed=seed
@@ -131,18 +131,19 @@ def create_with_raytune(
     wandb_config = {
         "teacher_dim": teacher_dim,
         "student_dim": student_dim,
+        "alignment_beta": alignment_beta,
         "dataset_size": len(dataset),
         "max_epochs": max_epochs,
         "val_split": val_split,
         "test_split": test_split,
         "early_stopping_patience": early_stopping_patience,
-        **best_config
+        **best_train_config
     }
     
     wandb_logger = WandbLogger(
-        project=wandb_project or project_name,
-        entity=wandb_entity,
-        name=wandb_run_name or f"best_model_final_training",
+        project=project_name,
+        # entity=wandb_entity,
+        name=wandb_run_name,
         config=wandb_config,
         log_model="all" if wandb_log_weights else False,
     )
@@ -150,10 +151,11 @@ def create_with_raytune(
     best_model = Projector(
         teacher_dim=teacher_dim,
         student_dim=student_dim,
-        tied_weights=best_config["tied_weights"],
-        lr=best_config["learning_rate"],
-        weight_decay=best_config["weight_decay"],
-        max_grad_norm=best_config["max_grad_norm"]
+        alignment_beta=alignment_beta,
+        tied_weights=best_train_config["tied_weights"],
+        lr=best_train_config["learning_rate"],
+        weight_decay=best_train_config["weight_decay"],
+        max_grad_norm=best_train_config["max_grad_norm"]
     )
     
     # Create callbacks for validation and checkpointing
@@ -162,7 +164,7 @@ def create_with_raytune(
     # Model checkpoint callback to save best model based on validation loss
     checkpoint_callback = ModelCheckpoint(
         monitor='val_total_loss',
-        dirpath=save_dir if save_dir else './checkpoints',
+        dirpath=f"{save_dir}/checkpoints",
         filename='best_model-{epoch:02d}-{val_total_loss:.4f}',
         save_top_k=1,
         mode='min',
@@ -188,7 +190,7 @@ def create_with_raytune(
         deterministic=True,
         check_val_every_n_epoch=1,
         logger=wandb_logger,
-        gradient_clip_val=best_config["max_grad_norm"],
+        gradient_clip_val=best_train_config["max_grad_norm"],
         callbacks=callbacks,
         log_every_n_steps=10 if verbose else 50,
     )
@@ -210,7 +212,8 @@ def create_with_raytune(
         best_model = Projector.load_from_checkpoint(
             checkpoint_callback.best_model_path,
             teacher_dim=teacher_dim,
-            student_dim=student_dim
+            student_dim=student_dim,
+            alignment_beta=alignment_beta,
         )
     
     # Run validation on the best model
@@ -269,10 +272,10 @@ def create_with_raytune(
     
     # Save results
     if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
+        Path(save_dir).makedirs(parents=True, exist_ok=True)
         
         with open(f"{save_dir}/best_params.json", 'w') as f:
-            json.dump(best_config, f, indent=4)
+            json.dump(best_train_config, f, indent=4)
         
         with open(f"{save_dir}/val_metrics.json", 'w') as f:
             json.dump(val_metrics, f, indent=4)
@@ -283,8 +286,8 @@ def create_with_raytune(
         with open(f"{save_dir}/comparison_metrics.json", 'w') as f:
             json.dump(comparison_metrics, f, indent=4)
         
-        torch.save(best_model.state_dict(), f"{save_dir}/best_weights.pt")
-        best_model.save_pretrained(f"{save_dir}/best_model")
+        # torch.save(best_model.state_dict(), f"{save_dir}/state_dict.pt")
+        best_model.save_pretrained(save_dir)
         
         # Save model to wandb if requested
         if wandb_log_weights and wandb_logger.experiment:
@@ -293,7 +296,7 @@ def create_with_raytune(
                 type="model",
                 description="Best model from hyperparameter tuning"
             )
-            model_artifact.add_file(f"{save_dir}/best_weights.pt")
+            model_artifact.add_file(f"{save_dir}/projector.bin")
             wandb_logger.experiment.log_artifact(model_artifact)
         
         if verbose:
@@ -305,4 +308,4 @@ def create_with_raytune(
     if verbose:
         print("Final training completed. W&B run finished.")
     
-    return best_model, best_config, analysis, val_metrics, test_metrics, comparison_metrics
+    return best_model  #, best_train_config, analysis, val_metrics, test_metrics, comparison_metrics

@@ -9,7 +9,7 @@ from kdfp.utils.shallow_model_loading import (
     load_shallow, 
     _load_shallow_tl, 
     _load_shallow_hf,
-    get_indices_and_layers_to_keep
+    get_indices_and_num_layers_to_keep
 )
 
 
@@ -85,7 +85,9 @@ class TestWeightCopying:
         mock_hooked_transformer.return_value = shallow_model
         
         # Run the function with reduction factor 0.25 (12 * 0.25 = 3 layers)
-        result_model, tokenizer, keep_indices = _load_shallow_tl("test_model", 0.25)
+        result_model, tokenizer, keep_indices = _load_shallow_tl(model_name="test_model",
+                                                                 layer_reduction_factor=0.25,
+                                                                 selection_method='linspace')
         
         # Calculate expected layer indices: torch.linspace(0, 11, 3) = [0, 6, 11]
         expected_indices = [0, 6, 11]
@@ -113,7 +115,9 @@ class TestWeightCopying:
         mock_hooked_transformer.return_value = shallow_model
         
         # Run the function with reduction factor 0.25
-        _load_shallow_tl("test_model", 0.25)
+        _load_shallow_tl(model_name="test_model",
+                         layer_reduction_factor=0.25,
+                         selection_method='linspace')
         
         # Verify each component was loaded with correct weights
         for component in ['embed', 'unembed', 'ln_final', 'pos_embed']:
@@ -152,7 +156,9 @@ class TestWeightCopying:
         mock_tokenizer.from_pretrained.return_value = tokenizer
         
         # Run the function with reduction factor 0.25
-        result_model, result_tokenizer, keep_indices = _load_shallow_hf("gpt2", 0.25)
+        result_model, result_tokenizer, keep_indices = _load_shallow_hf(model_name="gpt2",
+                                                                        layer_reduction_factor=0.25,
+                                                                        selection_method='linspace')
         
         # Calculate expected layer indices: torch.linspace(0, 11, 3) = [0, 6, 11]
         expected_indices = [0, 6, 11]
@@ -192,7 +198,9 @@ class TestWeightCopying:
         mock_tokenizer.from_pretrained.return_value = tokenizer
         
         # Run the function with reduction factor 0.25
-        _, _, keep_indices = _load_shallow_hf("gpt2", 0.25)
+        _, _, keep_indices = _load_shallow_hf(model_name="gpt2",
+                                              layer_reduction_factor=0.25,
+                                              selection_method='linspace')
         
         # Verify load_state_dict was called with modified state
         shallow_model.load_state_dict.assert_called_once()
@@ -223,7 +231,9 @@ class TestWeightCopying:
         ]
         
         for total_layers, reduction_factor, expected_count, expected_indices in test_cases:
-            keep_indices, layers_to_keep = get_indices_and_layers_to_keep(total_layers=total_layers, layer_reduction_factor=reduction_factor)
+            keep_indices, layers_to_keep = get_indices_and_num_layers_to_keep(total_layers=total_layers,
+                                                                          layer_reduction_factor=reduction_factor,
+                                                                          selection_method='linspace')
 
             assert len(keep_indices) == expected_count, f"Failed for {total_layers}/{reduction_factor}: expected {expected_count}, got {len(keep_indices)}"
             assert keep_indices == expected_indices, f"Failed for {total_layers}/{reduction_factor}: got {keep_indices}, expected {expected_indices}"
@@ -262,7 +272,9 @@ class TestKeepIndicesValidation:
         setattr(config, 'n_layer', total_layers)  # Using setattr to handle dynamic attribute
         mock_config.from_pretrained.return_value = config
 
-        _, layers_to_keep = get_indices_and_layers_to_keep(total_layers=total_layers, layer_reduction_factor=reduction_factor)
+        _, layers_to_keep = get_indices_and_num_layers_to_keep(total_layers=total_layers,
+                                                           layer_reduction_factor=reduction_factor,
+                                                           selection_method='linspace')
         
         shallow_model = MagicMock()
         shallow_model.transformer.h = [MagicMock() for _ in range(layers_to_keep)]
@@ -278,7 +290,9 @@ class TestKeepIndicesValidation:
         mock_tokenizer.from_pretrained.return_value = tokenizer
         
         # Run the function
-        _, _, keep_indices = _load_shallow_hf("gpt2", reduction_factor)
+        _, _, keep_indices = _load_shallow_hf(model_name="gpt2",
+                                              layer_reduction_factor=reduction_factor,
+                                              selection_method='linspace')
         
         # Verify the keep_indices match expected
         assert keep_indices == expected_indices, (
@@ -307,7 +321,9 @@ class TestKeepIndicesValidation:
         mock_hooked_transformer.return_value = shallow_model
         
         # Run the function with reduction factor 0.5
-        _, _, keep_indices = _load_shallow_tl("test_model", 0.5)
+        _, _, keep_indices = _load_shallow_tl(model_name="test_model",
+                                              layer_reduction_factor=0.5,
+                                              selection_method='linspace')
         
         # For 8 layers with reduction factor 0.5: torch.linspace(0, 7, 4) = [0, 2, 5, 7]
         expected_indices = [0, 2, 5, 7]
@@ -338,7 +354,9 @@ class TestEdgeCases:
         mock_hooked_transformer.return_value = shallow_model
         
         # Run the function with very small reduction factor
-        _, _, keep_indices = _load_shallow_tl("test_model", 0.01)
+        _, _, keep_indices = _load_shallow_tl(model_name="test_model",
+                                              layer_reduction_factor=0.01,
+                                              selection_method='linspace')
         
         # Should keep exactly 1 layer (index 0)
         assert len(keep_indices) == 1
@@ -365,7 +383,9 @@ class TestEdgeCases:
         mock_hooked_transformer.return_value = shallow_model
         
         # Run the function with reduction factor > 1
-        _, _, keep_indices = _load_shallow_tl("test_model", 1.5)
+        _, _, keep_indices = _load_shallow_tl(model_name="test_model",
+                                              layer_reduction_factor=1.5,
+                                              selection_method='linspace')
         
         # Should keep all 12 layers
         assert len(keep_indices) == 12
@@ -384,10 +404,13 @@ class TestWeightPreservation:
         """
         model_name = "EleutherAI/pythia-31m"
         reduction_factor = 0.5
+        selection_method = 'linspace'
         
         try:
             # Load and create shallow model
-            shallow_model, tokenizer, keep_indices = _load_shallow_hf(model_name, reduction_factor)
+            shallow_model, tokenizer, keep_indices = _load_shallow_hf(model_name=model_name,
+                                                                      layer_reduction_factor=reduction_factor,
+                                                                      selection_method='linspace')
             original_model = AutoModelForCausalLM.from_pretrained(model_name)
             
             # Get state dicts
@@ -417,6 +440,175 @@ class TestWeightPreservation:
             
         except Exception as e:
             pytest.skip(f"Could not load Pythia-31M model: {e}")
+
+class TestFirstNSelection:
+    """Test the 'first_n' selection method for layer reduction."""
+    
+    @pytest.mark.parametrize("total_layers,reduction_factor,expected_indices,expected_count", [
+        # Basic cases
+        (12, 0.5, [0, 1, 2, 3, 4, 5], 6),          # 12 * 0.5 = 6 layers (first 6)
+        (12, 0.25, [0, 1, 2], 3),                  # 12 * 0.25 = 3 layers (first 3)
+        (12, 0.33, [0, 1, 2, 3], 4),               # 12 * 0.33 ≈ 4 layers (first 4)
+        (8, 0.5, [0, 1, 2, 3], 4),                 # 8 * 0.5 = 4 layers (first 4)
+        (6, 0.33, [0, 1], 2),                      # 6 * 0.33 ≈ 2 layers (first 2)
+        
+        # Edge cases
+        (12, 1.0, list(range(12)), 12),            # 100% reduction = all layers
+        (12, 0.01, [0], 1),                        # Very small reduction = first layer only
+        (12, 1.5, list(range(12)), 12),            # >100% reduction = all layers
+        (1, 0.5, [0], 1),                          # Single layer model
+        (1, 1.0, [0], 1),                          # Single layer, 100% reduction
+    ])
+    def test_first_n_indices_calculation(self, total_layers, reduction_factor, 
+                                        expected_indices, expected_count):
+        """Test that first_n selection returns correct indices and count."""
+        keep_indices, layers_to_keep = get_indices_and_num_layers_to_keep(
+            total_layers=total_layers,
+            layer_reduction_factor=reduction_factor,
+            selection_method='first_n'
+        )
+        
+        assert layers_to_keep == expected_count, (
+            f"Expected {expected_count} layers, got {layers_to_keep}"
+        )
+        assert keep_indices == expected_indices, (
+            f"Expected indices {expected_indices}, got {keep_indices}"
+        )
+        assert len(keep_indices) == expected_count, (
+            f"Number of indices ({len(keep_indices)}) doesn't match expected count ({expected_count})"
+        )
+    
+    def test_first_n_versus_linspace_comparison(self):
+        """Test that first_n and linspace produce different results for same parameters."""
+        total_layers = 12
+        reduction_factor = 0.5
+        
+        first_n_indices, first_n_count = get_indices_and_num_layers_to_keep(
+            total_layers=total_layers,
+            layer_reduction_factor=reduction_factor,
+            selection_method='first_n'
+        )
+        
+        linspace_indices, linspace_count = get_indices_and_num_layers_to_keep(
+            total_layers=total_layers,
+            layer_reduction_factor=reduction_factor,
+            selection_method='linspace'
+        )
+        
+        # Both should keep the same number of layers
+        assert first_n_count == linspace_count == 6
+        
+        # But they should have different indices
+        assert first_n_indices != linspace_indices
+        assert first_n_indices == [0, 1, 2, 3, 4, 5]  # First 6 layers
+        assert linspace_indices == [0, 2, 4, 7, 9, 11]  # Evenly spaced
+    
+    @patch('kdfp.utils.shallow_model_loading.HookedTransformer')
+    def test_tl_first_n_selection(self, mock_hooked_transformer):
+        """Test that TransformerLens mode uses first_n selection correctly."""
+        total_layers = 8
+        reduction_factor = 0.5  # Should keep first 4 layers
+        
+        # Setup mock
+        original_model = MagicMock()
+        original_model.cfg.n_layers = total_layers
+        original_model.cfg.copy.return_value = MagicMock()
+        original_model.cfg.copy.return_value.n_layers = total_layers
+        original_model.blocks = [MagicMock() for _ in range(total_layers)]
+        for component in ['embed', 'unembed', 'ln_final', 'pos_embed']:
+            setattr(original_model, component, MagicMock())
+        mock_hooked_transformer.from_pretrained.return_value = original_model
+        
+        # Create shallow model with expected number of layers
+        shallow_model = MagicMock()
+        shallow_model.blocks = [MagicMock() for _ in range(4)]  # 8 * 0.5 = 4 layers
+        for component in ['embed', 'unembed', 'ln_final', 'pos_embed']:
+            setattr(shallow_model, component, MagicMock())
+        mock_hooked_transformer.return_value = shallow_model
+        
+        # Run the function with first_n selection
+        _, _, keep_indices = _load_shallow_tl(
+            model_name="test_model",
+            layer_reduction_factor=reduction_factor,
+            selection_method='first_n'
+        )
+        
+        # Should keep first 4 layers: [0, 1, 2, 3]
+        expected_indices = [0, 1, 2, 3]
+        assert keep_indices == expected_indices
+    
+    @patch('kdfp.utils.shallow_model_loading.AutoModelForCausalLM')
+    @patch('kdfp.utils.shallow_model_loading.AutoConfig')
+    @patch('kdfp.utils.shallow_model_loading.AutoTokenizer')
+    def test_hf_first_n_selection(self, mock_tokenizer, mock_config, mock_model):
+        """Test that HuggingFace mode uses first_n selection correctly."""
+        total_layers = 10
+        reduction_factor = 0.3  # Should keep first 3 layers
+        
+        # Setup mocks
+        original_model = MagicMock()
+        original_model.transformer.h = [MagicMock() for _ in range(total_layers)]
+        original_model.state_dict.return_value = {
+            'transformer.wte.weight': torch.randn(10, 8),
+            'transformer.wpe.weight': torch.randn(10, 8),
+            'transformer.ln_f.weight': torch.randn(8),
+            'lm_head.weight': torch.randn(10, 8),
+        }
+        mock_model.from_pretrained.return_value = original_model
+        
+        config = MagicMock()
+        setattr(config, 'n_layer', total_layers)
+        mock_config.from_pretrained.return_value = config
+        
+        # Create shallow model with expected number of layers
+        shallow_model = MagicMock()
+        shallow_model.transformer.h = [MagicMock() for _ in range(3)]  # 10 * 0.3 = 3 layers
+        shallow_model.state_dict.return_value = {
+            'transformer.wte.weight': torch.randn(10, 8),
+            'transformer.wpe.weight': torch.randn(10, 8),
+            'transformer.ln_f.weight': torch.randn(8),
+            'lm_head.weight': torch.randn(10, 8),
+        }
+        mock_model.from_config.return_value = shallow_model
+        
+        tokenizer = MagicMock()
+        mock_tokenizer.from_pretrained.return_value = tokenizer
+        
+        # Run the function with first_n selection
+        _, _, keep_indices = _load_shallow_hf(
+            model_name="gpt2",
+            layer_reduction_factor=reduction_factor,
+            selection_method='first_n'
+        )
+        
+        # Should keep first 3 layers: [0, 1, 2]
+        expected_indices = [0, 1, 2]
+        assert keep_indices == expected_indices
+    
+    def test_first_n_consistency_across_runs(self):
+        """Test that first_n selection is deterministic and consistent."""
+        total_layers = 12
+        reduction_factor = 0.25
+        
+        # Run multiple times
+        results = []
+        for _ in range(5):
+            keep_indices, layers_to_keep = get_indices_and_num_layers_to_keep(
+                total_layers=total_layers,
+                layer_reduction_factor=reduction_factor,
+                selection_method='first_n'
+            )
+            results.append((keep_indices, layers_to_keep))
+        
+        # All results should be identical
+        first_result = results[0]
+        for result in results[1:]:
+            assert result == first_result, "first_n selection should be deterministic"
+        
+        # Verify the expected result
+        expected_indices = [0, 1, 2]  # 12 * 0.25 = 3 layers (first 3)
+        expected_count = 3
+        assert first_result == (expected_indices, expected_count)
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
