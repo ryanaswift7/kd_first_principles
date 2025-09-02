@@ -27,7 +27,7 @@ def parse_cli_args():
 def main(config_path: str):
     # grab config and set root save dir
     config = GlobalConfig.from_yaml(config_path)
-    save_dir = "./results"
+    # save_dir = "./results"
 
     columns = ["experiment"]
     columns.extend(config.tasks.keys())
@@ -42,7 +42,7 @@ def main(config_path: str):
     # for i, experiment in enumerate(experiment_list):
     #     print(f"Starting experiment {i}: {experiment.name.upper()}")
     #     experiment.init()
-    #     results = experiment.run(save_dir=f"{save_dir}/{experiment.name}")
+    #     results = experiment.run()
 
     #     new_row = pd.DataFrame([dict(zip(result_df.columns.tolist(), results))])
     #     result_df = pd.concat([result_df, new_row], ignore_index=True)

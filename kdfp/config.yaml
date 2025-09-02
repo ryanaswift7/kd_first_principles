@@ -1,20 +1,45 @@
 teacher_name: &teacher_name EleutherAI/pythia-1.4b-deduped
 students: 
-  layer_reduction:
+  shallow:
     name: *teacher_name
     factor: 1/3
-  dim_reduction:
+  narrow:
     name: EleutherAI/pythia-410m-deduped
 
-projector_training:
-  dataset: common-pile/comma_v0.1_training_dataset
-  total_tokens: 1000
+directories:
+  root: results/
+  cache: cache/
+  models: models/
+  scores: scores/
+
+offline_projector_params:
+  alignment_betas: [0.5]  # [0.0, 0.25, 0.5, 0.75, 1.0]
+  training_args:
+    dataset: 
+      name: common-pile/comma_v0.1_training_dataset
+      subset: null
+      split: train
+      shuffle: false
+      token_rename: false
+    total_tokens: 1000
+    cache_batch_size: 8
+    n_trials: 1
+    force_cache_all: false
+    num_gpus_per_trial: 1.0
+    num_cpus_per_trial: 8
+
+
+# projector_training:
+#   dataset: common-pile/comma_v0.1_training_dataset
+#   total_tokens: 1000
 
 training_params:
   seed: [44] # [3, 27, 44]
   seq_len: 128
   num_epochs: 10
   reproducible_backend: true
+  num_workers: 1  # 4
+  device: 'cuda'  # 'mps' (?)
 
 hook_types:
   single:
@@ -25,11 +50,11 @@ hook_types:
     - "hook_mlp_out"
     - "hook_resid_post"
 
-projection:
+projection_variants:
   directions: ['up']  # ["up", "down"]
-  training_methods: ["offline"]  #["online", "offline"]
+  training_methods: ["online", "offline"]
 
-offline_projector_alignment_betas: [0.5]  # [0.0, 0.25, 0.5, 0.75, 1.0]
+# offline_projector_alignment_betas: [0.5]  # [0.0, 0.25, 0.5, 0.75, 1.0]
 
 objective_weight_variants:
   # - "only_outputs"

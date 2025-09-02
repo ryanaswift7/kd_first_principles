@@ -5,8 +5,11 @@ import torch
 import kdfp.utils.weight_conversion as wc
 from kdfp.schemas.configBase import ConfigBase
 
+
 class LM(ConfigBase):
     model_name: str
+    d_model: int
+    # model_dir: Optional[str] = None
     tl: Optional[HookedTransformer] = None
     hf: Optional[AutoModelForCausalLM] = None
     layer_reduction_factor: Optional[float] = None
@@ -21,6 +24,7 @@ class LM(ConfigBase):
             'model_name': self.model_name,
             'layer_reduction_factor': self.layer_reduction_factor,
             'hook_list': self.hook_list,
+            'd_model': self.d_model,
         }
         return config_dict
 

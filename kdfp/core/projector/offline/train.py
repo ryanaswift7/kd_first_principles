@@ -3,7 +3,7 @@ import pytorch_lightning as pl
 from ray.tune.integration.pytorch_lightning import TuneReportCheckpointCallback
 from kdfp.utils.data import ProjectorDataset
 from .projectorDataModule import ProjectorDataModule
-from .projector import Projector
+from .offlineProjector import OfflineProjector
 
 def train_projector(config: Dict[str, Any], 
                    dataset: ProjectorDataset,
@@ -12,8 +12,10 @@ def train_projector(config: Dict[str, Any],
                    alignment_beta: float,
                    max_epochs: int = 10,
                    val_split: float = 0.1,
-                   test_split: float = 0.1):
+                   test_split: float = 0.1,
+                   reproducible_backend: bool = True,):
     """Training function for Ray Tune"""
+
     
     datamodule = ProjectorDataModule(
         dataset=dataset,
@@ -29,7 +31,7 @@ def train_projector(config: Dict[str, Any],
     #     'alignment': config.get("align_weight"),
     # }
     
-    model = Projector(
+    model = OfflineProjector(
         teacher_dim=teacher_dim,
         student_dim=student_dim,
         alignment_beta=alignment_beta,
@@ -53,7 +55,7 @@ def train_projector(config: Dict[str, Any],
         enable_progress_bar=True,
         logger=False,
         enable_checkpointing=False,
-        deterministic=True,
+        deterministic=reproducible_backend,
         check_val_every_n_epoch=1
     )
     

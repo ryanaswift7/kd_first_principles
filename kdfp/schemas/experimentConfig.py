@@ -6,18 +6,19 @@ from kdfp.schemas.configBase import ConfigBase
 from pathlib import Path
 import json
 from pydantic import model_validator
-from kdfp.schemas.subConfigs import (TrainingParamsConfig,
-                                       HyperparamsConfig)
+from kdfp.schemas.subConfigs import (ExpDirConfig, OffProjTrainArgsConfig, TrainingParamsConfig,
+                                       HyperparamsConfig,
+                                       ExpProjectionConfig)
+from kdfp.core.init import init_projector
 
 class ExperimentConfig(ConfigBase):
     name: str
     reduction: Literal["shallow", "narrow"]
     teacher: LM
     student: LM
+    dirs: ExpDirConfig
     training_params: TrainingParamsConfig
-    projection_direction: Optional[Literal["up", "down"]]
-    projection_training: Optional[Literal["online", "offline"]]
-    offline_projector_alignment_beta: Optional[float]
+    projection: Optional[ExpProjectionConfig]
     objective_weight_variant: str
     objective_weights: ObjectiveWeights
     jsd_beta: Optional[float]
@@ -27,13 +28,14 @@ class ExperimentConfig(ConfigBase):
 
     @model_validator(mode='after')
     def validate_and_transform_config(self) -> 'ExperimentConfig':
-        if self.reduction == "shallow":
-            self.projection_direction = None
-            self.projection_training = None
-            self.offline_projector_alignment_beta = None
+        if self.projection:
+            if self.reduction == "shallow":
+                # all of the fields are already none but I'd prefer
+                # to also make the whole object None
+                self.projection = None
 
-        if self.projection_direction == "online":
-            self.offline_projector_alignment_beta = None
+            elif self.projection.direction == "online":
+                self.projection.offline_projector_alignment_beta = None
         return self
 
     def to_config_dict(self) -> Dict[str, Any]:
@@ -45,12 +47,11 @@ class ExperimentConfig(ConfigBase):
         """
         config_dict = {
             'name': self.name,
+            'dirs': self.dirs.to_config_dict(),
             'reduction': self.reduction,
             'teacher': self.teacher.to_config_dict(),
             'student': self.student.to_config_dict(),
-            'projection_direction': self.projection_direction,
-            'projection_training': self.projection_training,
-            'offline_projector_alignment_beta': self.offline_projector_alignment_beta,
+            'projection': self.projection.to_config_dict() if self.projection else "None",
             'objective_weight_variant': self.objective_weight_variant,
             'objective_weights': self.objective_weights.to_config_dict(),
             'jsd_beta': self.jsd_beta,
@@ -92,5 +93,15 @@ class ExperimentConfig(ConfigBase):
     
     def init(self) -> None:
         """Initialize teacher, student, and projector"""
-        pass
+        init_projector(teacher=self.teacher,
+                       student=self.student,
+                       projection=self.projection,
+                       cache_dir=self.dirs.cache,
+                       save_dir=self.dirs.projector_model,
+                       projection=self.projection,
+                       off_proj_train_args=self.projection.offline_projector_training_args,
+                       train_params=self.training_params,
+                       hyperparams=self.hyperparams,
+                       teacher_dir=None,
+                       student_dir=None,)
 

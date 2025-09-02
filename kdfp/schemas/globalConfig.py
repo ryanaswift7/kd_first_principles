@@ -5,28 +5,35 @@ from kdfp.schemas.experimentConfig import ExperimentConfig, TaskSpec, LM
 from transformer_lens import HookedTransformer
 from kdfp.utils.shallow_model_loading import get_indices_and_num_layers_to_keep
 from kdfp.schemas.objective_weights import OBJECTIVE_WEIGHT_VARIANTS_MAP
-from kdfp.schemas.subConfigs import (StudentConfigs,
-                                       ProjectorTrainingConfig,
+from kdfp.schemas.subConfigs import (BaseDirConfig, ExpDirConfig, OffProjParamsConfig, StudentConfigs,
+                                    #    ProjectorTrainingConfig,
                                        TrainingParamsConfig,
                                        HyperparamsConfig,
                                        TaskConfig,
                                        DistillationHooks,
-                                       HookLists)
+                                       ReductionHooks,
+                                       DistillationDims,
+                                       ReductionDims,
+                                       ExpProjectionConfig)
 
 
 class GlobalConfig(BaseModel):
     teacher_name: str
     students: StudentConfigs
-    projector_training: ProjectorTrainingConfig
+    directories: BaseDirConfig
+    offline_projector_params: OffProjParamsConfig
+    # projector_training: ProjectorTrainingConfig
     training_params: TrainingParamsConfig
+
     hook_types: Dict[str, List[str]] = Field(..., description="Keys 'single' and 'per_layer' with lists of hook names")
-    projection: Dict[str, List[str]] = Field(..., description="Keys 'directions' and 'training_methods'")
-    offline_projector_alignment_betas: List[float]
+    projection_variants: Dict[str, List[str]] = Field(..., description="Keys 'directions' and 'training_methods'")
+    # offline_projector_alignment_betas: List[float]
     objective_weight_variants: List[str]
     jsd_betas: List[float]
     hyperparams: HyperparamsConfig
     tasks: Dict[str, TaskConfig] # A dictionary where the key is the task name (e.g., 'hellaswag') and the value is its config
     hooks: Optional[DistillationHooks] = None
+    dims: Optional[DistillationDims] = None
 
     # Optional: Validator to ensure hook point keys are expected
     @field_validator('hook_types')
@@ -39,24 +46,28 @@ class GlobalConfig(BaseModel):
     @model_validator(mode='after')
     def generate_both_hook_lists(self) -> 'GlobalConfig':
         # self.hooks = DistillationHooks()
-        tn = self._generate_hook_list(model_name=self.teacher_name)
-        ts = self._generate_hook_list(model_name=self.teacher_name,
-                                                      layer_reduction_factor=self.students.layer_reduction.factor,
+        tn_hooks, tn_dims = self._generate_hook_list(model_name=self.teacher_name)
+        ts_hooks, ts_dims = self._generate_hook_list(model_name=self.teacher_name,
+                                                      layer_reduction_factor=self.students.shallow.factor,
                                                       selection_method='linspace')
         """
         - The shallow student is first n layers because once we actually load in the shallow student,
           the first n layers will be the entire student model.
         - This way, the linspaced teacher layers match up with all of the student layers
         """
-        sn = self._generate_hook_list(model_name=self.students.dim_reduction.name)
-        ss = self._generate_hook_list(model_name=self.students.layer_reduction.name,
-                                                      layer_reduction_factor=self.students.layer_reduction.factor,
+        sn_hooks, sn_dims = self._generate_hook_list(model_name=self.students.narrow.name)
+        ss_hooks, ss_dims = self._generate_hook_list(model_name=self.students.shallow.name,
+                                                      layer_reduction_factor=self.students.shallow.factor,
                                                       selection_method='first_n')
         
-        teacher_hooks = HookLists(narrow=tn, shallow=ts)
-        student_hooks = HookLists(narrow=sn, shallow=ss)
-
+        teacher_hooks = ReductionHooks(narrow=tn_hooks, shallow=ts_hooks)
+        student_hooks = ReductionHooks(narrow=sn_hooks, shallow=ss_hooks)
         self.hooks = DistillationHooks(teacher=teacher_hooks, student=student_hooks)
+
+        teacher_dims = ReductionDims(narrow=tn_dims, shallow=ts_dims)
+        student_dims = ReductionDims(narrow=sn_dims, shallow=ss_dims)
+        self.dims = DistillationDims(teacher=teacher_dims, student=student_dims)
+
         return self
 
     # Class method to load from a YAML file
@@ -83,6 +94,7 @@ class GlobalConfig(BaseModel):
                             layer_reduction_factor: Optional[float] = None,
                             selection_method: Optional[Literal['linspace', 'first_n']] = None) -> List[str]:
         lm = HookedTransformer.from_pretrained(model_name)
+        d_model = lm.cfg.d_model
         if layer_reduction_factor is not None:
             assert selection_method, "You must supply a selection method if performing layer reduction"
             layer_idx_list, _ = get_indices_and_num_layers_to_keep(total_layers=lm.cfg.n_layers,
@@ -96,18 +108,22 @@ class GlobalConfig(BaseModel):
         for idx in layer_idx_list:
             for hp in self.hook_types["per_layer"]:
                 hooks.append(f"blocks.{idx}.{hp}")
-        return hooks
+        return hooks, d_model
 
     def generate_experiment_list(self, debug: bool = False) -> List[ExperimentConfig]:
         tasks = self.generate_task_list()
 
+        base_cache_dir = self.directories.root + self.directories.cache
+        base_model_dir = self.directories.root + self.directories.models
+        base_scores_dir = self.directories.root + self.directories.scores
+
         experiment_list = []
 
-        for proj_dir in self.projection["directions"]:
-            for proj_train in self.projection["training_methods"]: 
+        for proj_dir in self.projection_variants["directions"]:
+            for proj_train in self.projection_variants["training_methods"]: 
                 for obj_weight_variant in self.objective_weight_variants:
                     for jsd_beta in self.jsd_betas:
-                            for off_proj_align_beta in self.offline_projector_alignment_betas:
+                            for off_proj_align_beta in self.offline_projector_params.alignment_betas:
                                 for reduction in ["shallow", "narrow"]:
                                     if reduction == "narrow":
                                         proj_str = f"{proj_dir}_{proj_train}"
@@ -115,39 +131,56 @@ class GlobalConfig(BaseModel):
                                             proj_str += f"_align_{off_proj_align_beta}"
                                         proj_str += '-'
                                         teacher = LM(model_name=self.teacher_name,
-                                                     hook_list=self.hooks.teacher.narrow)
-                                        student = LM(model_name=self.students.dim_reduction.name,
-                                                     hook_list=self.hooks.student.narrow)
-                                        # hook_list = self.teacher_narrow_hooks
+                                                     hook_list=self.hooks.teacher.narrow,
+                                                     d_model=self.dims.teacher.narrow)
+                                        student = LM(model_name=self.students.narrow.name,
+                                                     hook_list=self.hooks.student.narrow,
+                                                     d_model=self.dims.student.narrow)
                                         projection_direction = proj_dir
                                         projection_training = proj_train
                                         offline_projector_alignment_beta = off_proj_align_beta
 
+
                                     elif reduction == "shallow":
                                         proj_str = ""
                                         teacher = LM(model_name=self.teacher_name,
-                                                     hook_list=self.hooks.teacher.shallow)
-                                        student = LM(model_name=self.students.layer_reduction.name,
-                                                     hook_list=self.hooks.student.shallow)
+                                                     hook_list=self.hooks.teacher.shallow,
+                                                     d_model=self.dims.teacher.shallow)
+                                        student = LM(model_name=self.students.shallow.name,
+                                                     hook_list=self.hooks.student.shallow,
+                                                     d_model=self.dims.student.shallow)
                                         projection_direction = None
                                         projection_training = None
                                         offline_projector_alignment_beta = None
 
                                     else:
-                                        raise ValueError("Invalid reduction specified. Must be either 'layer' or 'dim'.")
+                                        raise ValueError("Invalid reduction specified. Must be either 'shallow' or 'narrow'.")
 
 
                                     exp_name = f"{reduction}-{proj_str}{obj_weight_variant}-jsd_{jsd_beta}"
+                                    projection = ExpProjectionConfig(
+                                        direction=projection_direction,
+                                        training=projection_training,
+                                        offline_projector_alignment_beta=offline_projector_alignment_beta,
+                                        offline_projector_training_args=self.offline_projector_params.training_args,
+                                    )
+
+                                    # only use cache for offline projector training
+                                    cache_dir = base_cache_dir if projection_training == 'offline' else None
+                                    projector_directory = f"{base_model_dir}/projector_{offline_projector_alignment_beta}" if offline_projector_alignment_beta else None
+                                    exp_dirs = ExpDirConfig(cache=cache_dir,
+                                                            projector_model=projector_directory,
+                                                            teacher_model=f"{base_model_dir}/{teacher.model_name}",
+                                                            student_model=f"{base_model_dir}/{exp_name}",
+                                                            student_scores=f"{base_scores_dir}/{exp_name}")
                                     exp = ExperimentConfig(
                                         name=exp_name,
+                                        dirs=exp_dirs,
                                         reduction=reduction,
                                         teacher=teacher,
                                         student=student,
                                         training_params=self.training_params,
-                                        projection_direction=projection_direction,
-                                        projection_training=projection_training,
-                                        offline_projector_alignment_beta=offline_projector_alignment_beta,
-                                        # hook_list=hook_list,
+                                        projection=projection,
                                         objective_weight_variant=obj_weight_variant,
                                         objective_weights=OBJECTIVE_WEIGHT_VARIANTS_MAP[obj_weight_variant],
                                         jsd_beta=jsd_beta,
@@ -155,36 +188,43 @@ class GlobalConfig(BaseModel):
                                         tasks=tasks,
                                     )
                                     experiment_list.append(exp)
-                                    # exp_names.append(exp_name)
 
         # need to add in baseline experiments
+        SHALLOW_FT_NAME = "shallow_ft"
         ft_shallow_student = ExperimentConfig(
-            name="shallow_ft",
+            name=SHALLOW_FT_NAME,
+            dirs=ExpDirConfig(cache=None,
+                              teacher_model=f"{base_model_dir}/{self.teacher_name}",
+                              student_model=f"{base_model_dir}/{SHALLOW_FT_NAME}",
+                              student_scores=f"{base_scores_dir}/{SHALLOW_FT_NAME}"),
             reduction="shallow",
-            teacher=LM(model_name=self.teacher_name),
-            student=LM(model_name=self.students.layer_reduction.name,
-                       layer_reduction_factor=self.students.layer_reduction.factor),
+            teacher=LM(model_name=self.teacher_name,
+                       d_model=self.dims.teacher.shallow),
+            student=LM(model_name=self.students.shallow.name,
+                       layer_reduction_factor=self.students.shallow.factor,
+                       d_model=self.dims.student.shallow),
             training_params=self.training_params,
-            projection_direction=None,
-            projection_training=None,
-            offline_projector_alignment_beta=None,
-            # hook_list=hook_list,
+            projection=None,
             objective_weight_variant="finetuning",
             objective_weights=OBJECTIVE_WEIGHT_VARIANTS_MAP["finetuning"],
             jsd_beta=None,
             hyperparams=self.hyperparams,
             tasks=tasks,
         )
+        NARROW_FT_NAME = "narrow_ft"
         ft_narrow_student = ExperimentConfig(
-            name="narrow_ft",
+            name=NARROW_FT_NAME,
+            dirs=ExpDirConfig(cache=None,
+                              teacher_model=f"{base_model_dir}/{self.teacher_name}",
+                              student_model=f"{base_model_dir}/{NARROW_FT_NAME}",
+                              student_scores=f"{base_scores_dir}/{NARROW_FT_NAME}"),
             reduction="narrow",
-            teacher=LM(model_name=self.teacher_name),
-            student=LM(model_name=self.students.dim_reduction.name),
+            teacher=LM(model_name=self.teacher_name,
+                       d_model=self.dims.teacher.narrow),
+            student=LM(model_name=self.students.narrow.name,
+                       d_model=self.dims.student.narrow),
             training_params=self.training_params,
-            projection_direction=None,
-            projection_training=None,
-            offline_projector_alignment_beta=None,
-            # hook_list=hook_list,
+            projection=None,
             objective_weight_variant="finetuning",
             objective_weights=OBJECTIVE_WEIGHT_VARIANTS_MAP["finetuning"],
             jsd_beta=None,
@@ -193,7 +233,6 @@ class GlobalConfig(BaseModel):
         )
 
         experiment_list.extend([ft_shallow_student, ft_narrow_student])
-        # exp_names.extend([ft_shallow_student.name, ft_narrow_student.name])
 
         if debug:
             print(f"Total experiments created: {len(experiment_list)}")
