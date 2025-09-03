@@ -2,7 +2,7 @@ from typing import Optional, Union, Dict, Any
 from kdfp.schemas.configBase import ConfigBase
 
 class TaskSpec(ConfigBase): 
-    task_name: str
+    name: str
     dataset: str
     subset: Optional[str] = None
     num_fewshot: int = 0

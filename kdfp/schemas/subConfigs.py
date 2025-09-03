@@ -30,6 +30,7 @@ class HyperparamsConfig(BaseModel):
     batch_size: List[int]
 
 class TaskConfig(BaseModel):
+    name: str
     dataset: str
     subset: Optional[str] = None
 
@@ -76,7 +77,7 @@ class BaseDirConfig(BaseModel):
 
 class ExpDirConfig(ConfigBase):
     cache: Optional[str] = None
-    projector_model: Optional[str] = None
+    off_proj_model: Optional[str] = None
     teacher_model: str
     student_model: str
     student_scores: str
@@ -87,6 +88,7 @@ class ExpDirConfig(ConfigBase):
             "teacher_model": self.teacher_model,
             "student_model": self.student_model,
             "student_scores": self.student_scores,
+            "off_proj_model": self.off_proj_model,
         }
         return config_dict
 

@@ -86,7 +86,7 @@ class GlobalConfig(BaseModel):
     def generate_task_list(self) -> List[TaskSpec]:
         tasks = []
         for k, v in self.tasks.items():
-            t = TaskSpec(task_name=k, dataset=v.dataset, subset=v.subset)
+            t = TaskSpec(name=k, dataset=v.dataset, subset=v.subset)
             tasks.append(t)
         return tasks
     
@@ -169,7 +169,7 @@ class GlobalConfig(BaseModel):
                                     cache_dir = base_cache_dir if projection_training == 'offline' else None
                                     projector_directory = f"{base_model_dir}/projector_{offline_projector_alignment_beta}" if offline_projector_alignment_beta else None
                                     exp_dirs = ExpDirConfig(cache=cache_dir,
-                                                            projector_model=projector_directory,
+                                                            off_proj_model=projector_directory,
                                                             teacher_model=f"{base_model_dir}/{teacher.model_name}",
                                                             student_model=f"{base_model_dir}/{exp_name}",
                                                             student_scores=f"{base_scores_dir}/{exp_name}")

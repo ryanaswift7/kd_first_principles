@@ -9,7 +9,9 @@ from pydantic import model_validator
 from kdfp.schemas.subConfigs import (ExpDirConfig, OffProjTrainArgsConfig, TrainingParamsConfig,
                                        HyperparamsConfig,
                                        ExpProjectionConfig)
-from kdfp.core.init import init_projector
+from kdfp.core.projector import OfflineProjector, OnlineProjector, OFF_PROJ_STATE_DICT_FILE
+from kdfp.utils.activation_caching import activation_caching
+import torch.nn as nn
 
 class ExperimentConfig(ConfigBase):
     name: str
@@ -91,17 +93,97 @@ class ExperimentConfig(ConfigBase):
         print(f"Configuration saved to: {file_path}")
         return file_path
     
+
+    def _init_offline_projector(self,
+                                # cache_dir: str,
+                                # save_dir: str,
+                                teacher_dir: Optional[str] = None,
+                                student_dir: Optional[str] = None,) -> OfflineProjector:
+        """Initialize the offline projector for an experiment. Defaults to pretrained teacher
+            and student, but you may use a custom version instead by passing in the directories.
+        """
+        # if we already trained one, load it instead of creating another
+        weights_path = Path(self.dirs.off_proj_model) / OFF_PROJ_STATE_DICT_FILE
+        if weights_path.exists():
+            print(f"Loading pretrained projector at: {str(weights_path)}.")
+            p = OfflineProjector.load_pretrained(str(weights_path))
+            return p.extract_single_direction(direction=self.projection.direction)
+
+        # cache teacher and student acts
+        teacher_cache_dir, teacher_dim = activation_caching(lm_name=self.teacher.model_name,
+                                                lm_hook_points=self.teacher.hook_list,
+                                                dataset_name=self.off_proj_train_args.dataset.name,
+                                                dataset_subset=self.off_proj_train_args.dataset.subset,
+                                                split=self.off_proj_train_args.dataset.split,
+                                                seq_len=self.train_params.seq_len,
+                                                batch_size=self.off_proj_train_args.cache_batch_size,
+                                                cache_dir=self.dirs.cache,
+                                                token_rename=self.off_proj_train_args.dataset.token_rename,
+                                                shuffle=self.off_proj_train_args.dataset.shuffle,
+                                                lm_dir=teacher_dir,
+                                                total_tokens=self.off_proj_train_args.total_tokens,
+                                                force_cache_all=self.off_proj_train_args.force_cache_all,
+                                                cache_outputs=False,
+                                                num_workers=self.train_params.num_workers,
+                                                device=self.train_params.device)
+        
+        student_cache_dir, student_dim = activation_caching(lm_name=self.student.model_name,
+                                                lm_hook_points=self.student.hook_list,
+                                                dataset_name=self.off_proj_train_args.dataset.name,
+                                                dataset_subset=self.off_proj_train_args.dataset.subset,
+                                                split=self.off_proj_train_args.dataset.split,
+                                                seq_len=self.train_params.seq_len,
+                                                batch_size=self.off_proj_train_args.cache_batch_size,
+                                                cache_dir=self.dirs.cache,
+                                                token_rename=self.off_proj_train_args.dataset.token_rename,
+                                                shuffle=self.off_proj_train_args.dataset.shuffle,
+                                                lm_dir=student_dir,
+                                                total_tokens=self.off_proj_train_args.total_tokens,
+                                                force_cache_all=self.off_proj_train_args.force_cache_all,
+                                                cache_outputs=False,
+                                                num_workers=self.train_params.num_workers,
+                                                device=self.train_params.device)
+
+        # create projector
+        projector = OfflineProjector.create(
+            teacher_cache_dir=teacher_cache_dir,
+            student_cache_dir=student_cache_dir,
+            teacher_dim=teacher_dim,
+            student_dim=student_dim,
+            alignment_beta=self.projection.offline_projector_alignment_beta,
+            max_epochs=self.train_params.num_epochs,
+            weight_decay_choices=self.hyperparams.weight_decay,
+            max_grad_norm_choices=self.hyperparams.max_grad_norm,
+            batch_size_choices=self.hyperparams.batch_size,
+            n_trials=self.off_proj_train_args.n_trials,
+            save_dir=f"{self.dirs.off_proj_model}/projector_{self.projection.offline_projector_alignment_beta}",
+            seed=self.train_params.seed,
+            reproducible_backend=self.train_params.reproducible_backend,
+            num_gpus_per_trial=self.off_proj_train_args.num_gpus_per_trial,
+            num_cpus_per_trial=self.off_proj_train_args.num_cpus_per_trial,
+        )
+        projector.save_pretrained(save_path=self.dirs.off_proj_model)
+        return projector.extract_single_direction(direction=self.projection.direction)
+
+    def _init_online_projector(self):
+        return OnlineProjector(teacher_dim=self.teacher.d_model,
+                            student_dim=self.student.d_model,
+                            direction=self.projection.direction)
+
+    def init_projector(self) -> nn.Module:
+        """Initialize projector for an experiment. kwargs are for init_offline_projector."""
+        if self.projection.training == 'online':
+            return self._init_online_projector()
+        elif self.projection.training == 'offline':
+            return self._init_offline_projector()
+        else:
+            raise ValueError(f"Invalid projection training specified: {self.projection.training}. Must be either 'online' or 'offline'.")
+        
+    # def init_teachers(self) -> None:
+
+
     def init(self) -> None:
-        """Initialize teacher, student, and projector"""
-        init_projector(teacher=self.teacher,
-                       student=self.student,
-                       projection=self.projection,
-                       cache_dir=self.dirs.cache,
-                       save_dir=self.dirs.projector_model,
-                       projection=self.projection,
-                       off_proj_train_args=self.projection.offline_projector_training_args,
-                       train_params=self.training_params,
-                       hyperparams=self.hyperparams,
-                       teacher_dir=None,
-                       student_dir=None,)
+        """Initialize teachers, student, and projector"""
+        self.init_projector()
+        # self.init_teachers()
 

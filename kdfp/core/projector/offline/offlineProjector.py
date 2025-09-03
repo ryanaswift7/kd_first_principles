@@ -164,17 +164,6 @@ class OfflineProjector(LightningModule):
             weight_decay=self.weight_decay
         )
 
-    # def project(self, x, projection_direction: str):
-    #     """Public method for projection in specific direction"""
-    #     if projection_direction == "teacher_to_student":
-    #         return self(x, direction="encode")
-    #     elif projection_direction == "student_to_teacher":
-    #         return self(x, direction="decode")
-    #     elif projection_direction == "autoencode":
-    #         return self(x, direction="autoencode")
-    #     else:
-    #         raise ValueError(f"Invalid projection direction: {projection_direction}")
-
     def save_pretrained(self, save_path: str):
         """Save model with configuration"""
         # Create directory if it doesn't exist
@@ -241,8 +230,9 @@ class OfflineProjector(LightningModule):
                weight_decay_choices: List[float],
                max_grad_norm_choices: List[float],
                batch_size_choices: List[int],
-               lr_choices: List[float] = [5e-5, 1e-4, 5e-4, 1e-3, 5e-3],
-               project_name: str = "kdfp_projector",
+               lr_min: float = 1e-5,
+               lr_max: float = 5e-3,
+               wandb_project_name: str = "kdfp_projector",
                n_trials: int = 15,
                val_split: float = 0.1,
                test_split: float = 0.1,
@@ -256,7 +246,7 @@ class OfflineProjector(LightningModule):
                # wandb_entity: Optional[str] = None,
                # wandb_run_name: Optional[str] = 'projector',
                # wandb_log_config: bool = True,
-               # wandb_log_gradients: bool = False,
+            #    wandb_log_gradients: bool = False,
                wandb_log_weights: bool = False,
                early_stopping_patience: Optional[int] = 5,) -> 'OfflineProjector':  #Tuple[Any, Dict[str, Any], Any, Dict[str, float], Dict[str, float]]:
         """Create and train projector with multi-objective loss"""
@@ -274,13 +264,13 @@ class OfflineProjector(LightningModule):
             print(f"Validation split: {val_split}, Test split: {test_split}")
         
         # Validate input lists are not empty
-        if not all([lr_choices, weight_decay_choices, max_grad_norm_choices, batch_size_choices]):
+        if not all([lr_min, lr_max, weight_decay_choices, max_grad_norm_choices, batch_size_choices]):
             raise ValueError("All hyperparameter choice lists must be non-empty")
         
         # Expanded search space with all hyperparameters as choices
         config: Dict[str, Any] = {
             "batch_size": tune.choice(batch_size_choices),
-            "learning_rate": tune.choice(lr_choices),
+            "learning_rate": tune.loguniform(lr_min, lr_max),
             "weight_decay": tune.choice(weight_decay_choices),
             "max_grad_norm": tune.choice(max_grad_norm_choices),
             "tied_weights": tune.choice([True, False]),
@@ -359,7 +349,7 @@ class OfflineProjector(LightningModule):
         }
         
         wandb_logger = WandbLogger(
-            project=project_name,
+            project=wandb_project_name,
             # entity=wandb_entity,
             name=wandb_run_name,
             config=wandb_config,
