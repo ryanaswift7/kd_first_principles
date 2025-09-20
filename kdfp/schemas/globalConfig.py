@@ -1,6 +1,7 @@
 from typing import List, Optional, Dict, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 import yaml
+import torch
 from kdfp.schemas.experimentConfig import ExperimentConfig, TaskSpec, LM
 from transformer_lens import HookedTransformer
 from kdfp.utils.shallow_model_loading import get_indices_and_num_layers_to_keep
@@ -15,7 +16,7 @@ from kdfp.schemas.subConfigs import (BaseDirConfig, ExpDirConfig, OffProjParamsC
                                        DistillationDims,
                                        ReductionDims,
                                        ExpProjectionConfig)
-
+import os
 
 class GlobalConfig(BaseModel):
     teacher_name: str
@@ -85,6 +86,7 @@ class GlobalConfig(BaseModel):
     
     def generate_task_list(self) -> List[TaskSpec]:
         tasks = []
+        # binary_tasks = []
         for k, v in self.tasks.items():
             t = TaskSpec(name=k, dataset=v.dataset, subset=v.subset)
             tasks.append(t)
@@ -94,14 +96,18 @@ class GlobalConfig(BaseModel):
                             layer_reduction_factor: Optional[float] = None,
                             selection_method: Optional[Literal['linspace', 'first_n']] = None) -> List[str]:
         lm = HookedTransformer.from_pretrained(model_name)
-        d_model = lm.cfg.d_model
+        lm_cfg = lm.cfg
+        del lm
+        torch.cuda.empty_cache()
+
+        d_model = lm_cfg.d_model
         if layer_reduction_factor is not None:
             assert selection_method, "You must supply a selection method if performing layer reduction"
-            layer_idx_list, _ = get_indices_and_num_layers_to_keep(total_layers=lm.cfg.n_layers,
+            layer_idx_list, _ = get_indices_and_num_layers_to_keep(total_layers=lm_cfg.n_layers,
                                                          layer_reduction_factor=layer_reduction_factor,
                                                          selection_method=selection_method)
         else:
-            layer_idx_list = list(range(lm.cfg.n_layers))
+            layer_idx_list = list(range(lm_cfg.n_layers))
 
         hooks = []
         hooks.extend(self.hook_types["single"])
@@ -113,9 +119,9 @@ class GlobalConfig(BaseModel):
     def generate_experiment_list(self, debug: bool = False) -> List[ExperimentConfig]:
         tasks = self.generate_task_list()
 
-        base_cache_dir = self.directories.root + self.directories.cache
-        base_model_dir = self.directories.root + self.directories.models
-        base_scores_dir = self.directories.root + self.directories.scores
+        base_cache_dir = self.directories.root + '/' + self.directories.cache
+        base_model_dir = self.directories.root + '/' + self.directories.models
+        base_scores_dir = self.directories.root + '/' + self.directories.scores
 
         experiment_list = []
 
@@ -158,7 +164,7 @@ class GlobalConfig(BaseModel):
 
 
                                     exp_name = f"{reduction}-{proj_str}{obj_weight_variant}-jsd_{jsd_beta}"
-                                    projection = ExpProjectionConfig(
+                                    projection_cfg = ExpProjectionConfig(
                                         direction=projection_direction,
                                         training=projection_training,
                                         offline_projector_alignment_beta=offline_projector_alignment_beta,
@@ -179,8 +185,8 @@ class GlobalConfig(BaseModel):
                                         reduction=reduction,
                                         teacher=teacher,
                                         student=student,
-                                        training_params=self.training_params,
-                                        projection=projection,
+                                        train_params=self.training_params,
+                                        projection=projection_cfg,
                                         objective_weight_variant=obj_weight_variant,
                                         objective_weights=OBJECTIVE_WEIGHT_VARIANTS_MAP[obj_weight_variant],
                                         jsd_beta=jsd_beta,
@@ -203,7 +209,7 @@ class GlobalConfig(BaseModel):
             student=LM(model_name=self.students.shallow.name,
                        layer_reduction_factor=self.students.shallow.factor,
                        d_model=self.dims.student.shallow),
-            training_params=self.training_params,
+            train_params=self.training_params,
             projection=None,
             objective_weight_variant="finetuning",
             objective_weights=OBJECTIVE_WEIGHT_VARIANTS_MAP["finetuning"],
@@ -223,7 +229,7 @@ class GlobalConfig(BaseModel):
                        d_model=self.dims.teacher.narrow),
             student=LM(model_name=self.students.narrow.name,
                        d_model=self.dims.student.narrow),
-            training_params=self.training_params,
+            train_params=self.training_params,
             projection=None,
             objective_weight_variant="finetuning",
             objective_weights=OBJECTIVE_WEIGHT_VARIANTS_MAP["finetuning"],
@@ -243,5 +249,5 @@ class GlobalConfig(BaseModel):
         unique_experiment_list = list(set(experiment_list))
         exp_names = [e.name for e in unique_experiment_list]
 
-        return experiment_list, sorted(exp_names)
+        return sorted(unique_experiment_list, key=lambda exp: exp.name), sorted(exp_names)
 

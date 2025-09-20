@@ -1,16 +1,26 @@
 import torch
-from typing import Optional
+from typing import Optional, Union
+from pathlib import Path
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader, random_split
 from kdfp.utils.data import ProjectorDataset
 
 
 class ProjectorDataModule(pl.LightningDataModule):
-    def __init__(self, dataset: ProjectorDataset, batch_size: int, seed: int,
-                 val_split: float = 0.1, test_split: float = 0.1,
-                 num_workers: int = 4, pin_memory: bool = True):
+    def __init__(self,
+                #  dataset: ProjectorDataset,
+                 teacher_cache_dir: Union[str, Path],
+                 student_cache_dir: Union[str, Path],
+                 batch_size: int,
+                 seed: int,
+                 val_split: float = 0.1,
+                 test_split: float = 0.1,
+                 num_workers: int = 4,
+                 pin_memory: bool = True):
         super().__init__()
-        self.dataset = dataset
+        # self.dataset = dataset
+        self.teacher_cache_dir = teacher_cache_dir
+        self.student_cache_dir = student_cache_dir
         self.batch_size = batch_size
         self.val_split = val_split
         self.test_split = test_split
@@ -19,6 +29,8 @@ class ProjectorDataModule(pl.LightningDataModule):
         self.pin_memory = pin_memory
         
     def setup(self, stage: Optional[str] = None):
+        self.dataset = ProjectorDataset(teacher_cache_dir=self.teacher_cache_dir,
+                                        student_cache_dir=self.student_cache_dir)
         total_size = len(self.dataset)
         test_size = int(total_size * self.test_split)
         val_size = int(total_size * self.val_split)

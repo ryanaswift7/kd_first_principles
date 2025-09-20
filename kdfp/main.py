@@ -12,17 +12,12 @@ def parse_cli_args():
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
     # Add 'run' command
-    run_parser = subparsers.add_parser('run', help='Run the main application')
+    run_parser = subparsers.add_parser('run', help='Run the experiment pipeline')
     run_parser.add_argument('-c', '--config', default=DEFAULT_CONFIG, 
                             help=f"Path to config file (default: {DEFAULT_CONFIG})")
     
     return parser.parse_args()
 
-
-# def init_teacher_and_offline_projector():
-#     init_teacher()
-#     init_offline_projector()
-#     return
 
 def main(config_path: str):
     # grab config and set root save dir
@@ -36,12 +31,14 @@ def main(config_path: str):
     experiment_list, experiment_names = config.generate_experiment_list()
     print(f"A total of {len(experiment_names)} experiments have been specified:")
     for i, name in enumerate(experiment_names):
+        assert experiment_list[i].name == name, f"Experiment name mismatch: {experiment_list[i].name} != {name}"
         print(f"    {i+1}: {name}")
 
 
-    # for i, experiment in enumerate(experiment_list):
-    #     print(f"Starting experiment {i}: {experiment.name.upper()}")
-    #     experiment.init()
+    for i, experiment in enumerate(experiment_list):
+        print(f"Starting experiment {i}: {experiment.name.upper()}")
+        experiment.init()
+        break
     #     results = experiment.run()
 
     #     new_row = pd.DataFrame([dict(zip(result_df.columns.tolist(), results))])

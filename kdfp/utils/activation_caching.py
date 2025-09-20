@@ -12,8 +12,8 @@ from datasets import load_dataset, Dataset
 from functools import partial
 from pathlib import Path
 import sys
-from utils.general import set_vram_limit, set_all_seeds, cleanup_resources, print_args_table, set_device
-from utils.data import CachedActivationsDataset, load_data, HookCache
+from .general import set_vram_limit, set_all_seeds, cleanup_resources, print_args_table, set_device
+from .data import CachedActivationsDataset, load_data, HookCache
 import argparse
 import sys
 import math
@@ -199,7 +199,7 @@ def prepare_lm_and_dataloader(lm_name: str,
                         tokenizer=tokenizer,
                         seq_len=seq_len,
                         token_rename=token_rename,
-                        n_samples=n_samples)
+                        n_samples=n_samples,)
     dl = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -234,7 +234,7 @@ def cache_activations(
         save_dir,
         device,
         n_samples: Optional[int],
-        sae: bool = False,):
+        token_rename: bool = False,):
     """Process dataset and cache activations at specified hook point."""
 
     print("N SAMPLES: ", n_samples)
@@ -254,10 +254,10 @@ def cache_activations(
     try:
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(dataloader)):
-                if sae:
-                    input_ids = batch.to(device)
-                else:
+                if token_rename:
                     input_ids = batch["tokens"].to(device)
+                else:
+                    input_ids = batch["input_ids"].to(device)
 
                 # Check if we need to truncate this batch to meet n_samples limit
                 current_batch_size = input_ids.shape[0]
@@ -327,7 +327,7 @@ def is_cache_complete(
     # Check mapping file
     mapping_file = os.path.join(Path(cache_dir).parent, "batch_mapping.txt")
     if not os.path.exists(mapping_file):
-        print(f"Mapping file not found in {Path(cache_dir).parent}.")
+        # print(f"Mapping file not found in {Path(cache_dir).parent}.")
         return False
     
     # If n_samples is specified, check if we have at least that many samples
@@ -344,10 +344,10 @@ def is_cache_complete(
                         total_samples = max(total_samples, end_idx)
                 
                 if total_samples < n_samples:
-                    print(f"Error: Cache contains only {total_samples} samples, but {n_samples} samples are required.")
+                    # print(f"Error: Cache contains only {total_samples} samples, but {n_samples} samples are required.")
                     return False
-                else:
-                    print(f"Cache contains {total_samples} samples (required: {n_samples}).")
+                # else:
+                #     print(f"Cache contains {total_samples} samples (required: {n_samples}).")
                     
         except Exception as e:
             print(f"Error reading mapping file: {e}")
@@ -440,6 +440,7 @@ def activation_caching(lm_name: str,
             save_dir=lm_act_cache_dir,
             device=device,
             n_samples=n_samples,
+            token_rename=token_rename,
         )  
         print(f"\nModel activation caching complete. Batch file for all hook points saved at {lm_act_cache_dir}/batch_mapping.txt")
     else:

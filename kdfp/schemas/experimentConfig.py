@@ -19,7 +19,7 @@ class ExperimentConfig(ConfigBase):
     teacher: LM
     student: LM
     dirs: ExpDirConfig
-    training_params: TrainingParamsConfig
+    train_params: TrainingParamsConfig
     projection: Optional[ExpProjectionConfig]
     objective_weight_variant: str
     objective_weights: ObjectiveWeights
@@ -53,7 +53,7 @@ class ExperimentConfig(ConfigBase):
             'reduction': self.reduction,
             'teacher': self.teacher.to_config_dict(),
             'student': self.student.to_config_dict(),
-            'projection': self.projection.to_config_dict() if self.projection else "None",
+            'projection_cfg': self.projection.to_config_dict() if self.projection else "None",
             'objective_weight_variant': self.objective_weight_variant,
             'objective_weights': self.objective_weights.to_config_dict(),
             'jsd_beta': self.jsd_beta,
@@ -112,34 +112,34 @@ class ExperimentConfig(ConfigBase):
         # cache teacher and student acts
         teacher_cache_dir, teacher_dim = activation_caching(lm_name=self.teacher.model_name,
                                                 lm_hook_points=self.teacher.hook_list,
-                                                dataset_name=self.off_proj_train_args.dataset.name,
-                                                dataset_subset=self.off_proj_train_args.dataset.subset,
-                                                split=self.off_proj_train_args.dataset.split,
+                                                dataset_name=self.projection.offline_projector_training_args.dataset.name,
+                                                dataset_subset=self.projection.offline_projector_training_args.dataset.subset,
+                                                split=self.projection.offline_projector_training_args.dataset.split,
                                                 seq_len=self.train_params.seq_len,
-                                                batch_size=self.off_proj_train_args.cache_batch_size,
+                                                batch_size=self.projection.offline_projector_training_args.cache_batch_size,
                                                 cache_dir=self.dirs.cache,
-                                                token_rename=self.off_proj_train_args.dataset.token_rename,
-                                                shuffle=self.off_proj_train_args.dataset.shuffle,
+                                                token_rename=self.projection.offline_projector_training_args.dataset.token_rename,
+                                                shuffle=self.projection.offline_projector_training_args.dataset.shuffle,
                                                 lm_dir=teacher_dir,
-                                                total_tokens=self.off_proj_train_args.total_tokens,
-                                                force_cache_all=self.off_proj_train_args.force_cache_all,
+                                                total_tokens=self.projection.offline_projector_training_args.total_tokens,
+                                                force_cache_all=self.projection.offline_projector_training_args.force_cache_all,
                                                 cache_outputs=False,
                                                 num_workers=self.train_params.num_workers,
                                                 device=self.train_params.device)
         
         student_cache_dir, student_dim = activation_caching(lm_name=self.student.model_name,
                                                 lm_hook_points=self.student.hook_list,
-                                                dataset_name=self.off_proj_train_args.dataset.name,
-                                                dataset_subset=self.off_proj_train_args.dataset.subset,
-                                                split=self.off_proj_train_args.dataset.split,
+                                                dataset_name=self.projection.offline_projector_training_args.dataset.name,
+                                                dataset_subset=self.projection.offline_projector_training_args.dataset.subset,
+                                                split=self.projection.offline_projector_training_args.dataset.split,
                                                 seq_len=self.train_params.seq_len,
-                                                batch_size=self.off_proj_train_args.cache_batch_size,
+                                                batch_size=self.projection.offline_projector_training_args.cache_batch_size,
                                                 cache_dir=self.dirs.cache,
-                                                token_rename=self.off_proj_train_args.dataset.token_rename,
-                                                shuffle=self.off_proj_train_args.dataset.shuffle,
+                                                token_rename=self.projection.offline_projector_training_args.dataset.token_rename,
+                                                shuffle=self.projection.offline_projector_training_args.dataset.shuffle,
                                                 lm_dir=student_dir,
-                                                total_tokens=self.off_proj_train_args.total_tokens,
-                                                force_cache_all=self.off_proj_train_args.force_cache_all,
+                                                total_tokens=self.projection.offline_projector_training_args.total_tokens,
+                                                force_cache_all=self.projection.offline_projector_training_args.force_cache_all,
                                                 cache_outputs=False,
                                                 num_workers=self.train_params.num_workers,
                                                 device=self.train_params.device)
@@ -152,33 +152,38 @@ class ExperimentConfig(ConfigBase):
             student_dim=student_dim,
             alignment_beta=self.projection.offline_projector_alignment_beta,
             max_epochs=self.train_params.num_epochs,
-            weight_decay_choices=self.hyperparams.weight_decay,
-            max_grad_norm_choices=self.hyperparams.max_grad_norm,
-            batch_size_choices=self.hyperparams.batch_size,
-            n_trials=self.off_proj_train_args.n_trials,
+            wd_min=self.hyperparams.weight_decay.mini,
+            wd_max=self.hyperparams.weight_decay.maxi,
+            mgn_min=self.hyperparams.max_grad_norm.mini,
+            mgn_max=self.hyperparams.max_grad_norm.maxi,
+            batch_sizes=self.hyperparams.batch_sizes,
+            n_trials=self.projection.offline_projector_training_args.n_trials,
             save_dir=f"{self.dirs.off_proj_model}/projector_{self.projection.offline_projector_alignment_beta}",
             seed=self.train_params.seed,
             reproducible_backend=self.train_params.reproducible_backend,
-            num_gpus_per_trial=self.off_proj_train_args.num_gpus_per_trial,
-            num_cpus_per_trial=self.off_proj_train_args.num_cpus_per_trial,
+            num_gpus_per_trial=self.projection.offline_projector_training_args.num_gpus_per_trial,
+            num_cpus_per_trial=self.projection.offline_projector_training_args.num_cpus_per_trial,
         )
-        projector.save_pretrained(save_path=self.dirs.off_proj_model)
-        return projector.extract_single_direction(direction=self.projection.direction)
+        # projector.save_pretrained(save_path=self.dirs.off_proj_model)
+        # return projector.extract_single_direction(direction=self.projection.direction)
 
     def _init_online_projector(self):
         return OnlineProjector(teacher_dim=self.teacher.d_model,
                             student_dim=self.student.d_model,
                             direction=self.projection.direction)
 
-    def init_projector(self) -> nn.Module:
+    def init_projector(self) -> None:
         """Initialize projector for an experiment. kwargs are for init_offline_projector."""
-        if self.projection.training == 'online':
-            return self._init_online_projector()
-        elif self.projection.training == 'offline':
-            return self._init_offline_projector()
-        else:
-            raise ValueError(f"Invalid projection training specified: {self.projection.training}. Must be either 'online' or 'offline'.")
-        
+        if self.projection:
+            if self.projection.training == 'online':
+                p = self._init_online_projector()
+            elif self.projection.training == 'offline':
+                p = self._init_offline_projector()
+            else:
+                raise ValueError(f"Invalid projection training specified: {self.projection.training}. Must be either 'online' or 'offline'.")
+            self.projection.model = p
+        return
+    
     # def init_teachers(self) -> None:
 
 

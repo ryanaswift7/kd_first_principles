@@ -1,10 +1,11 @@
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from fractions import Fraction
 from typing import Any, Dict, Literal, Union, Optional, List
 import torch.nn as nn
 from kdfp.core.projector.offline.offlineProjector import OfflineProjector
 from kdfp.core.projector.online.onlineProjector import OnlineProjector
 from kdfp.schemas.configBase import ConfigBase
+import os
 
 class LayerReductionConfig(BaseModel):
     name: str
@@ -22,20 +23,28 @@ class StudentConfigs(BaseModel):
     shallow: LayerReductionConfig
     narrow: DimReductionConfig
 
+class MiniMaxiHyperparam(BaseModel):
+    mini: Union[float, int]
+    maxi: Union[float, int]
+
 class HyperparamsConfig(BaseModel):
-    lr: List[float]
-    weight_decay: List[float]
-    temperature: List[float]
-    max_grad_norm: List[float]
-    batch_size: List[int]
+    lr : MiniMaxiHyperparam
+    weight_decay: MiniMaxiHyperparam
+    temperature: MiniMaxiHyperparam
+    max_grad_norm: MiniMaxiHyperparam
+    batch_sizes: List[int]
+    # lr: List[float]
+    # weight_decay: List[float]
+    # temperature: List[float]
+    # max_grad_norm: List[float]
+    # batch_size: List[int]
 
 class TaskConfig(BaseModel):
-    name: str
     dataset: str
     subset: Optional[str] = None
 
 class TrainingParamsConfig(BaseModel):
-    seed: List[int]
+    seed: int
     seq_len: int
     num_epochs: int
     reproducible_backend: bool
@@ -81,6 +90,17 @@ class ExpDirConfig(ConfigBase):
     teacher_model: str
     student_model: str
     student_scores: str
+
+    @model_validator(mode='after')
+    def make_paths_absolute(self):
+        self.teacher_model = os.path.abspath(self.teacher_model)
+        self.student_model = os.path.abspath(self.student_model)
+        self.student_scores = os.path.abspath(self.student_scores)
+        if self.cache:
+            self.cache = os.path.abspath(self.cache)
+        if self.off_proj_model:
+            self.off_proj_model = os.path.abspath(self.off_proj_model)
+        return self
 
     def to_config_dict(self) -> Dict[str, Any]:
         config_dict = {

@@ -1,8 +1,9 @@
-from typing import Optional, Union, Dict, Any
+from typing import Optional, Union, Dict, Any, Literal
 from kdfp.schemas.configBase import ConfigBase
 
 class TaskSpec(ConfigBase): 
     name: str
+    # task_type: Literal["binary", "multiclass"]
     dataset: str
     subset: Optional[str] = None
     num_fewshot: int = 0
