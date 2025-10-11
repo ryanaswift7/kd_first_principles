@@ -33,7 +33,7 @@ class ObjectiveWeights(ConfigBase):
             )
         
         return self
-    def to_config_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         """
         Return a standardized dictionary representation for configuration purposes.
         Excludes the heavy model objects (tl, hf).

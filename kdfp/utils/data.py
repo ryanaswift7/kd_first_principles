@@ -1,7 +1,7 @@
 import os
 import torch
 from torch.utils.data import Dataset, ConcatDataset
-from datasets import load_dataset
+from datasets import load_dataset, load_dataset_builder
 from functools import partial
 import pandas as pd
 from tqdm.auto import tqdm
@@ -44,25 +44,24 @@ def load_data(tokenizer,
             subset,
             split=split,
             trust_remote_code=True,
-            streaming=streaming,
+            streaming=True,
         )
+
     else:
         dataset = load_dataset(
             dataset_name,
             split=split,
             trust_remote_code=True,
-            streaming=streaming,
+            streaming=True,
         )
+    
+    if n_samples:
+        dataset = dataset.take(n_samples)
 
-    # Use `partial` to pass `args` to `_preprocess_and_rename`
     preprocess_fn = partial(_preprocess,
                             seq_len=seq_len,
                             tokenizer=tokenizer,
                             token_rename=token_rename)
-
-    if n_samples:
-        dataset = dataset.take(n_samples)
-
     dataset = dataset.map(
         preprocess_fn,
         batched=True,
@@ -73,149 +72,363 @@ def load_data(tokenizer,
     return dataset
 
 
-def _format_arc(examples):
-    texts = []
-    labels = []
+def _format_arc(examples, split: str):
+    """
+    Formats ARC examples for either training or NLL-based evaluation.
+
+    Args:
+        examples: A batch of examples from the ARC dataset.
+        split (str): The dataset split, e.g., 'train' or 'validation'.
+    """
+    # Get the number of examples in the batch
+    num_examples = len(examples['id'])
     
-    for i in range(len(examples["id"])):
-        context = examples['question'][i]
-        choices = examples['choices']['text'][i]
-        choice_labels = examples['choices']['label'][i]
-        ans = examples['answerKey'][i]
-        if ans in ['A', 'B', 'C', 'D', 'E']:
-            ans = ord(ans) - ord('A')
-        elif ans in ['1', '2', '3', '4', '5']:
-            ans = int(ans) - 1
+    if split == 'train':
+        # For TRAINING: Create a single, correct question-answer pair.
+        texts = []
+        for i in range(num_examples):
+            question = examples['question'][i]
+            choices = examples['choices'][i]['text']
+            choice_labels = examples['choices'][i]['label'] # e.g., ['A', 'B', 'C', 'D']
+            answer_key = examples['answerKey'][i] # e.g., 'C'
 
-        choice_list = [f"{choice_label}) {choice}" for choice_label, choice in zip(choice_labels, choices)]
-        choice_text = "\n".join(choice_list)
-        text = f"Question: {context}\nChoices: {choice_text}\nAnswer: "
-        
-        texts.append(text)
-        labels.append(ans)
-    return texts, labels
+            # Find the 0-indexed integer for the correct answer
+            correct_idx = choice_labels.index(answer_key)
+            correct_answer_text = choices[correct_idx]
+            
+            # Format as a complete and correct QA pair
+            text = f"Question: {question}\nAnswer: {correct_answer_text}"
+            texts.append(text)
+            
+        return texts, None # No separate labels needed for training
 
-def _format_hellaswag(examples):
-    texts = []
-    labels = []
+    else:
+        # For VALIDATION: Create all possible QA pairs for each example
+        # and return them in a flattened list for efficient batch tokenization.
+        all_choice_texts = []
+        labels = []
+        for i in range(num_examples):
+            question = examples['question'][i]
+            choices = examples['choices'][i]['text']
+            choice_labels = examples['choices'][i]['label']
+            answer_key = examples['answerKey'][i]
+
+            # Find the 0-indexed label
+            label_idx = choice_labels.index(answer_key)
+            labels.append(label_idx)
+
+            # Create a formatted string for each of the choices
+            for choice in choices:
+                text = f"Question: {question}\nAnswer: {choice}"
+                all_choice_texts.append(text)
+            
+        return all_choice_texts, labels
+
+def _format_hellaswag(examples, split: str):
+    """
+    Prepares texts and labels for HellaSwag.
+
+    For split='train': Returns a list of single correct sentences.
+    For split='validation'/'test': Returns all 4 possible sentences for each example,
+                                   flattened into a single list, plus the labels.
+    """
+    # Get the number of examples in the batch
+    num_examples = len(examples['ctx'])
     
-    for i in range(len(examples["ind"])):
-        # HellaSwag format
-        title = examples["activity_label"]
-        context = examples['ctx'][i]
-        choices = [examples['endings'][i][j] for j in range(4)]
-        label = examples['label'][i]
-        choice_list = [f"{idx}) {choice}" for idx, choice in enumerate(choices)]
-        choice_text = "\n".join(choice_list)
-        text = f"Title: {title}\nContext: {context}\nChoices: {choice_text}\nAnswer: "
+    if split == 'train':
+        texts = []
+        for i in range(num_examples):
+            context = examples['ctx'][i]
+            correct_ending = examples['endings'][i][int(examples['label'][i])]
+            texts.append(context + " " + correct_ending)
+        # No labels needed for training
+        return texts, None
+    else:
+        # For validation, we create all 4 options for each example
+        all_choice_texts = []
+        labels = []
+        for i in range(num_examples):
+            context = examples['ctx'][i]
+            for choice in examples['endings'][i]:
+                all_choice_texts.append(context + " " + choice)
+            labels.append(int(examples['label'][i]))
+        return all_choice_texts, labels
 
-        texts.append(text)
-        labels.append(label)
-    return texts, labels
+def _format_piqa(examples, split: str):
+    """
+    Formats PIQA examples for either training or NLL-based evaluation.
 
-def _format_piqa(examples):
-    texts = []
-    labels = []
+    Args:
+        examples: A batch of examples from the PIQA dataset.
+        split (str): The dataset split, e.g., 'train' or 'validation'.
+    """
+    # Get the number of examples in the batch
+    num_examples = len(examples['goal'])
     
-    for i in range(len(examples["goal"])):
-        context = examples['goal'][i]
-        choices = [examples['sol1'][i], examples['sol2'][i]]
-        label = examples['label'][i]
-        choice_list = [f"{idx}) {choice}" for idx, choice in enumerate(choices)]
-        choice_text = "\n".join(choice_list)
-        text = f"Question: {context}\nChoices: {choice_text}\nAnswer: "
-        
-        texts.append(text)
-        labels.append(label)
-    return texts, labels
+    if split == 'train':
+        # For TRAINING: Create a single, correct goal-solution pair.
+        texts = []
+        for i in range(num_examples):
+            goal = examples['goal'][i]
+            sol1 = examples['sol1'][i]
+            sol2 = examples['sol2'][i]
+            # The 'label' is already a 0-indexed integer (0 or 1)
+            correct_label = examples['label'][i]
+            correct_solution = sol1 if correct_label == 0 else sol2
+            
+            # Format as a complete and correct goal-solution pair
+            text = f"Goal: {goal}\nSolution: {correct_solution}"
+            texts.append(text)
+            
+        return texts, None # No separate labels needed for training
 
-def _format_boolq(examples):
-    texts = []
-    labels = []
-    
-    for i in range(len(examples["idx"])):
-        context = examples['passage'][i]
-        question = examples['question'][i]
-        label = examples['label'][i]
-        text = f"Passage: {context}\nQuestion: {question}\nChoices: yes or no\nAnswer: "
-        
-        texts.append(text)
-        labels.append(label)
-    return texts, labels
+    else:
+        # For VALIDATION: Create both possible goal-solution pairs for each example
+        # and return them in a flattened list for efficient batch tokenization.
+        all_choice_texts = []
+        labels = []
+        for i in range(num_examples):
+            goal = examples['goal'][i]
+            sol1 = examples['sol1'][i]
+            sol2 = examples['sol2'][i]
+            label_idx = examples['label'][i]
+            
+            labels.append(label_idx)
 
-def _format_logiqa(examples):
-    texts = []
-    labels = []
-    
-    for i in range(len(examples["id"])):
-        context = examples['text'][i]
-        question = examples['question'][i]
-        raw_choices = examples["options"][i]
-        choice_list = [f"A) {raw_choices[0]}", f"B) {raw_choices[1]}", f"C) {raw_choices[2]}", f"D) {raw_choices[3]}"]
-        label = examples['answer'][i]
-        choice_text = "\n".join(choice_list)
-        text = f"Passage: {context}\nQuestion: {question}\nChoices: {choice_text}\nAnswer: "
-        
-        texts.append(text)
-        labels.append(label)
-    return texts, labels
+            # Create a formatted string for both possible solutions
+            text1 = f"Goal: {goal}\nSolution: {sol1}"
+            text2 = f"Goal: {goal}\nSolution: {sol2}"
+            all_choice_texts.extend([text1, text2])
+            
+        return all_choice_texts, labels
 
-def _format_sciq(examples):
-    texts = []
-    labels = []
-    
-    for i in range(len(examples["question"])):
-        context = examples['support'][i]
-        question = examples['question'][i]
-        choices = [examples['correct_answer'][i], examples["distractor1"][i], examples["distractor2"][i], examples["distractor3"][i]]
-        random.shuffle(choices)
-        label = choices.index(examples['correct_answer'][i])
-        choice_list = [f"{idx}) {choice}" for idx, choice in enumerate(choices)]
-        choice_text = "\n".join(choice_list)
-        text = f"Passage: {context}\nQuestion: {question}\nChoices: {choice_text}\nAnswer: "
-        
-        texts.append(text)
-        labels.append(label)
-    return texts, labels
+def _format_boolq(examples, split: str):
+    """
+    Formats BoolQ examples for either training or NLL-based evaluation.
 
-def _format_winogrande(examples):
-    texts = []
-    labels = []
+    Args:
+        examples: A batch of examples from the BoolQ dataset.
+        split (str): The dataset split, e.g., 'train' or 'validation'.
+    """
+    # Get the number of examples in the batch
+    num_examples = len(examples['question'])
     
-    for i in range(len(examples["sentence"])):
-        context = examples['sentence'][i]
-        idx = examples['sentence'][i].index('_') +1
-        choices = [f"1) {examples['option1'][i] + context[idx:]}", f"2) {examples['option2'][i] + context[idx:]}"]
-        label = examples['answer'][i]
-        choice_text = "\n".join(choices)
-        text = f"Passage: {context[:idx]}\nChoices: {choice_text}\nAnswer: "
-        
-        texts.append(text)
-        labels.append(label)
-    return texts, labels
+    # Define the fixed choices and their mapping from the boolean label
+    # This ensures consistency: False -> 0 -> "no", True -> 1 -> "yes"
+    choices = ["no", "yes"]
+
+    if split == 'train':
+        # For TRAINING: Create a single, correct question-answer pair.
+        texts = []
+        for i in range(num_examples):
+            context = examples['passage'][i]
+            question = examples['question'][i]
+            # Determine the correct answer string based on the boolean label
+            correct_answer_text = "yes" if examples['label'][i] else "no"
+            
+            # Format as a complete and correct QA pair
+            text = f"Passage: {context}\nQuestion: {question}?\nAnswer: {correct_answer_text}"
+            texts.append(text)
+            
+        return texts, None # No separate labels needed for training
+
+    else:
+        # For VALIDATION: Create both possible QA pairs for each example
+        # and return them in a flattened list for efficient batch tokenization.
+        all_choice_texts = []
+        labels = []
+        for i in range(num_examples):
+            context = examples['passage'][i]
+            question = examples['question'][i]
+            
+            # Determine the 0-indexed label (0 for "no", 1 for "yes")
+            label_idx = 1 if examples['label'][i] else 0
+            labels.append(label_idx)
+
+            # Create a formatted string for both of the fixed choices ("no", "yes")
+            for choice in choices:
+                text = f"Passage: {context}\nQuestion: {question}?\nAnswer: {choice}"
+                all_choice_texts.append(text)
+            
+        return all_choice_texts, labels
+
+def _format_logiqa(examples, split: str):
+    """
+    Formats LogiQA examples for either training or NLL-based evaluation.
+
+    Args:
+        examples: A batch of examples from the LogiQA dataset.
+        split (str): The dataset split, e.g., 'train' or 'validation'.
+    """
+    # Get the number of examples in the batch
+    num_examples = len(examples['id'])
+    
+    if split == 'train':
+        # For TRAINING: Create a single, correct question-answer pair.
+        texts = []
+        for i in range(num_examples):
+            context = examples['text'][i]
+            question = examples['question'][i]
+            choices = examples["options"][i]
+            # The 'answer' is already a 0-indexed integer
+            correct_answer_idx = examples['answer'][i]
+            correct_answer_text = choices[correct_answer_idx]
+            
+            # Format as a complete and correct QA pair
+            text = f"Passage: {context}\nQuestion: {question}\nAnswer: {correct_answer_text}"
+            texts.append(text)
+            
+        return texts, None # No separate labels needed for training
+
+    else:
+        # For VALIDATION: Create four possible QA pairs for each example
+        # and return them in a flattened list for efficient batch tokenization.
+        all_choice_texts = []
+        labels = []
+        for i in range(num_examples):
+            context = examples['text'][i]
+            question = examples['question'][i]
+            choices = examples["options"][i]
+            label_idx = examples['answer'][i]
+            
+            labels.append(label_idx)
+
+            # Create a formatted string for each of the four choices
+            for choice in choices:
+                text = f"Passage: {context}\nQuestion: {question}\nAnswer: {choice}"
+                all_choice_texts.append(text)
+            
+        return all_choice_texts, labels
+
+def _format_sciq(examples, split: str):
+    """
+    Formats SciQ examples for either training or NLL-based evaluation.
+
+    Args:
+        examples: A batch of examples from the SciQ dataset.
+        split (str): The dataset split, e.g., 'train' or 'validation'.
+    """
+    # Get the number of examples in the batch
+    num_examples = len(examples['question'])
+    
+    if split == 'train':
+        # For TRAINING: Create a single, correct question-answer pair.
+        texts = []
+        for i in range(num_examples):
+            context = examples['support'][i]
+            question = examples['question'][i]
+            correct_answer = examples['correct_answer'][i]
+            
+            # Format as a complete and correct QA pair
+            text = f"Context: {context}\nQuestion: {question}\nAnswer: {correct_answer}"
+            texts.append(text)
+            
+        return texts, None # No separate labels needed for training
+
+    else:
+        # For VALIDATION: Create four possible QA pairs for each example
+        # and return them in a flattened list for efficient batch tokenization.
+        all_choice_texts = []
+        labels = []
+        for i in range(num_examples):
+            context = examples['support'][i]
+            question = examples['question'][i]
+            correct_answer = examples['correct_answer'][i]
+            
+            # Assemble all four choices
+            choices = [
+                correct_answer, 
+                examples["distractor1"][i], 
+                examples["distractor2"][i], 
+                examples["distractor3"][i]
+            ]
+            
+            # Shuffle the choices to avoid positional bias
+            random.shuffle(choices)
+            
+            # Find the new 0-indexed label of the correct answer
+            label_idx = choices.index(correct_answer)
+            labels.append(label_idx)
+
+            # Create a formatted string for each of the four shuffled choices
+            for choice in choices:
+                text = f"Context: {context}\nQuestion: {question}\nAnswer: {choice}"
+                all_choice_texts.append(text)
+            
+        return all_choice_texts, labels
+    
+def _format_winogrande(examples, split: str):
+    """
+    Formats Winogrande examples for either training or NLL-based evaluation.
+
+    Args:
+        examples: A batch of examples from the Winogrande dataset.
+        split (str): The dataset split, e.g., 'train' or 'validation'.
+    """
+    # Get the number of examples in the batch
+    num_examples = len(examples['sentence'])
+    
+    if split == 'train':
+        # For TRAINING: Create a single, correctly filled-in sentence for each example.
+        texts = []
+        for i in range(num_examples):
+            sentence = examples['sentence'][i]
+            option1 = examples['option1'][i]
+            option2 = examples['option2'][i]
+            # The 'answer' in the dataset is 1-based, so we determine the correct text
+            correct_option = option1 if examples['answer'][i] == '1' else option2
+            
+            # Replace the pronoun placeholder '_' with the correct option
+            filled_sentence = sentence.replace('_', correct_option, 1)
+            texts.append(filled_sentence)
+            
+        return texts, None # No separate labels needed for training
+
+    else:
+        # For VALIDATION: Create all possible sentences (2 for each example)
+        # and return them in a flattened list for efficient batch tokenization.
+        all_choice_texts = []
+        labels = []
+        for i in range(num_examples):
+            sentence = examples['sentence'][i]
+            option1 = examples['option1'][i]
+            option2 = examples['option2'][i]
+            
+            # Create both possible sentences
+            text_option1 = sentence.replace('_', option1, 1)
+            text_option2 = sentence.replace('_', option2, 1)
+            all_choice_texts.extend([text_option1, text_option2])
+            
+            # The 'answer' is 1 or 2; convert it to a 0-indexed label
+            label_idx = int(examples['answer'][i]) - 1
+            labels.append(label_idx)
+            
+        return all_choice_texts, labels
 
 def _preprocess_task_ft(examples,
+                        split: str,
                         task: TaskSpec,
                         seq_len: int,
                         tokenizer,):
+    if "hellaswag" in task.task_name:
+        texts, labels = _format_hellaswag(examples, split=split)
+    elif "winogrande" in task.task_name:
+        texts, labels = _format_winogrande(examples, split=split)
+    elif "sciq" in task.task_name:
+        texts, labels = _format_sciq(examples, split=split)
+    elif "logiqa" in task.task_name:
+        texts, labels = _format_logiqa(examples, split=split)
+    elif "boolq" in task.task_name:
+        texts, labels = _format_boolq(examples, split=split)
+    elif "piqa" in task.task_name:
+        texts, labels = _format_piqa(examples, split=split)
+    elif "arc" in task.task_name:
+        texts, labels = _format_arc(examples, split=split)
+    else:
+        raise ValueError(f"Task {task.name} is not currently supported.")
     
-    processed_examples = {}
-    
-    if 'arc' in task.name:
-        texts, labels = _format_arc(examples)
-    elif 'boolq' in task.name:
-        texts, labels = _format_boolq(examples)
-    elif 'hellaswag' in task.name:
-        texts, labels = _format_hellaswag(examples)
-    elif 'logiqa' in task.name:
-        texts, labels = _format_logiqa(examples)
-    elif 'piqa' in task.name:
-        texts, labels = _format_piqa(examples)
-    elif 'sciq'in task.name:
-        texts, labels = _format_sciq(examples)
-    elif 'winogrande' in task.name:
-        texts, labels = _format_winogrande(examples)
 
+    # Tokenize all text inputs at once
     tokenized = tokenizer(
         texts,
         max_length=seq_len,
@@ -223,12 +436,24 @@ def _preprocess_task_ft(examples,
         truncation=True,
         return_tensors="pt"
     )
-    
-    processed_examples.update(tokenized)
-    processed_examples['labels'] = labels
-    
-    
-    return processed_examples
+
+    # if split == 'train':
+    #     # For training, labels are the input_ids shifted
+    #     tokenized['labels'] = tokenized['input_ids'].clone()
+    #     return tokenized
+    # else:
+    if split != 'train':
+        # For validation, reshape the tokenized outputs
+        num_examples = len(labels)
+        num_choices = 4  if task.task_type == 'multiclass' else 2
+
+        # Reshape from [batch_size * 4, seq_len] to [batch_size, 4, seq_len]
+        for key in tokenized:
+            tokenized[key] = tokenized[key].view(num_examples, num_choices, -1)
+        
+        # Add the labels to the dictionary
+        tokenized['label'] = torch.tensor(labels, dtype=torch.long)
+    return tokenized
 
 
 def load_task_data(task: TaskSpec,
@@ -237,47 +462,39 @@ def load_task_data(task: TaskSpec,
                    split: str = 'train',
                 #    token_rename: bool = False,
                    n_samples: Optional[int] = None,) -> Dataset:
-    # task_types_map = {
-    #     'hellaswag': 'multiple_choice',
-    #     # 'trivia_qa': 'qa',
-    #     'boolq': 'classification',
-    #     'piqa': 'multiple_choice',
-    #     'arc_easy': 'multiple_choice',
-    #     'arc_challenge': 'multiple_choice',
-    #     'winogrande': 'multiple_choice',
-    #     'sciq': 'classification',
-    #     'logiqa': 'multiple_choice',
-    # }
-
     if task.subset:
         dataset = load_dataset(
-            task.dataset,
+            task.dataset_name,
             task.subset,
             split=split,
             trust_remote_code=True,
+            streaming=True,
         )
     else:
         dataset = load_dataset(
-            task.dataset,
+            task.dataset_name,
             split=split,
             trust_remote_code=True,
+            streaming=True,
         )
     
-    # Limit samples if requested
-    if n_samples and n_samples < len(dataset):
-        dataset = dataset.select(range(n_samples))
+    if n_samples:
+        dataset = dataset.take(n_samples)
 
     preprocess_fn = partial(
         _preprocess_task_ft,
+        split=split,
         task=task,
         seq_len=seq_len,
         tokenizer=tokenizer,
-        # task_type=task_types_map[task.name],
     )
+    
+    torch.cuda.empty_cache()
 
     dataset = dataset.map(
         preprocess_fn,
         batched=True,
+        # load_from_cache_file=False, 
         remove_columns=dataset.column_names  # Remove original columns to save memory
     )
     return dataset
@@ -428,8 +645,8 @@ class HookCache(BaseModel):
 
         for hook_name in hook_dict.keys():
             matches = [s for s in self.hook_list if hook_name in s]
-            if not matches:
-                warnings.warn(f"No hook points found for hook {hook_name}", RuntimeWarning)
+            # if not matches:
+            #     warnings.warn(f"No hook points found for hook {hook_name}", RuntimeWarning)
             hook_dict[hook_name] = matches
 
         # run verifications

@@ -6,6 +6,8 @@ students:
   narrow:
     name: EleutherAI/pythia-410m-deduped
 
+torch_dtype: bfloat16
+
 directories:
   root: results
   cache: cache
@@ -23,21 +25,24 @@ offline_projector_params:
       token_rename: false
     total_tokens: 1024  # 1000000
     cache_batch_size: 8
-    n_trials: 1  # 15
+    num_epochs: 1
+    n_trials: 1
     force_cache_all: false
-    num_gpus_per_trial: 2.0
-    num_cpus_per_trial: 16
+    num_gpus_per_trial: 0.25
+    num_cpus_per_trial: 1
 
-# lm_training_params:
-#   num_gpus_per_trial: 1.0
-#   num_cpus_per_trial: 8
+lm_params:
+  num_samples: 8  # null
+  num_epochs: 1
+  n_trials: 1
+  num_gpus_per_trial: 1.0
+  num_cpus_per_trial: 6
 
 training_params:
   seed: 44 # [3, 27, 44]
   seq_len: 128  # 2048
-  num_epochs: 10
   reproducible_backend: true
-  num_workers: 1  # 4
+  num_data_workers: 0
   device: 'cuda'  # 'mps' (?)
 
 hook_types:
@@ -51,9 +56,7 @@ hook_types:
 
 projection_variants:
   directions: ['up']  # ["up", "down"]
-  training_methods: ["online", "offline"]
-
-# offline_projector_alignment_betas: [0.5]  # [0.0, 0.25, 0.5, 0.75, 1.0]
+  training_methods: ["online", "offline", "randomized"]
 
 objective_weight_variants:
   # - "only_outputs"
@@ -85,40 +88,26 @@ hyperparams:
   batch_sizes: [8]  # [8, 16, 32]
 
 tasks:
-  arc_challenge:
-    dataset: allenai/ai2_arc
-    subset: ARC-Challenge
-  arc_easy:
-    dataset: allenai/ai2_arc
-    subset: ARC-Easy
-  boolq:
-    dataset: aps/super_glue
-    subset: boolq
   hellaswag:
-    dataset: Rowan/hellaswag
-  logiqa2:
-    dataset: baber/logiqa2
-  piqa:
-    dataset: baber/piqa
-  sciq:
-    dataset: allenai/sciq
-  winogrande:
-    dataset: allenai/winogrande
-    subset: winogrande_xl
-
-  # triviaqa:
-  #   dataset: mandarjoshi/trivia_qa
-  #   subset: rc.nocontext
-
-  # - hellaswag
-  # - trivia_qa
-  # - boolq
-  # - piqa
-  # - arc_easy
-  # - arc_challenge
-  # - winogrande
-  # - sciq
-  # - logiqa2
+    dataset_name: Rowan/hellaswag
+  # arc_challenge:
+  #   dataset_name: allenai/ai2_arc
+  #   subset: ARC-Challenge
+  # arc_easy:
+  #   dataset_name: allenai/ai2_arc
+  #   subset: ARC-Easy
+  # boolq:
+  #   dataset_name: aps/super_glue
+  #   subset: boolq
+  # logiqa2:
+  #   dataset_name: baber/logiqa2
+  # piqa:
+  #   dataset_name: baber/piqa
+  # sciq:
+  #   dataset_name: allenai/sciq
+  # winogrande:
+  #   dataset_name: allenai/winogrande
+  #   subset: winogrande_xl
 
 
   

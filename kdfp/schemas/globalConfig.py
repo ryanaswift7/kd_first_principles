@@ -1,29 +1,37 @@
-from typing import List, Optional, Dict, Literal
+from typing import List, Optional, Dict, Literal, Union
 from pydantic import BaseModel, Field, field_validator, model_validator
 import yaml
 import torch
+from kdfp.schemas.configBase import ConfigBase
 from kdfp.schemas.experimentConfig import ExperimentConfig, TaskSpec, LM
 from transformer_lens import HookedTransformer
 from kdfp.utils.shallow_model_loading import get_indices_and_num_layers_to_keep
 from kdfp.schemas.objective_weights import OBJECTIVE_WEIGHT_VARIANTS_MAP
-from kdfp.schemas.subConfigs import (BaseDirConfig, ExpDirConfig, OffProjParamsConfig, StudentConfigs,
-                                    #    ProjectorTrainingConfig,
-                                       TrainingParamsConfig,
-                                       HyperparamsConfig,
-                                       TaskConfig,
-                                       DistillationHooks,
-                                       ReductionHooks,
-                                       DistillationDims,
-                                       ReductionDims,
-                                       ExpProjectionConfig)
+from kdfp.schemas.subConfigs import (
+    BaseDirConfig,
+    DtypeSerializerMixin,
+    ExpDirConfig,
+    OffProjParamsConfig,
+    StudentConfigs,
+    LMParamsConfig,
+    TrainingParamsConfig,
+    HyperparamsConfig,
+    TaskConfig,
+    DistillationHooks,
+    ReductionHooks,
+    DistillationDims,
+    ReductionDims,
+    ExpProjectionConfig)
 import os
+from kdfp.utils.enums import (ProjectionDirection, ProjectorTraining, StudentReduction, safe_enum)
 
-class GlobalConfig(BaseModel):
+class GlobalConfig(ConfigBase, DtypeSerializerMixin):
     teacher_name: str
     students: StudentConfigs
+    torch_dtype: Union[str, torch.dtype]
     directories: BaseDirConfig
     offline_projector_params: OffProjParamsConfig
-    # projector_training: ProjectorTrainingConfig
+    lm_params: LMParamsConfig
     training_params: TrainingParamsConfig
 
     hook_types: Dict[str, List[str]] = Field(..., description="Keys 'single' and 'per_layer' with lists of hook names")
@@ -36,13 +44,18 @@ class GlobalConfig(BaseModel):
     hooks: Optional[DistillationHooks] = None
     dims: Optional[DistillationDims] = None
 
-    # Optional: Validator to ensure hook point keys are expected
+    # validator to ensure hook point keys are expected
     @field_validator('hook_types')
     def validate_hook_keys(cls, v):
         allowed_keys = {'single', 'per_layer'}
         if not all(key in allowed_keys for key in v.keys()):
             raise ValueError(f'hook_types can only contain the keys: {allowed_keys}')
         return v
+    
+    # validator to parse dtype string into an actual dtype
+    @field_validator('torch_dtype')
+    def validate_dtype(cls, v):
+        return getattr(torch, v)
     
     @model_validator(mode='after')
     def generate_both_hook_lists(self) -> 'GlobalConfig':
@@ -88,7 +101,7 @@ class GlobalConfig(BaseModel):
         tasks = []
         # binary_tasks = []
         for k, v in self.tasks.items():
-            t = TaskSpec(name=k, dataset=v.dataset, subset=v.subset)
+            t = TaskSpec(task_name=k, dataset_name=v.dataset_name, subset=v.subset)
             tasks.append(t)
         return tasks
     
@@ -130,10 +143,10 @@ class GlobalConfig(BaseModel):
                 for obj_weight_variant in self.objective_weight_variants:
                     for jsd_beta in self.jsd_betas:
                             for off_proj_align_beta in self.offline_projector_params.alignment_betas:
-                                for reduction in ["shallow", "narrow"]:
-                                    if reduction == "narrow":
+                                for reduction in [member for member in StudentReduction]:
+                                    if reduction == StudentReduction.NARROW:
                                         proj_str = f"{proj_dir}_{proj_train}"
-                                        if proj_train == "offline":
+                                        if proj_train == ProjectorTraining.OFFLINE.value:
                                             proj_str += f"_align_{off_proj_align_beta}"
                                         proj_str += '-'
                                         teacher = LM(model_name=self.teacher_name,
@@ -143,11 +156,11 @@ class GlobalConfig(BaseModel):
                                                      hook_list=self.hooks.student.narrow,
                                                      d_model=self.dims.student.narrow)
                                         projection_direction = proj_dir
-                                        projection_training = proj_train
+                                        projector_training = proj_train
                                         offline_projector_alignment_beta = off_proj_align_beta
 
 
-                                    elif reduction == "shallow":
+                                    elif reduction == StudentReduction.SHALLOW:
                                         proj_str = ""
                                         teacher = LM(model_name=self.teacher_name,
                                                      hook_list=self.hooks.teacher.shallow,
@@ -156,29 +169,29 @@ class GlobalConfig(BaseModel):
                                                      hook_list=self.hooks.student.shallow,
                                                      d_model=self.dims.student.shallow)
                                         projection_direction = None
-                                        projection_training = None
+                                        projector_training = None
                                         offline_projector_alignment_beta = None
 
                                     else:
-                                        raise ValueError("Invalid reduction specified. Must be either 'shallow' or 'narrow'.")
+                                        raise ValueError(f"Invalid reduction specified: '{reduction}'.")
 
 
-                                    exp_name = f"{reduction}-{proj_str}{obj_weight_variant}-jsd_{jsd_beta}"
+                                    exp_name = f"{reduction.value}-{proj_str}{obj_weight_variant}-jsd_{jsd_beta}"
                                     projection_cfg = ExpProjectionConfig(
-                                        direction=projection_direction,
-                                        training=projection_training,
+                                        direction=safe_enum(ProjectionDirection, projection_direction),
+                                        training=safe_enum(ProjectorTraining, projector_training),
                                         offline_projector_alignment_beta=offline_projector_alignment_beta,
                                         offline_projector_training_args=self.offline_projector_params.training_args,
                                     )
 
                                     # only use cache for offline projector training
-                                    cache_dir = base_cache_dir if projection_training == 'offline' else None
-                                    projector_directory = f"{base_model_dir}/projector_{offline_projector_alignment_beta}" if offline_projector_alignment_beta else None
+                                    cache_dir = base_cache_dir if projector_training == ProjectorTraining.OFFLINE.value else None
+                                    projector_directory = f"{base_model_dir}/offline_projectors/off_proj_{offline_projector_alignment_beta}" if offline_projector_alignment_beta else None
                                     exp_dirs = ExpDirConfig(cache=cache_dir,
                                                             off_proj_model=projector_directory,
-                                                            teacher_model=f"{base_model_dir}/{teacher.model_name}",
-                                                            student_model=f"{base_model_dir}/{exp_name}",
-                                                            student_scores=f"{base_scores_dir}/{exp_name}")
+                                                            teacher_model=f"{base_model_dir}/teachers/{teacher.model_name}",
+                                                            student_model=f"{base_model_dir}/students/{exp_name}",
+                                                            student_scores=f"{base_scores_dir}/students/{exp_name}")
                                     exp = ExperimentConfig(
                                         name=exp_name,
                                         dirs=exp_dirs,
@@ -186,12 +199,14 @@ class GlobalConfig(BaseModel):
                                         teacher=teacher,
                                         student=student,
                                         train_params=self.training_params,
+                                        lm_params=self.lm_params,
                                         projection=projection_cfg,
                                         objective_weight_variant=obj_weight_variant,
                                         objective_weights=OBJECTIVE_WEIGHT_VARIANTS_MAP[obj_weight_variant],
                                         jsd_beta=jsd_beta,
                                         hyperparams=self.hyperparams,
                                         tasks=tasks,
+                                        torch_dtype=self.torch_dtype,
                                     )
                                     experiment_list.append(exp)
 
@@ -203,19 +218,21 @@ class GlobalConfig(BaseModel):
                               teacher_model=f"{base_model_dir}/{self.teacher_name}",
                               student_model=f"{base_model_dir}/{SHALLOW_FT_NAME}",
                               student_scores=f"{base_scores_dir}/{SHALLOW_FT_NAME}"),
-            reduction="shallow",
+            reduction=StudentReduction.SHALLOW,
             teacher=LM(model_name=self.teacher_name,
                        d_model=self.dims.teacher.shallow),
             student=LM(model_name=self.students.shallow.name,
                        layer_reduction_factor=self.students.shallow.factor,
                        d_model=self.dims.student.shallow),
             train_params=self.training_params,
+            lm_params=self.lm_params,
             projection=None,
             objective_weight_variant="finetuning",
             objective_weights=OBJECTIVE_WEIGHT_VARIANTS_MAP["finetuning"],
             jsd_beta=None,
             hyperparams=self.hyperparams,
             tasks=tasks,
+            torch_dtype=self.torch_dtype,
         )
         NARROW_FT_NAME = "narrow_ft"
         ft_narrow_student = ExperimentConfig(
@@ -224,18 +241,20 @@ class GlobalConfig(BaseModel):
                               teacher_model=f"{base_model_dir}/{self.teacher_name}",
                               student_model=f"{base_model_dir}/{NARROW_FT_NAME}",
                               student_scores=f"{base_scores_dir}/{NARROW_FT_NAME}"),
-            reduction="narrow",
+            reduction=StudentReduction.NARROW,
             teacher=LM(model_name=self.teacher_name,
                        d_model=self.dims.teacher.narrow),
             student=LM(model_name=self.students.narrow.name,
                        d_model=self.dims.student.narrow),
             train_params=self.training_params,
+            lm_params=self.lm_params,
             projection=None,
             objective_weight_variant="finetuning",
             objective_weights=OBJECTIVE_WEIGHT_VARIANTS_MAP["finetuning"],
             jsd_beta=None,
             hyperparams=self.hyperparams,
             tasks=tasks,
+            torch_dtype=self.torch_dtype,
         )
 
         experiment_list.extend([ft_shallow_student, ft_narrow_student])

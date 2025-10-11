@@ -1,6 +1,8 @@
 from argparse import ArgumentParser
 from kdfp.schemas.globalConfig import GlobalConfig
 import pandas as pd
+import os
+import torch
 # from core.initalization import init_teacher, init_offline_projector
 # from core.analysis import analyze
 
@@ -20,6 +22,9 @@ def parse_cli_args():
 
 
 def main(config_path: str):
+    os.environ["TOKENIZERS_PARALLELISM"] = 'true'
+    torch.set_float32_matmul_precision('medium')
+    
     # grab config and set root save dir
     config = GlobalConfig.from_yaml(config_path)
     # save_dir = "./results"

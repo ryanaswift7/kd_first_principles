@@ -50,7 +50,7 @@ def _init_offline_projector(teacher: LM,
                                                total_tokens=off_proj_train_args.total_tokens,
                                                force_cache_all=off_proj_train_args.force_cache_all,
                                                cache_outputs=False,
-                                               num_workers=train_params.num_workers,
+                                               num_workers=train_params.num_data_workers,
                                                device=train_params.device)
     
     student_cache_dir, student_dim = activation_caching(lm_name=student.model_name,
@@ -67,7 +67,7 @@ def _init_offline_projector(teacher: LM,
                                                total_tokens=off_proj_train_args.total_tokens,
                                                force_cache_all=off_proj_train_args.force_cache_all,
                                                cache_outputs=False,
-                                               num_workers=train_params.num_workers,
+                                               num_workers=train_params.num_data_workers,
                                                device=train_params.device)
 
     # create projector

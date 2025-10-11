@@ -157,6 +157,7 @@ def prepare_lm_and_dataloader(lm_name: str,
                               split: str,
                               seq_len: int,
                               batch_size: int,
+                              torch_dtype: torch.dtype,
                               token_rename: bool = False,
                               shuffle: bool = False,
                               lm_dir: Optional[str] = None,
@@ -178,7 +179,7 @@ def prepare_lm_and_dataloader(lm_name: str,
     #                     n_devices=N_DEVICES,
     #                     )
     # else:
-    lm = HookedTransformer.from_pretrained_no_processing(lm_name)  #, n_devices=N_DEVICES)
+    lm = HookedTransformer.from_pretrained_no_processing(lm_name, dtype=torch_dtype)  #, n_devices=N_DEVICES)
     tokenizer = lm.tokenizer
 
     if lm_dir:
@@ -364,6 +365,7 @@ def activation_caching(lm_name: str,
                        seq_len: int,
                        batch_size: int,
                        cache_dir: str,
+                       torch_dtype: torch.dtype,
                        token_rename: bool = False,
                        shuffle: bool = False,
                        lm_dir: Optional[str] = None,
@@ -384,17 +386,19 @@ def activation_caching(lm_name: str,
     lm_act_cache_dir = f"{cache_dir}/{lm_name.split('/')[1]}/{dataset_name.split('/')[1]}"
 
     lm, token_dl, n_samples = prepare_lm_and_dataloader(
-        lm_name,
-        dataset_name,
-        dataset_subset,
-        split,
-        seq_len,
-        batch_size,
-        token_rename,
-        shuffle,
-        lm_dir,
-        total_tokens,
-        num_workers,)
+        lm_name=lm_name,
+        dataset_name=dataset_name,
+        dataset_subset=dataset_subset,
+        split=split,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        torch_dtype=torch_dtype,
+        token_rename=token_rename,
+        shuffle=shuffle,
+        lm_dir=lm_dir,
+        total_tokens=total_tokens,
+        num_workers=num_workers,
+    )
     # if sae:
     #     assert resid_hook_item == sae.cfg.hook_name, f"resid hook: {resid_hook_item}\nsae cfg hook: {sae.cfg.hook_name}"
 

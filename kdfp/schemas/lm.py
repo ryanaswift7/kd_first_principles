@@ -4,18 +4,20 @@ from transformers import AutoModelForCausalLM
 import torch
 import kdfp.utils.weight_conversion as wc
 from kdfp.schemas.configBase import ConfigBase
+from lightning.pytorch import LightningModule
 
 
 class LM(ConfigBase):
     model_name: str
     d_model: int
     # model_dir: Optional[str] = None
+    pl: Optional[LightningModule] = None
     tl: Optional[HookedTransformer] = None
     hf: Optional[AutoModelForCausalLM] = None
     layer_reduction_factor: Optional[float] = None
     hook_list: Optional[List[str]] = None
     
-    def to_config_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         """
         Return a standardized dictionary representation for configuration purposes.
         Excludes the heavy model objects (tl, hf).

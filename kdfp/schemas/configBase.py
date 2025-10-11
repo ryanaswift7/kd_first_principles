@@ -1,37 +1,44 @@
-from abc import ABC, abstractmethod
-from pydantic import BaseModel
-from typing import Dict, Any
 import json
+from typing import Set, Dict, Any
+from pydantic import BaseModel
 
-class ConfigBase(ABC, BaseModel):
+class ConfigBase(BaseModel):
     """
     Abstract base class for all configuration objects.
-    Provides standardized methods for configuration representation and comparison.
+    Provides standardized methods for serialization, comparison, and hashing
+    using Pydantic's built-in functionality.
     """
-    
-    @abstractmethod
+    # Pydantic V2+ uses a `model_config` dictionary instead of a class `Config`
+    model_config = {
+        'arbitrary_types_allowed': True,
+        'extra': 'forbid',
+    }
+
+    # Subclasses should override this set to specify fields to exclude.
+    # This replaces the need to manually implement `to_dict()` everywhere.
+    _heavy_fields_to_exclude: Set[str] = set()
+
     def to_config_dict(self) -> Dict[str, Any]:
         """
         Return a standardized dictionary representation for configuration purposes.
-        This should exclude heavy objects and only include lightweight configuration fields.
+        This automatically excludes fields defined in `_heavy_fields_to_exclude`.
         """
-        pass
-    
+        return self.model_dump(exclude=self._heavy_fields_to_exclude)
+
     @property
     def config_json(self) -> str:
-        """Property that returns JSON representation for hashing."""
-        return json.dumps(self.to_config_dict(), sort_keys=True, default=str)
-    
+        """Property that returns a sorted JSON representation for hashing."""
+        return self.model_dump_json(
+            exclude=self._heavy_fields_to_exclude,
+            indent=4,
+        )
+
     def __hash__(self) -> int:
         """Make objects hashable based on their configuration."""
         return hash(self.config_json)
-    
+
     def __eq__(self, other: object) -> bool:
         """Compare objects based on their configuration."""
-        if not isinstance(other, ConfigBase):
-            return False
+        if not isinstance(other, self.__class__):
+            return NotImplemented
         return self.config_json == other.config_json
-    
-    class Config:
-        arbitrary_types_allowed = True
-        extra = 'forbid'  # Prevent extra fields

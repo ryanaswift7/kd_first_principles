@@ -1,7 +1,7 @@
 import torch
 from typing import Optional, Union
 from pathlib import Path
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 from torch.utils.data import DataLoader, random_split
 from kdfp.utils.data import ProjectorDataset
 
