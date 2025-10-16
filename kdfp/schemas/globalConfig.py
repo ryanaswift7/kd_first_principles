@@ -2,14 +2,18 @@ from typing import List, Optional, Dict, Literal, Union
 from pydantic import BaseModel, Field, field_validator, model_validator
 import yaml
 import torch
+import lightning.pytorch as pl
+import pandas as pd
+
+from kdfp.core.baseline import BaselineModule, BaselineModuleConfig
 from kdfp.schemas.configBase import ConfigBase
-from kdfp.schemas.experimentConfig import ExperimentConfig, TaskSpec, LM
+from kdfp.schemas.experimentConfig import ExperimentConfig, TaskSpec, LMConfig
 from transformer_lens import HookedTransformer
+from kdfp.schemas.mixins import DtypeSerializerMixin
 from kdfp.utils.shallow_model_loading import get_indices_and_num_layers_to_keep
 from kdfp.schemas.objective_weights import OBJECTIVE_WEIGHT_VARIANTS_MAP
 from kdfp.schemas.subConfigs import (
     BaseDirConfig,
-    DtypeSerializerMixin,
     ExpDirConfig,
     OffProjParamsConfig,
     StudentConfigs,
@@ -21,14 +25,12 @@ from kdfp.schemas.subConfigs import (
     ReductionHooks,
     DistillationDims,
     ReductionDims,
-    ExpProjectionConfig)
-import os
+    ProjectionConfig)
 from kdfp.utils.enums import (ProjectionDirection, ProjectorTraining, StudentReduction, safe_enum)
 
-class GlobalConfig(ConfigBase, DtypeSerializerMixin):
+class GlobalConfig(ConfigBase):
     teacher_name: str
     students: StudentConfigs
-    torch_dtype: Union[str, torch.dtype]
     directories: BaseDirConfig
     offline_projector_params: OffProjParamsConfig
     lm_params: LMParamsConfig
@@ -36,7 +38,6 @@ class GlobalConfig(ConfigBase, DtypeSerializerMixin):
 
     hook_types: Dict[str, List[str]] = Field(..., description="Keys 'single' and 'per_layer' with lists of hook names")
     projection_variants: Dict[str, List[str]] = Field(..., description="Keys 'directions' and 'training_methods'")
-    # offline_projector_alignment_betas: List[float]
     objective_weight_variants: List[str]
     jsd_betas: List[float]
     hyperparams: HyperparamsConfig
@@ -130,7 +131,7 @@ class GlobalConfig(ConfigBase, DtypeSerializerMixin):
         return hooks, d_model
 
     def generate_experiment_list(self, debug: bool = False) -> List[ExperimentConfig]:
-        tasks = self.generate_task_list()
+        self.tasks = self.generate_task_list()
 
         base_cache_dir = self.directories.root + '/' + self.directories.cache
         base_model_dir = self.directories.root + '/' + self.directories.models
@@ -149,10 +150,10 @@ class GlobalConfig(ConfigBase, DtypeSerializerMixin):
                                         if proj_train == ProjectorTraining.OFFLINE.value:
                                             proj_str += f"_align_{off_proj_align_beta}"
                                         proj_str += '-'
-                                        teacher = LM(model_name=self.teacher_name,
+                                        teacher = LMConfig(model_name=self.teacher_name,
                                                      hook_list=self.hooks.teacher.narrow,
                                                      d_model=self.dims.teacher.narrow)
-                                        student = LM(model_name=self.students.narrow.name,
+                                        student = LMConfig(model_name=self.students.narrow.name,
                                                      hook_list=self.hooks.student.narrow,
                                                      d_model=self.dims.student.narrow)
                                         projection_direction = proj_dir
@@ -162,10 +163,10 @@ class GlobalConfig(ConfigBase, DtypeSerializerMixin):
 
                                     elif reduction == StudentReduction.SHALLOW:
                                         proj_str = ""
-                                        teacher = LM(model_name=self.teacher_name,
+                                        teacher = LMConfig(model_name=self.teacher_name,
                                                      hook_list=self.hooks.teacher.shallow,
                                                      d_model=self.dims.teacher.shallow)
-                                        student = LM(model_name=self.students.shallow.name,
+                                        student = LMConfig(model_name=self.students.shallow.name,
                                                      hook_list=self.hooks.student.shallow,
                                                      d_model=self.dims.student.shallow)
                                         projection_direction = None
@@ -177,7 +178,7 @@ class GlobalConfig(ConfigBase, DtypeSerializerMixin):
 
 
                                     exp_name = f"{reduction.value}-{proj_str}{obj_weight_variant}-jsd_{jsd_beta}"
-                                    projection_cfg = ExpProjectionConfig(
+                                    projection_cfg = ProjectionConfig(
                                         direction=safe_enum(ProjectionDirection, projection_direction),
                                         training=safe_enum(ProjectorTraining, projector_training),
                                         offline_projector_alignment_beta=offline_projector_alignment_beta,
@@ -189,7 +190,7 @@ class GlobalConfig(ConfigBase, DtypeSerializerMixin):
                                     projector_directory = f"{base_model_dir}/offline_projectors/off_proj_{offline_projector_alignment_beta}" if offline_projector_alignment_beta else None
                                     exp_dirs = ExpDirConfig(cache=cache_dir,
                                                             off_proj_model=projector_directory,
-                                                            teacher_model=f"{base_model_dir}/teachers/{teacher.model_name}",
+                                                            teacher_models=f"{base_model_dir}/teachers/{teacher.model_name}",
                                                             student_model=f"{base_model_dir}/students/{exp_name}",
                                                             student_scores=f"{base_scores_dir}/students/{exp_name}")
                                     exp = ExperimentConfig(
@@ -197,15 +198,15 @@ class GlobalConfig(ConfigBase, DtypeSerializerMixin):
                                         dirs=exp_dirs,
                                         reduction=reduction,
                                         teacher=teacher,
-                                        student=student,
-                                        train_params=self.training_params,
+                                        student_cfg=student,
+                                        training_params=self.training_params,
                                         lm_params=self.lm_params,
                                         projection=projection_cfg,
                                         objective_weight_variant=obj_weight_variant,
                                         objective_weights=OBJECTIVE_WEIGHT_VARIANTS_MAP[obj_weight_variant],
                                         jsd_beta=jsd_beta,
                                         hyperparams=self.hyperparams,
-                                        tasks=tasks,
+                                        tasks=self.tasks,
                                         torch_dtype=self.torch_dtype,
                                     )
                                     experiment_list.append(exp)
@@ -215,45 +216,45 @@ class GlobalConfig(ConfigBase, DtypeSerializerMixin):
         ft_shallow_student = ExperimentConfig(
             name=SHALLOW_FT_NAME,
             dirs=ExpDirConfig(cache=None,
-                              teacher_model=f"{base_model_dir}/{self.teacher_name}",
+                              teacher_models=f"{base_model_dir}/{self.teacher_name}",
                               student_model=f"{base_model_dir}/{SHALLOW_FT_NAME}",
                               student_scores=f"{base_scores_dir}/{SHALLOW_FT_NAME}"),
             reduction=StudentReduction.SHALLOW,
-            teacher=LM(model_name=self.teacher_name,
+            teacher=LMConfig(model_name=self.teacher_name,
                        d_model=self.dims.teacher.shallow),
-            student=LM(model_name=self.students.shallow.name,
+            student_cfg=LMConfig(model_name=self.students.shallow.name,
                        layer_reduction_factor=self.students.shallow.factor,
                        d_model=self.dims.student.shallow),
-            train_params=self.training_params,
+            training_params=self.training_params,
             lm_params=self.lm_params,
             projection=None,
             objective_weight_variant="finetuning",
             objective_weights=OBJECTIVE_WEIGHT_VARIANTS_MAP["finetuning"],
             jsd_beta=None,
             hyperparams=self.hyperparams,
-            tasks=tasks,
+            tasks=self.tasks,
             torch_dtype=self.torch_dtype,
         )
         NARROW_FT_NAME = "narrow_ft"
         ft_narrow_student = ExperimentConfig(
             name=NARROW_FT_NAME,
             dirs=ExpDirConfig(cache=None,
-                              teacher_model=f"{base_model_dir}/{self.teacher_name}",
+                              teacher_models=f"{base_model_dir}/{self.teacher_name}",
                               student_model=f"{base_model_dir}/{NARROW_FT_NAME}",
                               student_scores=f"{base_scores_dir}/{NARROW_FT_NAME}"),
             reduction=StudentReduction.NARROW,
-            teacher=LM(model_name=self.teacher_name,
+            teacher=LMConfig(model_name=self.teacher_name,
                        d_model=self.dims.teacher.narrow),
-            student=LM(model_name=self.students.narrow.name,
+            student_cfg=LMConfig(model_name=self.students.narrow.name,
                        d_model=self.dims.student.narrow),
-            train_params=self.training_params,
+            training_params=self.training_params,
             lm_params=self.lm_params,
             projection=None,
             objective_weight_variant="finetuning",
             objective_weights=OBJECTIVE_WEIGHT_VARIANTS_MAP["finetuning"],
             jsd_beta=None,
             hyperparams=self.hyperparams,
-            tasks=tasks,
+            tasks=self.tasks,
             torch_dtype=self.torch_dtype,
         )
 
@@ -267,6 +268,89 @@ class GlobalConfig(ConfigBase, DtypeSerializerMixin):
         # - I use this to filter out the duplicates
         unique_experiment_list = list(set(experiment_list))
         exp_names = [e.name for e in unique_experiment_list]
+        self.sorted_experiment_list = sorted(unique_experiment_list, key=lambda exp: exp.name)
 
-        return sorted(unique_experiment_list, key=lambda exp: exp.name), sorted(exp_names)
+        return self.sorted_experiment_list, sorted(exp_names)
 
+    def run_baseline_tests(self) -> List[dict]:
+        results_list = []
+        trainer = pl.Trainer(
+            accelerator='gpu',
+            devices=1,
+            deterministic=self.training_params.reproducible_backend,
+        )
+        for task in self.tasks:
+            base_teacher_cfg = BaselineModuleConfig(
+                model_name=self.teacher_name,
+                is_shallow=False,
+                task=task,
+                seq_len=self.training_params.seq_len,
+                batch_size=self.lm_params.test_batch_size,
+                seed=self.training_params.seed,
+                torch_dtype=self.training_params.torch_dtype,
+                num_data_workers=self.training_params.resources.teacher.num_data_workers,
+                n_samples=self.lm_params.num_samples,
+                layer_reduction_factor=None,)
+            base_teacher_module = BaselineModule(base_teacher_cfg)
+            base_teacher_results = trainer.test(base_teacher_module)
+            results_list.append({
+                "EXPERIMENT": "base_teacher",
+                "TASK": task.task_name,
+                "METRIC": "accuracy",
+                "SCORE": base_teacher_results[0]['test_acc']})
+            results_list.append({
+                "EXPERIMENT": "base_teacher",
+                "TASK": task.task_name,
+                "METRIC": "f1",
+                "SCORE": base_teacher_results[0]['test_f1']})
+
+            base_narrow_student_cfg = BaselineModuleConfig(
+                model_name=self.students.narrow.name,
+                is_shallow=False,
+                task=task,
+                seq_len=self.training_params.seq_len,
+                batch_size=self.lm_params.test_batch_size,
+                seed=self.training_params.seed,
+                torch_dtype=self.training_params.torch_dtype,
+                num_data_workers=self.training_params.resources.teacher.num_data_workers,
+                n_samples=self.lm_params.num_samples,
+                layer_reduction_factor=None,
+            )
+            base_narrow_student_module = BaselineModule(base_narrow_student_cfg)
+            base_narrow_student_results = trainer.test(base_narrow_student_module)
+            results_list.append({
+                "EXPERIMENT": "base_narrow",
+                "TASK": task.task_name,
+                "METRIC": "accuracy",
+                "SCORE": base_narrow_student_results[0]['test_acc']})
+            results_list.append({
+                "EXPERIMENT": "base_teacher",
+                "TASK": task.task_name,
+                "METRIC": "f1",
+                "SCORE": base_narrow_student_results[0]['test_f1']})
+
+            base_shallow_student_cfg = BaselineModuleConfig(
+                model_name=self.students.shallow.name,
+                is_shallow=True,
+                task=task,
+                seq_len=self.training_params.seq_len,
+                batch_size=self.lm_params.test_batch_size,
+                seed=self.training_params.seed,
+                torch_dtype=self.training_params.torch_dtype,
+                num_data_workers=self.training_params.resources.teacher.num_data_workers,
+                n_samples=self.lm_params.num_samples,
+                layer_reduction_factor=self.students.shallow.factor,
+            )
+            base_shallow_student_module = BaselineModule(base_shallow_student_cfg)
+            base_shallow_student_results = trainer.test(base_shallow_student_module)
+            results_list.append({
+                "EXPERIMENT": "base_shallow",
+                "TASK": task.task_name,
+                "METRIC": "accuracy",
+                "SCORE": base_shallow_student_results[0]['test_acc']})
+            results_list.append({
+                "EXPERIMENT": "base_teacher",
+                "TASK": task.task_name,
+                "METRIC": "f1",
+                "SCORE": base_shallow_student_results[0]['test_f1']})
+        return results_list

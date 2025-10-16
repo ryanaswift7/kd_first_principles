@@ -6,8 +6,6 @@ students:
   narrow:
     name: EleutherAI/pythia-410m-deduped
 
-torch_dtype: bfloat16
-
 directories:
   root: results
   cache: cache
@@ -28,22 +26,37 @@ offline_projector_params:
     num_epochs: 1
     n_trials: 1
     force_cache_all: false
-    num_gpus_per_trial: 0.25
-    num_cpus_per_trial: 1
 
 lm_params:
   num_samples: 8  # null
   num_epochs: 1
   n_trials: 1
-  num_gpus_per_trial: 1.0
-  num_cpus_per_trial: 6
+  test_batch_size: 64
 
 training_params:
   seed: 44 # [3, 27, 44]
   seq_len: 128  # 2048
   reproducible_backend: true
-  num_data_workers: 0
-  device: 'cuda'  # 'mps' (?)
+  device: 'cuda'
+  torch_dtype: bfloat16
+  resources: 
+    num_available_gpus: 2
+    projector:
+      num_data_workers: 0
+      num_ray_workers: 1
+      num_cpus_per_trial: 1
+      num_gpus_per_trial: 0.25
+    teacher:
+      num_data_workers: 4
+      num_ray_workers: 1
+      num_cpus_per_trial: 6
+      num_gpus_per_trial: 0.5
+    student:
+      num_data_workers: 4
+      num_ray_workers: 1
+      num_cpus_per_trial: 6
+      num_gpus_per_trial: 2.0
+
 
 hook_types:
   single:

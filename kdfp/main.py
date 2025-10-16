@@ -25,13 +25,7 @@ def main(config_path: str):
     os.environ["TOKENIZERS_PARALLELISM"] = 'true'
     torch.set_float32_matmul_precision('medium')
     
-    # grab config and set root save dir
     config = GlobalConfig.from_yaml(config_path)
-    # save_dir = "./results"
-
-    columns = ["experiment"]
-    columns.extend(config.tasks.keys())
-    result_df = pd.DataFrame(columns=columns)
 
     experiment_list, experiment_names = config.generate_experiment_list()
     print(f"A total of {len(experiment_names)} experiments have been specified:")
@@ -39,7 +33,7 @@ def main(config_path: str):
         assert experiment_list[i].name == name, f"Experiment name mismatch: {experiment_list[i].name} != {name}"
         print(f"    {i+1}: {name}")
 
-
+    baseline_results_list = config.run_baseline_tests()
     for i, experiment in enumerate(experiment_list):
         print(f"Starting experiment {i}: {experiment.name.upper()}")
         experiment.init()

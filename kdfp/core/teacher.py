@@ -1,22 +1,8 @@
-"""
-TODO:
-- Teacher class which contains a dict of task names -> ft model locations
-    - select task name to load ft model for task
-- have an individual training function, and also one for applying indiv to the
-    full task list
-- should have create(task=task), init() [make and use task list], save, load
-- init should make sure every task variant is trained and/or available
-- change LM class to have a dict of task names and model locations
-- default to HF for everything and use TL when necessary
-"""
-
-
 import os
 from pydantic import field_validator
 import torch
 from torch.utils.data import DataLoader
 import lightning.pytorch as pl
-# import pytorch_lightning as pl
 import ray
 from ray.tune import CLIReporter
 from ray.tune.integration.pytorch_lightning import TuneReportCallback, TuneReportCheckpointCallback
@@ -36,11 +22,6 @@ import wandb
 from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
 from torchmetrics.classification import Accuracy
 from torchmetrics import F1Score
-
-from kdfp.schemas.configBase import ConfigBase
-from kdfp.schemas.subConfigs import DtypeSerializerMixin, HyperparamsConfig, LMParamsConfig, TrainingParamsConfig
-from kdfp.schemas.tasks import TaskSpec
-from kdfp.utils.data import load_task_data
 import json
 from ray.train.lightning import (
     RayDDPStrategy,
@@ -53,10 +34,17 @@ import ray.tune
 import ray.train
 import uuid
 
-def gen_teacher_weights_file(task_name: str) -> str:
+from kdfp.schemas.configBase import ConfigBase
+from kdfp.schemas.subConfigs import HyperparamsConfig, LMParamsConfig, TrainingParamsConfig
+from kdfp.schemas.tasks import TaskSpec
+from kdfp.schemas.mixins import DtypeSerializerMixin, MCEvalMixin
+from kdfp.utils.data import load_task_data
+
+
+def gen_teacher_weights_filename(task_name: str) -> str:
     return f"teacher_{task_name}.bin"
 
-class TeacherTrainConfig(ConfigBase, DtypeSerializerMixin):
+class TeacherModuleConfig(ConfigBase, DtypeSerializerMixin):
     model_name: str
     tokenizer_name: str
     task: TaskSpec
@@ -67,33 +55,21 @@ class TeacherTrainConfig(ConfigBase, DtypeSerializerMixin):
     max_grad_norm: float
     seed: int
     torch_dtype: Union[str, torch.dtype]
-    num_workers: Optional[int] = None
+    num_data_workers: Optional[int] = None
     n_samples: Optional[int] = None
-    # warmup_steps: int,
-    # project_name: str,
-    # experiment_name: str,
-    # scheduler_type: Literal["cosine", "cosine_warmup", "cosine_restarts", "cosine_annealing"],
-    # num_cycles: int,
-    # t_mult: int,
-    # eta_min: float,
-    # tune_mode: bool = False,
-    @field_validator('torch_dtype')
-    def validate_dtype(cls, v):
-        if isinstance(v, str):
-            v = getattr(torch, v)
-        return v
 
-class Teacher(pl.LightningModule):
-    def __init__(self, train_config):
+class TeacherModule(pl.LightningModule, MCEvalMixin):
+    def __init__(self, train_config: TeacherModuleConfig):
         super().__init__()
 
         # If train_config is a dict (from loading a checkpoint),
         # parse it back into a TeacherTrainConfig object.
-        if isinstance(train_config, dict):
-            self.train_config = TeacherTrainConfig(**train_config)
-        else:
-            # Otherwise (on initial creation), use the object directly.
-            self.train_config = train_config
+        # if isinstance(train_config, dict):
+        #     self.train_config = TeacherModuleConfig(**train_config)
+        # else:
+        #     # Otherwise (on initial creation), use the object directly.
+        #     self.train_config = train_config
+        self.train_config = train_config
 
         # Now self.train_config is guaranteed to be a TeacherTrainConfig object,
         # and you can safely call .model_dump()
@@ -137,7 +113,7 @@ class Teacher(pl.LightningModule):
         
     @property
     def model_file(self):
-        return gen_teacher_weights_file(self.train_config.task.task_name)
+        return gen_teacher_weights_filename(self.train_config.task.task_name)
         
     def forward(self, input_ids, attention_mask, labels=None):
         return self.model(
@@ -153,81 +129,16 @@ class Teacher(pl.LightningModule):
             labels=batch['labels']
         )
         loss = outputs.loss
-        print("\n\nRAN TRAINING STEP\n\n")
-
-        # if batch_idx == 0:
-        #     # Get the first item's details from the batch
-        #     first_input_ids = batch['input_ids'][0]
-        #     # last_5_input_ids = first_input_ids[-5:]
-            
-        #     # Decode for readability
-        #     context_text = self.tokenizer.decode(first_input_ids, skip_special_tokens=True)
-
-        #     # Print in a clean, readable format
-        #     print("\n" + "="*60)
-        #     print("🔍 TRAIN EXAMPLE (Batch 0, Sample 0)")
-        #     print(f"  INPUT CONTEXT:\n    '{context_text}'")
-        #     print("="*60 + "\n")
-
         self.log('train_loss', loss, sync_dist=True)
-        
         return loss
-        
+    
     def validation_step(self, batch, batch_idx):
-        """
-        Corrected, efficient, and vectorized validation step.
-        """
-        # The batch contains tensors of shape [batch_size, 4, seq_len]
-        batch_size, num_choices, seq_len = batch['input_ids'].shape
-        true_labels = batch['label']
-
-        # 1. Reshape inputs for a single, efficient forward pass
-        # Shape becomes [batch_size * 4, seq_len]
-        input_ids = batch['input_ids'].view(-1, seq_len)
-        # attention_mask = batch['attention_mask'].view(-1, seq_len)
-
-        # 2. Perform one forward pass for all choices in the batch
-        with torch.no_grad():
-            outputs = self.model(input_ids=input_ids)  # , attention_mask=attention_mask)
-        
-        logits = outputs.logits
-
-        # --- Add the debugging check for safety ---
-        if torch.isnan(logits).any() or torch.isinf(logits).any():
-            raise ValueError("NaN or Inf in logits, stopping validation.")
-
-        # 3. Calculate the Negative Log-Likelihood (NLL) for each choice
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = input_ids[..., 1:].contiguous()
-
-        # Use reduction='none' to get the loss for each token individually
-        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-        
-        nll_per_token = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        
-        # Reshape the per-token losses to match the sequence structure
-        nll_per_token = nll_per_token.view(batch_size * num_choices, -1)
-        
-        # Ignore the loss for padding tokens by setting them to zero
-        nll_per_token[shift_labels == self.tokenizer.pad_token_id] = 0
-        
-        # Sum the NLL for each sequence to get a score per choice
-        nll_scores = nll_per_token.sum(dim=1)
-
-        # 4. Reshape scores and find the prediction
-        # Reshape scores from [batch_size * 4] to [batch_size, 4]
-        choice_nll_scores = nll_scores.view(batch_size, num_choices)
-
-        # The prediction is the choice with the minimum NLL
-        preds = torch.argmin(choice_nll_scores, dim=1)
-
-        # 5. Update metrics and log loss
+        preds, true_labels, correct_choice_loss = self._shared_eval_step(
+            model=self.model,
+            batch=batch,
+            batch_idx=batch_idx)
         self.val_metrics.update(preds, true_labels)
-        
-        # Log the mean NLL of the correct choices
-        correct_choice_loss = choice_nll_scores[torch.arange(batch_size), true_labels].mean()
         self.log('val_loss', correct_choice_loss, sync_dist=True)
-
         return {"val_loss": correct_choice_loss}
     
     def on_validation_epoch_end(self):
@@ -235,57 +146,12 @@ class Teacher(pl.LightningModule):
         self.val_metrics.reset()
 
     def test_step(self, batch, batch_idx):
-        # The batch contains tensors of shape [batch_size, 4, seq_len]
-        batch_size, num_choices, seq_len = batch['input_ids'].shape
-        true_labels = batch['label']
-
-        # 1. Reshape inputs for a single, efficient forward pass
-        # Shape becomes [batch_size * 4, seq_len]
-        input_ids = batch['input_ids'].view(-1, seq_len)
-        # attention_mask = batch['attention_mask'].view(-1, seq_len)
-
-        # 2. Perform one forward pass for all choices in the batch
-        with torch.no_grad():
-            outputs = self.model(input_ids=input_ids)  #, attention_mask=attention_mask)
-        
-        logits = outputs.logits
-
-        # --- Add the debugging check for safety ---
-        if torch.isnan(logits).any() or torch.isinf(logits).any():
-            raise ValueError("NaN or Inf in logits, stopping testing.")
-
-        # 3. Calculate the Negative Log-Likelihood (NLL) for each choice
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = input_ids[..., 1:].contiguous()
-
-        # Use reduction='none' to get the loss for each token individually
-        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-        
-        nll_per_token = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        
-        # Reshape the per-token losses to match the sequence structure
-        nll_per_token = nll_per_token.view(batch_size * num_choices, -1)
-        
-        # Ignore the loss for padding tokens by setting them to zero
-        nll_per_token[shift_labels == self.tokenizer.pad_token_id] = 0
-        
-        # Sum the NLL for each sequence to get a score per choice
-        nll_scores = nll_per_token.sum(dim=1)
-
-        # 4. Reshape scores and find the prediction
-        # Reshape scores from [batch_size * 4] to [batch_size, 4]
-        choice_nll_scores = nll_scores.view(batch_size, num_choices)
-
-        # The prediction is the choice with the minimum NLL
-        preds = torch.argmin(choice_nll_scores, dim=1)
-
-        # 5. Update metrics and log loss
+        preds, true_labels, correct_choice_loss = self._shared_eval_step(
+            model=self.model,
+            batch=batch,
+            batch_idx=batch_idx)
         self.test_metrics.update(preds, true_labels)
-        
-        # Log the mean NLL of the correct choices
-        correct_choice_loss = choice_nll_scores[torch.arange(batch_size), true_labels].mean()
         self.log('test_loss', correct_choice_loss, sync_dist=True)
-
         return {"test_loss": correct_choice_loss}
 
     def on_test_epoch_end(self):
@@ -308,13 +174,13 @@ class Teacher(pl.LightningModule):
             split='train',
             n_samples=self.train_config.n_samples)
         
-        # dataset = dataset.shuffle(seed=self.train_config.seed, buffer_size=1000)
+        dataset = dataset.shuffle(seed=self.train_config.seed, buffer_size=1000)
         
         return DataLoader(
             dataset,
             batch_size=self.train_config.batch_size,
             shuffle=False,
-            num_workers=self.train_config.num_workers,
+            num_workers=self.train_config.num_data_workers,
             collate_fn=self.data_collator,
             pin_memory=True
         )
@@ -331,7 +197,7 @@ class Teacher(pl.LightningModule):
             dataset,
             batch_size=self.train_config.batch_size,
             shuffle=False,
-            num_workers=self.train_config.num_workers,
+            num_workers=self.train_config.num_data_workers,
             # collate_fn=self.data_collator,
             pin_memory=True
         )
@@ -348,7 +214,7 @@ class Teacher(pl.LightningModule):
             dataset,
             batch_size=self.train_config.batch_size,
             shuffle=False,
-            num_workers=self.train_config.num_workers,
+            num_workers=self.train_config.num_data_workers,
             # collate_fn=self.data_collator,
             pin_memory=True
         )
@@ -360,9 +226,9 @@ class Teacher(pl.LightningModule):
         lm_params: LMParamsConfig,
         hyperparams: HyperparamsConfig,
         training_params: TrainingParamsConfig,
-        torch_dtype: torch.dtype,
     ):
         """Create a teacher for a given task using hyperparameter tuning with Ray Tune"""
+
         # os.environ["RAY_TRAIN_V2_ENABLED"] = '1'
         # torch.set_float32_matmul_precision('medium')
         pl.seed_everything(training_params.seed, workers=True)
@@ -371,7 +237,7 @@ class Teacher(pl.LightningModule):
         def train_teacher_per_worker(config):
             if training_params.reproducible_backend:
                 ray.train.torch.enable_reproducibility()
-            train_config = TeacherTrainConfig(
+            train_config = TeacherModuleConfig(
                 model_name=lm_name,
                 tokenizer_name=lm_name,
                 task=task,
@@ -381,12 +247,12 @@ class Teacher(pl.LightningModule):
                 weight_decay=config["weight_decay"],
                 max_grad_norm=config["max_grad_norm"],
                 n_samples=lm_params.num_samples,
-                num_workers=training_params.num_data_workers,
+                num_workers=training_params.resources.teacher.num_data_workers,
                 seed=training_params.seed,
-                torch_dtype=torch_dtype,
+                torch_dtype=training_params.torch_dtype,
             )
 
-            model = Teacher(train_config=train_config)
+            module = TeacherModule(train_config=train_config)
             
             trainer = pl.Trainer(
                 devices="auto",
@@ -403,23 +269,23 @@ class Teacher(pl.LightningModule):
                 check_val_every_n_epoch=1,
             )
             trainer = prepare_trainer(trainer)
-            model.train()
-            trainer.fit(model)
+            module.train()
+            trainer.fit(module)
             
         def tune_asha(num_trials: int):
             
             train_loop_config = {
                 "learning_rate": ray.tune.qloguniform(hyperparams.lr.mini, hyperparams.lr.maxi, 1e-6),
-                "weight_decay": ray.tune.quniform(hyperparams.weight_decay.mini, hyperparams.weight_decay.maxi, 1e-4),
+                "weight_decay": ray.tune.qloguniform(hyperparams.weight_decay.mini, hyperparams.weight_decay.maxi, 1e-4),
                 "batch_size": ray.tune.choice(hyperparams.batch_sizes),
-                "max_grad_norm": ray.tune.qloguniform(hyperparams.max_grad_norm.mini, hyperparams.max_grad_norm.maxi, 1e-1)
+                "max_grad_norm": ray.tune.quniform(hyperparams.max_grad_norm.mini, hyperparams.max_grad_norm.maxi, 1e-1)
             }
             scaling_config = ray.train.ScalingConfig(
-                num_workers=1,
+                num_workers=training_params.resources.teacher.num_ray_workers,
                 use_gpu=True,
                 resources_per_worker={
-                    "CPU": lm_params.num_cpus_per_trial,
-                    "GPU": lm_params.num_gpus_per_trial,},
+                    "CPU": training_params.resources.teacher.num_cpus_per_trial,
+                    "GPU": training_params.resources.teacher.num_gpus_per_trial,},
                 placement_strategy="PACK",
             )
             tune_run_config = ray.tune.RunConfig(
@@ -452,7 +318,7 @@ class Teacher(pl.LightningModule):
                     mode="max",
                     num_samples=num_trials,
                     scheduler=scheduler,
-                    max_concurrent_trials=(2 // lm_params.num_gpus_per_trial),
+                    max_concurrent_trials=(training_params.resources.num_available_gpus // training_params.resources.teacher.num_gpus_per_trial),
                 ),
             )
             return tuner.fit()
@@ -460,7 +326,7 @@ class Teacher(pl.LightningModule):
         results = tune_asha(num_trials=lm_params.n_trials)
         best_result = results.get_best_result()
         with best_result.checkpoint.as_directory() as checkpoint_dir:
-            return Teacher.load_from_checkpoint(f"{checkpoint_dir}/checkpoint.ckpt")
+            return TeacherModule.load_from_checkpoint(f"{checkpoint_dir}/checkpoint.ckpt")
     
 
     def save_pretrained(self, path: str) -> None:
@@ -468,26 +334,27 @@ class Teacher(pl.LightningModule):
         os.makedirs(path, exist_ok=True)
         self.model.save_pretrained(path)
         self.tokenizer.save_pretrained(path)
-
-        torch.save(self.model.state_dict(), f"{path}/{self.model_file}")
+        save_path = f"{path}/{self.model_file}"
+        torch.save(self.model.state_dict(), save_path)
 
         with open(f"{path}/config.json", "w") as f:
-            cfg = self.train_config.model_dump()
-            json.dump({"train_config": cfg}, f, indent=4)
+            # cfg = self.train_config.model_dump()
+            # json.dump({"train_config": cfg}, f, indent=4)
+            json.dump(self.train_config.model_dump(), f, indent=4)
 
         print(f"Teacher for task {self.train_config.task.task_name} saved to {path}")
         
     @classmethod
-    def load_pretrained(cls, path: str) -> 'Teacher':
+    def load_pretrained(cls, path: str) -> 'TeacherModule':
         with open(f"{path}/config.json", "w") as f:
             hparams = json.load(f)
-        
-        teacher = cls(**hparams)
-        teacher.model = AutoModelForCausalLM.from_pretrained(
+        cfg = TeacherModuleConfig(**hparams)
+        teacher_module = cls(train_config=cfg)
+        teacher_module.model = AutoModelForCausalLM.from_pretrained(
             path,
-            torch_dtype=teacher.train_config.torch_dtype)
-        teacher.model_name = path
-        teacher.tokenizer = AutoTokenizer.from_pretrained(path)
+            torch_dtype=teacher_module.train_config.torch_dtype)
+        teacher_module.model_name = path
+        teacher_module.tokenizer = AutoTokenizer.from_pretrained(path)
 
         print(f"Teacher for task {hparams["task"].name} loaded from {path}")
-        return teacher
+        return teacher_module

@@ -23,24 +23,28 @@ def get_indices_and_num_layers_to_keep(total_layers: int,
 def load_shallow(model_name: str,
                  mode: Literal["tl", "hf"], 
                  layer_reduction_factor: float,
-                 selection_method: Literal['linspace', 'first_n']):
+                 selection_method: Literal['linspace', 'first_n'],
+                 torch_dtype: torch.dtype):
     if mode == "tl":
         return _load_shallow_tl(model_name=model_name,
                                 layer_reduction_factor=layer_reduction_factor,
-                                selection_method=selection_method)
+                                selection_method=selection_method,
+                                torch_dtype=torch_dtype)
     elif mode == "hf":
         return _load_shallow_hf(model_name=model_name,
                                 layer_reduction_factor=layer_reduction_factor,
-                                selection_method=selection_method)
+                                selection_method=selection_method,
+                                torch_dtype=torch_dtype)
     else:
         raise ValueError("I don't know how you did it, but you provided an invalid mode. Must be either 'tl' or 'hf'.")
     
 
 def _load_shallow_tl(model_name: str,
                      layer_reduction_factor: float,
-                     selection_method: Literal['linspace', 'first_n']):
+                     selection_method: Literal['linspace', 'first_n'],
+                     torch_dtype: torch.dtype):
     # Load original model
-    original_model = HookedTransformer.from_pretrained(model_name)
+    original_model = HookedTransformer.from_pretrained_no_processing(model_name, dtype=torch_dtype)
     tokenizer = original_model.tokenizer
     
     # Calculate which layers to keep
@@ -134,7 +138,8 @@ def detect_model_family(model_name: str) -> str:
 
 def _load_shallow_hf(model_name: str,
                      layer_reduction_factor: float,
-                     selection_method: Literal['linspace', 'first_n']):
+                     selection_method: Literal['linspace', 'first_n'],
+                     torch_dtype: torch.dtype):
     """
     Create shallow causal LM by keeping evenly spaced layers.
     
@@ -150,7 +155,7 @@ def _load_shallow_hf(model_name: str,
     config = MODEL_FAMILY_CONFIGS[family]
     
     # Load original model
-    original_model = AutoModelForCausalLM.from_pretrained(model_name)
+    original_model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch_dtype)
     original_config = AutoConfig.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     

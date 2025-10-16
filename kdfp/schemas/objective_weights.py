@@ -33,21 +33,21 @@ class ObjectiveWeights(ConfigBase):
             )
         
         return self
-    def to_dict(self) -> Dict[str, Any]:
-        """
-        Return a standardized dictionary representation for configuration purposes.
-        Excludes the heavy model objects (tl, hf).
-        """
-        config_dict = {
-            'teacher_outputs': self.teacher_outputs,
-            'true_labels': self.true_labels,
-            'embed': self.embed,
-            'attn_scores': self.attn_scores,
-            'attn_out': self.attn_out,
-            'mlp': self.mlp,
-            'resid': self.resid,
-        }
-        return config_dict
+    # def to_dict(self) -> Dict[str, Any]:
+    #     """
+    #     Return a standardized dictionary representation for configuration purposes.
+    #     Excludes the heavy model objects (tl, hf).
+    #     """
+    #     config_dict = {
+    #         'teacher_outputs': self.teacher_outputs,
+    #         'true_labels': self.true_labels,
+    #         'embed': self.embed,
+    #         'attn_scores': self.attn_scores,
+    #         'attn_out': self.attn_out,
+    #         'mlp': self.mlp,
+    #         'resid': self.resid,
+    #     }
+    #     return config_dict
 
 # reference this to 
 OBJECTIVE_WEIGHT_VARIANTS_MAP = {

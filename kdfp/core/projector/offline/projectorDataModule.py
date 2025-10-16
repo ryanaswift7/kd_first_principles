@@ -8,14 +8,13 @@ from kdfp.utils.data import ProjectorDataset
 
 class ProjectorDataModule(pl.LightningDataModule):
     def __init__(self,
-                #  dataset: ProjectorDataset,
                  teacher_cache_dir: Union[str, Path],
                  student_cache_dir: Union[str, Path],
                  batch_size: int,
                  seed: int,
+                 num_workers: int,
                  val_split: float = 0.1,
                  test_split: float = 0.1,
-                 num_workers: int = 4,
                  pin_memory: bool = True):
         super().__init__()
         # self.dataset = dataset

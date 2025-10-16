@@ -1,0 +1,92 @@
+from typing import Union, Optional
+import torch
+import lightning.pytorch as pl
+import torchmetrics
+from torchmetrics import Accuracy, F1Score
+from transformer_lens import HookedTransformer
+from torch.utils.data import DataLoader
+
+from kdfp.schemas.configBase import ConfigBase
+from kdfp.schemas.mixins import DtypeSerializerMixin, MCEvalMixin
+from kdfp.schemas.tasks import TaskSpec
+from kdfp.utils.data import load_task_data
+from kdfp.utils.shallow_model_loading import load_shallow
+
+
+class BaselineModuleConfig(ConfigBase, DtypeSerializerMixin):
+    model_name: str
+    is_shallow: bool
+    task: TaskSpec
+    seq_len: int
+    batch_size: int
+    seed: int
+    torch_dtype: Union[str, torch.dtype]
+    num_data_workers: Optional[int] = None
+    n_samples: Optional[int] = None
+    layer_reduction_factor: Optional[int] = None
+
+class BaselineModule(pl.LightningModule, MCEvalMixin):
+    def __init__(self, train_config):
+        super().__init__()
+        if isinstance(train_config, dict):
+            self.train_config = BaselineModuleConfig(**train_config)
+        else:
+            self.train_config = train_config
+        self.save_hyperparameters({"train_config": self.train_config.model_dump()})
+
+        if self.train_config.is_shallow:
+            self.model, self.tokenizer, _ = load_shallow(
+                model_name=self.train_config.model_name,
+                mode='tl',
+                layer_reduction_factor=self.train_config.layer_reduction_factor,
+                selection_method='linspace',
+                torch_dtype=self.train_config.torch_dtype)
+        else:
+            self.model = HookedTransformer.from_pretrained(
+                self.train_config.model_name,
+                dtype=self.train_config.torch_dtype)
+            self.tokenizer = self.model.tokenizer
+
+        if self.train_config.task.task_type == 'multiclass':
+            acc = Accuracy(task=self.train_config.task.task_type, num_classes=4)
+            f1 = F1Score(task=self.train_config.task.task_type, num_classes=4)
+        else:  # binary
+            acc = Accuracy(task=self.train_config.task.task_type)
+            f1 = F1Score(task=self.train_config.task.task_type)
+
+        # Eval metrics
+        self.test_metrics = torchmetrics.MetricCollection(
+            {
+                "acc": acc,
+                "f1": f1,
+            },
+            prefix="test_"
+        )
+    def test_step(self, batch, batch_idx):
+        preds, true_labels, correct_choice_loss = self._shared_eval_step(
+            model=self.model,
+            batch=batch,
+            batch_idx=batch_idx)
+        self.test_metrics.update(preds, true_labels)
+        self.log('test_loss', correct_choice_loss, sync_dist=True)
+        return {"test_loss": correct_choice_loss}
+
+    def on_test_epoch_end(self):
+        self.log_dict(self.test_metrics.compute(), sync_dist=True)
+        self.test_metrics.reset()
+
+    def test_dataloader(self):
+        dataset = load_task_data(
+            task=self.train_config.task,
+            tokenizer=self.tokenizer,
+            seq_len=self.train_config.seq_len,
+            split='test',
+            n_samples=self.train_config.n_samples)
+        
+        return DataLoader(
+            dataset,
+            batch_size=self.train_config.batch_size,
+            shuffle=False,
+            num_workers=self.train_config.num_data_workers,
+            pin_memory=True
+        )

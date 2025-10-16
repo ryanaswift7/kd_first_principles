@@ -11,6 +11,9 @@ import lightning.pytorch as pl
 from ray import tune
 from ray.tune import CLIReporter
 from ray.tune.schedulers import ASHAScheduler
+from kdfp.schemas.configBase import ConfigBase
+from kdfp.schemas.mixins import DtypeSerializerMixin
+from kdfp.schemas.subConfigs import HyperparamsConfig, OffProjParamsConfig, ProjectionConfig, TrainingParamsConfig
 from kdfp.utils.data import ProjectorDataset
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
@@ -31,30 +34,47 @@ from ray.train.lightning import RayTrainReportCallback
 import uuid
 
 
-OFF_PROJ_STATE_DICT_FILE = "offline_projector.bin"
-AVAILABLE_GPUS = 2
 
-class OfflineProjector(LightningModule):
-    def __init__(self,
-                 teacher_dim: int,
-                 student_dim: int,
-                 alignment_beta: float,
-                #  hparams: Namespace,
-                 lr: float,
-                 weight_decay: float,
-                 torch_dtype: torch.dtype,
-                 tied_weights: bool = False):
+def gen_off_proj_weights_filename(alignment_beta: float) -> str:
+    return f"offline_projector_align_{alignment_beta}.bin"
+
+class OffProjModuleConfig(ConfigBase, DtypeSerializerMixin):
+    teacher_dim: int
+    student_dim: int
+    alignment_beta: float
+    lr: float
+    weight_decay: float
+    torch_dtype: torch.dtype
+    tied_weights: bool = False
+
+class OfflineProjectorModule(LightningModule):
+    def __init__(self, train_config: OffProjModuleConfig):
         super().__init__()
-        self.save_hyperparameters()
+        # If train_config is a dict (from loading a checkpoint),
+        # parse it back into a TeacherTrainConfig object.
+        # if isinstance(train_config, dict):
+        #     self.train_config = OffProjModuleConfig(**train_config)
+        # else:
+        #     # Otherwise (on initial creation), use the object directly.
+        #     self.train_config = train_config
+
+        self.train_config = train_config
+        self.save_hyperparameters({"train_config": self.train_config.model_dump()})
         
         # Encoder: teacher -> student space (i.e. DOWN)
-        self.encoder = nn.Linear(teacher_dim, student_dim, dtype=torch_dtype)
+        self.encoder = nn.Linear(
+            self.train_config.teacher_dim,
+            self.train_config.student_dim,
+            dtype=self.train_config.torch_dtype)
         
         # Decoder: student -> teacher space (i.e. UP)
-        self.decoder = nn.Linear(student_dim, teacher_dim, dtype=torch_dtype)
+        self.decoder = nn.Linear(
+            self.train_config.student_dim,
+            self.train_config.teacher_dim,
+            dtype=self.train_config.torch_dtype)
         
         # Weight tying if enabled
-        if tied_weights:
+        if self.train_config.tied_weights:
             self.decoder.weight = nn.Parameter(self.encoder.weight.t())
         
         self.criterion = nn.MSELoss()
@@ -62,6 +82,9 @@ class OfflineProjector(LightningModule):
         self.val_total_losses = []
         self.test_total_losses = []
 
+    @property
+    def model_file(self):
+        return gen_off_proj_weights_filename(alignment_beta=self.train_config.alignment_beta)
 
     def forward(self, x, direction: Optional[ProjectionDirection] = None):
         if direction == None:
@@ -171,57 +194,6 @@ class OfflineProjector(LightningModule):
         )
         # scheduler = 
         return optimizer
-
-    def save_pretrained(self, path: str):
-        """Save model with configuration"""
-        # Create directory if it doesn't exist
-        Path(path).mkdir(parents=True, exist_ok=True)
-        
-        # Save model state dict
-        torch.save(self.state_dict(), f"{path}/{OFF_PROJ_STATE_DICT_FILE}")
-        
-        # Save configuration
-        config = {
-            'teacher_dim': self.hparams.teacher_dim,
-            'student_dim': self.hparams.student_dim,
-            'tied_weights': self.hparams.tied_weights,
-            'alignment_beta': self.hparams.alignment_beta,
-            'lr': self.hparams.lr,
-            'weight_decay': self.hparams.weight_decay,
-            'torch_dtype': str(self.hparams.torch_dtype).split('.')[-1],
-            # 'hparams': vars(self.hparams) if isinstance(self.hparams, Namespace) else dict(self.hparams),
-        }
-        
-        with open(f"{path}/config.json", "w") as f:
-            json.dump(config, f, indent=4)
-        
-        print(f"Model saved to {path}")
-    
-    @classmethod
-    def load_pretrained(cls, path: str, map_location=None):
-        """Load model from saved configuration"""
-        # Load configuration
-        with open(f"{path}/config.json", "r") as f:
-            config = json.load(f)
-        
-        # set dtype correctly
-        config["torch_dtype"] = getattr(torch, config["torch_dtype"])
-        
-        # # Create model instance
-        model = cls(**config)
-        
-        # Load weights
-        model_path = f"{path}/{OFF_PROJ_STATE_DICT_FILE}"
-        if map_location:
-            state_dict = torch.load(model_path, map_location=map_location)
-        else:
-            state_dict = torch.load(model_path)
-        
-        model.load_state_dict(state_dict)
-        model.eval()
-        
-        print(f"Model loaded from {path}")
-        return model
     
     def extract_single_direction(self, direction: ProjectionDirection):
         return self.encoder if direction == ProjectionDirection.DOWN else self.decoder
@@ -232,83 +204,43 @@ class OfflineProjector(LightningModule):
                student_cache_dir: str,
                teacher_dim: int,
                student_dim: int,
-               torch_dtype: torch.dtype,
-               alignment_beta: float,
-               max_epochs: int,
-               wd_min: float,
-               wd_max: float,
-               mgn_min: float,
-               mgn_max: float,
-               batch_sizes: List[int],
-               lr_min: float = 1e-5,
-               lr_max: float = 1e-2,
-               n_trials: int = 15,
+               projection: ProjectionConfig,
+               hyperparams: HyperparamsConfig,
+               training_params: TrainingParamsConfig,
                val_split: float = 0.1,
-               test_split: float = 0.1,
-               seed: int = 44,
-               reproducible_backend: bool = True,
-               num_gpus_per_trial: float = 1.0,
-               num_cpus_per_trial: int = 8,
-               verbose: bool = True,) -> 'OfflineProjector':  #Tuple[Any, Dict[str, Any], Any, Dict[str, float], Dict[str, float]]:
+               test_split: float = 0.1,) -> 'OfflineProjectorModule':  #Tuple[Any, Dict[str, Any], Any, Dict[str, float], Dict[str, float]]:
         """Create and train projector with multi-objective loss"""
         from .train import train_projector_per_worker
 
-        pl.seed_everything(seed, workers=True)
-        run_name = f'off_proj_{alignment_beta}'
-        
-        # dataset = ProjectorDataset(teacher_cache_dir, student_cache_dir)
-        
-        if verbose:
-            # print(f"Dataset size: {len(dataset)}")
-            print(f"Teacher dim: {teacher_dim}, Student dim: {student_dim}")
-            print(f"Max epochs: {max_epochs}")
-            print(f"Validation split: {val_split}, Test split: {test_split}")
-        
-        # Validate input lists are not empty
-        hparams = {
-            'lr_min': lr_min,
-            'lr_max': lr_max,
-            'wd_min': wd_min,
-            'wd_max': wd_max,
-            'mgn_min': mgn_min,
-            'mgn_max': mgn_max,
-            'batch_sizes': batch_sizes,
-        }
-        if not all(hparams.values()):
-            for k, v in hparams.items():
-                if v is None:
-                    print(f'{k} is empty')
-                    raise ValueError("All hyperparameter options must be non-empty.")
-        
+        pl.seed_everything(training_params.seed, workers=True)
+        run_name = f'off_proj_{projection.offline_projector_alignment_beta}'
 
         train_func = partial(train_projector_per_worker,
                              teacher_cache_dir=teacher_cache_dir,
                              student_cache_dir=student_cache_dir,
                              teacher_dim=teacher_dim,
                              student_dim=student_dim,
-                             alignment_beta=alignment_beta,
-                             max_epochs=max_epochs,
+                             alignment_beta=projection.offline_projector_alignment_beta,
+                             max_epochs=projection.offline_projector_training_args.num_epochs,
                              val_split=val_split,
                              test_split=test_split,
-                             seed=seed,
-                             reproducible_backend=reproducible_backend,
-                             torch_dtype=torch_dtype,)
+                             training_params=training_params,)
         
         # NOTE: CANNOT USE RAY TRAIN V2 (at least on single node)
         def tune_asha(num_trials: int):
             search_space: Dict[str, Any] = {
-                "batch_size": tune.choice(batch_sizes),
-                "learning_rate": tune.qloguniform(lr_min, lr_max, 5e-6),
-                "weight_decay": tune.qloguniform(wd_min, wd_max, 5e-6),
-                "max_grad_norm": tune.quniform(mgn_min, mgn_max, 1e-3),
+                "batch_size": tune.choice(hyperparams.batch_sizes),
+                "learning_rate": tune.qloguniform(hyperparams.lr.mini, hyperparams.lr.maxi, 5e-6),
+                "weight_decay": tune.qloguniform(hyperparams.weight_decay.mini, hyperparams.weight_decay.maxi, 5e-6),
+                "max_grad_norm": tune.quniform(hyperparams.max_grad_norm.mini, hyperparams.max_grad_norm.maxi, 1e-3),
                 "tied_weights": tune.choice([True, False]),
             }
             scaling_config = ray.train.ScalingConfig(
-                num_workers=1,
+                num_workers=training_params.resources.projector.num_ray_workers,
                 use_gpu=True,
                 resources_per_worker={
-                    "CPU": num_cpus_per_trial,
-                    "GPU": num_gpus_per_trial,},
+                    "CPU": training_params.resources.projector.num_cpus_per_trial,
+                    "GPU": training_params.resources.projector.num_gpus_per_trial,},
                 placement_strategy="PACK",
             )
             ray_ptl_trainer = TorchTrainer(
@@ -326,7 +258,7 @@ class OfflineProjector(LightningModule):
             )
             
             scheduler = ASHAScheduler(
-                max_t=max_epochs,
+                max_t=projection.offline_projector_training_args.num_epochs,
                 grace_period=1,
                 reduction_factor=2
             )
@@ -339,13 +271,46 @@ class OfflineProjector(LightningModule):
                     mode="min",
                     num_samples=num_trials,
                     scheduler=scheduler,
-                    max_concurrent_trials=(AVAILABLE_GPUS // num_gpus_per_trial),
+                    max_concurrent_trials=(training_params.resources.num_available_gpus // training_params.resources.projector.num_gpus_per_trial,),
                 ),
             )
             return tuner.fit()
         
-        results = tune_asha(num_trials=n_trials)
+        results = tune_asha(num_trials=projection.offline_projector_training_args.n_trials)
         best_result = results.get_best_result()
         with best_result.checkpoint.as_directory() as checkpoint_dir:
-            return OfflineProjector.load_from_checkpoint(f"{checkpoint_dir}/checkpoint.ckpt")
+            return OfflineProjectorModule.load_from_checkpoint(f"{checkpoint_dir}/checkpoint.ckpt")
+
+    def save_pretrained(self, path: str):
+        """Save model with configuration"""
+        Path(path).mkdir(parents=True, exist_ok=True)
+        save_path = f"{path}/{self.model_file}"
+        torch.save(self.state_dict(), save_path)
+        
+        with open(f"{path}/config.json", "w") as f:
+            # cfg = self.train_config.model_dump()
+            # json.dump({"train_config": cfg}, f, indent=4)
+            json.dump(self.train_config.model_dump(), f, indent=4)
+        
+        print(f"Offline projector saved to {path}")
+    
+    @classmethod
+    def load_pretrained(cls, path: str):
+        """Load model from saved configuration"""
+        # Load configuration
+        with open(f"{path}/config.json", "w") as f:
+            hparams = json.load(f)
+
+        cfg = OffProjModuleConfig(**hparams)
+        model = cls(train_config=cfg)
+        
+        # Load weights
+        model_path = f"{path}/{model.model_file}"
+        state_dict = torch.load(model_path, weights_only=True)
+        
+        model.load_state_dict(state_dict)
+        model.eval()
+        # with alignment beta {model.train_config.projection.offline_projector_alignment_beta}
+        print(f"Loaded pretrained offline projector from {path}")
+        return model
             
