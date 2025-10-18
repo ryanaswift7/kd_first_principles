@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 import torchmetrics
 from torchmetrics import Accuracy, F1Score
-from transformer_lens import HookedTransformer
+from transformer_lens import HookedTransformer, HookedTransformerConfig
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -24,7 +24,7 @@ from ray.train.lightning import (
 from ray.tune.schedulers import ASHAScheduler
 
 from kdfp.core.projector.identity.identityProjector import IdentityProjector
-from kdfp.core.projector.offline.offlineProjector import OfflineProjectorModule
+from kdfp.core.projector.offline.offlineProjector import OfflineProjectorModule, gen_off_proj_weights_filename
 from kdfp.core.projector.online.onlineProjector import OnlineProjector
 from kdfp.core.projector.randomized.RandomizedProjector import RandomizedProjector
 from kdfp.core.student.training_utils import jensen_shannon_divergence
@@ -52,7 +52,7 @@ class StudentModuleConfig(ConfigBase, DtypeSerializerMixin):
     student_cfg: LMConfig
     teacher_cfg: LMConfig
     dirs: ExpDirConfig
-    projection: ProjectionConfig
+    projection: Optional[ProjectionConfig] = None
     task: TaskSpec
     seq_len: int
     batch_size: int
@@ -73,12 +73,12 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
 
         # If train_config is a dict (from loading a checkpoint),
         # parse it back into a TeacherTrainConfig object.
-        # if isinstance(train_config, dict):
-        #     self.train_config = StudentModuleConfig(**train_config)
-        # else:
-        #     # Otherwise (on initial creation), use the object directly.
-        #     self.train_config = train_config
-        self.train_config = train_config
+        if isinstance(train_config, dict):
+            self.train_config = StudentModuleConfig(**train_config)
+        else:
+            # Otherwise (on initial creation), use the object directly.
+            self.train_config = train_config
+        # self.train_config = train_config
 
         # Now self.train_config is guaranteed to be a TeacherTrainConfig object,
         # and you can safely call .model_dump()
@@ -120,17 +120,24 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
 
         
     def load_teacher(self) -> HookedTransformer:
+        teacher_hf = AutoModelForCausalLM.from_pretrained(
+            f"{self.train_config.dirs.teacher_models}/{self.train_config.task.name}")
         # load base teacher
-        teacher = HookedTransformer.from_pretrained_no_processing(
+        teacher_tl = HookedTransformer.from_pretrained_no_processing(
             self.train_config.teacher_cfg.model_name,
             dtype=self.train_config.torch_dtype)
         
+        
         # load finetuned weights, convert to transformer lens format, load into teacher
-        weights_file = Path(self.train_config.dirs.teacher_models) / gen_teacher_weights_filename(task_name=self.task.task_name)
-        teacher_weights = torch.load(weights_file, weights_only=True)
-        tl_teacher_weights = convert_neox_to_hooked_weights(neox_state_dict=teacher_weights, cfg=self.teacher.cfg)
-        teacher.load_state_dict(tl_teacher_weights)
-        return teacher
+        # weights_file = Path(self.train_config.dirs.teacher_models) / gen_teacher_weights_filename(task_name=self.train_config.task.name)
+        # teacher_weights = torch.load(weights_file, weights_only=True)
+        # print("\n" + "="*60)
+        # print(teacher_weights)
+        # print("="*60)
+        tl_teacher_weights = convert_neox_to_hooked_weights(neox_model=teacher_hf, cfg=teacher_tl.cfg)
+        teacher_tl.load_state_dict(tl_teacher_weights, strict=False)
+        teacher_tl.eval()
+        return teacher_tl
 
     def load_student(self) -> HookedTransformer:
         if self.train_config.student_cfg.layer_reduction_factor:
@@ -150,22 +157,22 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         if self.train_config.projection:
             if self.train_config.projection.training == ProjectorTraining.OFFLINE:
                 # weights_file = Path(self.train_config.dirs.off_proj_models)
-                p = OfflineProjectorModule.load_pretrained(self.train_config.dirs.off_proj_models)
-                return p.extract_single_direction(self.train_config.projection.direction)
+                p = OfflineProjectorModule.load_pretrained(
+                    f"{self.train_config.dirs.off_proj_models}")
+                    # + f"/{gen_off_proj_weights_filename(self.train_config.projection.offline_projector_alignment_beta)}")
+                return p.extract_single_direction(self.train_config.projection.direction).eval()
             elif self.train_config.projection.training == ProjectorTraining.ONLINE:
                 return OnlineProjector(
                     teacher_dim=self.train_config.teacher_cfg.d_model,
                     student_dim=self.train_config.student_cfg.d_model,
                     direction=self.train_config.projection.direction,
-                    torch_dtype=self.train_config.torch_dtype,
-                )
+                    torch_dtype=self.train_config.torch_dtype,).train()
             elif self.train_config.projection.training == ProjectorTraining.RANDOMIZED:
                 return RandomizedProjector(
                     teacher_dim=self.train_config.teacher_cfg.d_model,
                     student_dim=self.train_config.student_cfg.d_model,
                     direction=self.train_config.projection.direction,
-                    torch_dtype=self.train_config.torch_dtype,
-                )
+                    torch_dtype=self.train_config.torch_dtype,).eval()
         else:
             # self.projector = IdentityProjector()
             return None
@@ -173,7 +180,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
 
     @property
     def model_file(self):
-        return gen_student_weights_filename(self.train_config.task.task_name)
+        return gen_student_weights_filename(self.train_config.task.name)
         
     def forward(self, input_ids, attention_mask, labels=None):
         return self.student(
@@ -188,21 +195,30 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         teacher_hooks = self.train_config.teacher_cfg.hook_list
         obj_weights = self.train_config.objective_weights
 
-        n = len(teacher_hooks)
-        assert n == len(student_hooks)
-
         input_ids = batch["input_ids"]
-
         total_loss = 0
-
-        student_output, student_cache = self.student.run_with_cache(
-            input_ids,
-            names_filter=lambda name: name in student_hooks,)
         
-        with torch.no_grad():
-            teacher_output, teacher_cache = self.teacher.run_with_cache(
+        if teacher_hooks:
+            n = len(teacher_hooks)
+            assert n == len(student_hooks)
+
+            student_output, student_cache = self.student.run_with_cache(
                 input_ids,
-                names_filter=lambda name: name in teacher_hooks,)
+                return_type='both',
+                names_filter=lambda name: name in student_hooks,)
+            
+            with torch.no_grad():
+                teacher_output, teacher_cache = self.teacher.run_with_cache(
+                    input_ids,
+                    return_type='both',
+                    names_filter=lambda name: name in teacher_hooks,
+                )
+        else:
+            student_output = self.student(input_ids, return_type='both')
+            
+            with torch.no_grad():
+                teacher_output = self.teacher(input_ids, return_type='both')
+
             
         total_loss += obj_weights.true_labels * student_output.loss
 
@@ -287,8 +303,10 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
     def configure_optimizers(self):
         if isinstance(self.projector, OnlineProjector):
             optimizer = torch.optim.AdamW(
-                self.student.parameters(),
-                self.projector.parameters(),
+                [
+                    {'params': self.student.parameters()},
+                    {'params': self.projector.parameters()}
+                ],
                 lr=self.train_config.learning_rate,
                 weight_decay=self.train_config.weight_decay
             )
@@ -298,7 +316,8 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 lr=self.train_config.learning_rate,
                 weight_decay=self.train_config.weight_decay
             )
-            self.projector.eval()
+            if self.projector:
+                self.projector.eval()
         return optimizer
         
     def train_dataloader(self):
@@ -359,6 +378,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         exp_name: str,
         student_cfg: LMConfig,
         teacher_cfg: LMConfig,
+        dirs: ExpDirConfig,
         task: TaskSpec,
         lm_params: LMParamsConfig,
         hyperparams: HyperparamsConfig,
@@ -376,6 +396,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             train_config = StudentModuleConfig(
                 student_cfg=student_cfg,
                 teacher_cfg=teacher_cfg,
+                dirs=dirs,
                 projection=projection,
                 task=task,
                 seq_len=training_params.seq_len,
@@ -436,8 +457,9 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                     checkpoint_score_attribute="val_acc",
                     checkpoint_score_order="max",
                 ),
-                failure_config=ray.tune.FailureConfig(max_failures=5),
-                storage_path="/research-storage/lab/ryanswif/kd_first_principles/ray-shenan/"
+                failure_config=ray.tune.FailureConfig(
+                    max_failures=training_params.resources.max_failures),
+                storage_path=dirs.ray,
             )
             ray_ptl_trainer = ray.train.torch.TorchTrainer(
                 train_student_per_worker,
@@ -474,21 +496,31 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         save_path = f"{path}/{self.model_file}"
         torch.save(student_tl_state_dict, save_path)
 
-        student_hf_state_dict = convert_hooked_to_neox_weights(student_tl_state_dict, cfg=self.student.cfg)
-        hf = AutoModelForCausalLM.from_pretrained(self.student_cfg.model_name, dtype=self.torch_dtype)
+        student_hf_state_dict, _ = convert_hooked_to_neox_weights(self.student, cfg=self.student.cfg)
+        if self.train_config.student_cfg.layer_reduction_factor:
+            hf, _, _ = load_shallow(
+                model_name=self.train_config.student_cfg.model_name,
+                mode='hf',
+                layer_reduction_factor=self.train_config.student_cfg.layer_reduction_factor,
+                selection_method='linspace',
+                torch_dtype=self.train_config.torch_dtype)
+        else:
+            hf = AutoModelForCausalLM.from_pretrained(
+                self.train_config.student_cfg.model_name,
+                dtype=self.train_config.torch_dtype)
         hf.load_state_dict(student_hf_state_dict)
         hf.save_pretrained(path)
 
-        with open(f"{path}/config.json", "w") as f:
+        with open(f"{path}/pl_config.json", "w") as f:
             # cfg = self.train_config.model_dump()
             # json.dump({"train_config": cfg}, f, indent=4)
             json.dump(self.train_config.model_dump(), f, indent=4)
 
-        print(f"Student for task {self.train_config.task.task_name} saved to {path}")
+        print(f"Student for task {self.train_config.task.name} saved to {path}")
 
     @classmethod
     def load_pretrained(cls, path: str) -> 'StudentModule':
-        with open(f"{path}/config.json", "w") as f:
+        with open(f"{path}/pl_config.json", "w") as f:
             hparams = json.load(f)
         cfg = StudentModuleConfig(**hparams)
         student_module = cls(train_config=cfg)

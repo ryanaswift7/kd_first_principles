@@ -1,3 +1,4 @@
+import shutil
 from typing import Optional, Literal, List, Dict, Any, Union
 import lightning.pytorch as pl
 from transformers import AutoModelForCausalLM
@@ -5,7 +6,6 @@ from kdfp.core.projector.offline.offlineProjector import gen_off_proj_weights_fi
 from kdfp.core.projector.randomized import RandomizedProjector
 from kdfp.core.student.student import StudentModule
 from kdfp.core.teacher import TeacherModule, gen_teacher_weights_filename
-from kdfp.schemas.mixins import DtypeSerializerMixin
 from kdfp.schemas.objective_weights import ObjectiveWeights
 from kdfp.schemas.tasks import TaskSpec
 from kdfp.schemas.lmConfig import LMConfig
@@ -20,14 +20,14 @@ from kdfp.schemas.subConfigs import (
     TrainingParamsConfig,
     HyperparamsConfig,
     ProjectionConfig)
-from kdfp.core.projector import OfflineProjectorModule, OnlineProjector, OFF_PROJ_STATE_DICT_FILE
+from kdfp.core.projector import OfflineProjectorModule, OnlineProjector
 from kdfp.utils.activation_caching import activation_caching
 import torch.nn as nn
 from kdfp.utils.enums import (StudentReduction, ProjectorTraining)
 import torch
 import pandas as pd
 
-class ExperimentConfig(ConfigBase, DtypeSerializerMixin):
+class ExperimentConfig(ConfigBase):
     name: str
     reduction: StudentReduction
     teacher_cfg: LMConfig
@@ -91,7 +91,7 @@ class ExperimentConfig(ConfigBase, DtypeSerializerMixin):
             and student, but you may use a custom version instead by passing in the directories.
         """
         # if we already trained one, load it instead of creating another
-        off_proj_weights_path = Path(self.dirs.off_proj_model) / gen_off_proj_weights_filename(alignment_beta=self.projection.offline_projector_alignment_beta)
+        off_proj_weights_path = Path(self.dirs.off_proj_models) / gen_off_proj_weights_filename(alignment_beta=self.projection.offline_projector_alignment_beta)
         if off_proj_weights_path.exists():
             print(f"Pretrained offline projector for with alignment beta '{self.projection.offline_projector_alignment_beta}' located at: {str(off_proj_weights_path)}")
 
@@ -113,7 +113,7 @@ class ExperimentConfig(ConfigBase, DtypeSerializerMixin):
                                                     total_tokens=self.projection.offline_projector_training_args.total_tokens,
                                                     force_cache_all=self.projection.offline_projector_training_args.force_cache_all,
                                                     cache_outputs=False,
-                                                    num_workers=self.training_params.num_data_workers,
+                                                    num_workers=self.training_params.resources.projector.num_data_workers,
                                                     device=self.training_params.device,
                                                     torch_dtype=self.training_params.torch_dtype,)
             
@@ -144,10 +144,11 @@ class ExperimentConfig(ConfigBase, DtypeSerializerMixin):
                 projection=self.projection,
                 hyperparams=self.hyperparams,
                 training_params=self.training_params,
+                dirs=self.dirs,
                 val_split=0.1,
                 test_split=0.1,)
-            projector.save_pretrained(path=self.dirs.off_proj_model)
-            # load_test = OfflineProjector.load_pretrained(save_path=self.dirs.off_proj_model)
+            projector.save_pretrained(path=self.dirs.off_proj_models)
+            # load_test = OfflineProjector.load_pretrained(save_path=self.dirs.off_proj_models)
             # return projector.extract_single_direction(direction=self.projection.direction)
 
     def init_online_projector(self):
@@ -184,9 +185,9 @@ class ExperimentConfig(ConfigBase, DtypeSerializerMixin):
 
     def init_teacher_by_task(self, task: TaskSpec) -> None:
         # save_dir = f"{self.dirs.teacher_model}/{task.task_name}"
-        teacher_weights_file = Path(self.dirs.teacher_models) / gen_teacher_weights_filename(task.task_name)
+        teacher_weights_file = Path(self.dirs.teacher_models) / task.name / gen_teacher_weights_filename(task.name)
         if teacher_weights_file.exists():
-            print(f"Pretrained teacher for task '{task.task_name}' located at: {str(teacher_weights_file)}")
+            print(f"Pretrained teacher for task '{task.name}' located at: {str(teacher_weights_file)}")
         else:
             t = TeacherModule.create(
                 lm_name=self.teacher_cfg.model_name,
@@ -194,8 +195,9 @@ class ExperimentConfig(ConfigBase, DtypeSerializerMixin):
                 lm_params=self.lm_params,
                 hyperparams=self.hyperparams,
                 training_params=self.training_params,
+                dirs=self.dirs,
             )
-            t.save_pretrained(path=self.dirs.teacher_models)
+            t.save_pretrained(path=f"{self.dirs.teacher_models}/{task.name}")
 
 
     def init(self) -> None:
@@ -204,14 +206,28 @@ class ExperimentConfig(ConfigBase, DtypeSerializerMixin):
         for task in self.tasks:
             self.init_teacher_by_task(task)
 
-    def run(self) -> pd.Dataframe:
+    def cleanup_log_dirs(self) -> None:
+        # print("\n\n\n" + "="*60)
+        # print("CLEANING UP LOGS AT:")
+        # print("RAY: ",self.dirs.ray)
+        # print("LIGHTNING: ", self.dirs.lightning)
+        # print("="*60 + "\n\n\n")
+
+        shutil.rmtree(self.dirs.ray, ignore_errors=True)
+        shutil.rmtree(self.dirs.lightning, ignore_errors=True)
+
+    def run(self) -> List[dict]:
         results_list = []
-        test_trainer = pl.Trainer(
-            accelerator='gpu',
-            devices=1,
-            deterministic=self.training_params.reproducible_backend,
-        )
-        for task in self.tasks:
+        def trainer_factory() -> pl.Trainer:
+            return pl.Trainer(
+                accelerator='gpu',
+                strategy='auto',
+                devices=1,
+                deterministic=self.training_params.reproducible_backend,
+                default_root_dir=self.dirs.lightning,
+            )
+        for i, task in enumerate(self.tasks):
+            print(f"\nRunning task {i+1}/{len(self.tasks)}: '{task.name.upper()}'...")
             student = StudentModule.create(
                 exp_name=self.name,
                 dirs=self.dirs,
@@ -224,16 +240,21 @@ class ExperimentConfig(ConfigBase, DtypeSerializerMixin):
                 projection=self.projection,
                 jsd_beta=self.jsd_beta,
                 objective_weights=self.objective_weights)
-            results = test_trainer.test(student)
+            student.save_pretrained(f"{self.dirs.student_models}/{task.name}")
+            results = trainer_factory().test(model=student, verbose=True)
             results_list.append({
                 "EXPERIMENT": self.name,
-                "TASK": task.task_name,
+                "TASK": task.name,
                 "METRIC": "accuracy",
                 "SCORE": results[0]['test_acc']})
             results_list.append({
                 "EXPERIMENT": self.name,
-                "TASK": task.task_name,
+                "TASK": task.name,
                 "METRIC": "f1",
                 "SCORE": results[0]['test_f1']})
-        return pd.DataFrame(results_list)
+            print(f"\nFinished task {i+1}/{len(self.tasks)}: '{task.name.upper()}'!")
+
+            
+        self.cleanup_log_dirs()
+        return results_list
             

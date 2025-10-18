@@ -45,6 +45,7 @@ def _load_shallow_tl(model_name: str,
                      torch_dtype: torch.dtype):
     # Load original model
     original_model = HookedTransformer.from_pretrained_no_processing(model_name, dtype=torch_dtype)
+
     tokenizer = original_model.tokenizer
     
     # Calculate which layers to keep
@@ -55,7 +56,7 @@ def _load_shallow_tl(model_name: str,
                                                                   selection_method=selection_method)
     
     # Create new config with fewer layers
-    new_cfg = original_model.cfg.copy()
+    new_cfg = copy.deepcopy(original_model.cfg)
     new_cfg.n_layers = layers_to_keep
     
     # Create new model with modified config
@@ -72,7 +73,7 @@ def _load_shallow_tl(model_name: str,
     shallow_model.embed.load_state_dict(original_model.embed.state_dict())
     shallow_model.unembed.load_state_dict(original_model.unembed.state_dict())
     shallow_model.ln_final.load_state_dict(original_model.ln_final.state_dict())
-    shallow_model.pos_embed.load_state_dict(original_model.pos_embed.state_dict())
+    # shallow_model.pos_embed.load_state_dict(original_model.pos_embed.state_dict())
     
     return shallow_model, tokenizer, keep_indices
 

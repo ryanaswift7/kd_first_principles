@@ -410,19 +410,19 @@ def _preprocess_task_ft(examples,
                         task: TaskSpec,
                         seq_len: int,
                         tokenizer,):
-    if "hellaswag" in task.task_name:
+    if "hellaswag" in task.name:
         texts, labels = _format_hellaswag(examples, split=split)
-    elif "winogrande" in task.task_name:
+    elif "winogrande" in task.name:
         texts, labels = _format_winogrande(examples, split=split)
-    elif "sciq" in task.task_name:
+    elif "sciq" in task.name:
         texts, labels = _format_sciq(examples, split=split)
-    elif "logiqa" in task.task_name:
+    elif "logiqa" in task.name:
         texts, labels = _format_logiqa(examples, split=split)
-    elif "boolq" in task.task_name:
+    elif "boolq" in task.name:
         texts, labels = _format_boolq(examples, split=split)
-    elif "piqa" in task.task_name:
+    elif "piqa" in task.name:
         texts, labels = _format_piqa(examples, split=split)
-    elif "arc" in task.task_name:
+    elif "arc" in task.name:
         texts, labels = _format_arc(examples, split=split)
     else:
         raise ValueError(f"Task {task.name} is not currently supported.")
@@ -456,49 +456,76 @@ def _preprocess_task_ft(examples,
     return tokenized
 
 
-def load_task_data(task: TaskSpec,
-                   tokenizer,
-                   seq_len: int,
-                   split: str = 'train',
-                #    token_rename: bool = False,
-                   n_samples: Optional[int] = None,) -> Dataset:
+def load_task_data(
+    task: "TaskSpec",
+    tokenizer,
+    seq_len: int,
+    split: str,
+    n_samples: Optional[int] = None,
+) -> Dataset:
+    """
+    Loads and preprocesses a dataset for a given task.
+
+    If task.test_available is False, it reserves 10% of the 'train' split
+    for validation/testing purposes. `actual_split` is the split used for
+    loading the data from HuggingFace, and `split` is used to decide
+    how to preprocess and format the data.
+    """
+    actual_split = split
+
+    # If a dedicated test set is not provided by the dataset, create a
+    # holdout set from the training data.
+    if not task.test_available:
+        if split == "train":
+            # When training, use the first 90% of the original training data.
+            actual_split = f"train"
+        elif split == "validation":
+            # When 'test' or 'validation' is requested, use the last 10% of
+            # the training data as a substitute validation set.
+            actual_split = f"train"
+        elif split == "test":
+            actual_split = "validation"
+
     if task.subset:
         dataset = load_dataset(
             task.dataset_name,
             task.subset,
-            split=split,
+            split=actual_split,
             trust_remote_code=True,
             streaming=True,
         )
     else:
         dataset = load_dataset(
             task.dataset_name,
-            split=split,
+            split=actual_split,
             trust_remote_code=True,
             streaming=True,
         )
-    
+    if not task.test_available:
+        if split == "train":
+            dataset = dataset.take(task.ninety_percent)
+        elif split == "validation":
+            dataset = dataset.skip(task.ninety_percent)
+
     if n_samples:
         dataset = dataset.take(n_samples)
 
     preprocess_fn = partial(
         _preprocess_task_ft,
-        split=split,
+        split=split,  # the originally requested split name
         task=task,
         seq_len=seq_len,
         tokenizer=tokenizer,
     )
-    
+
     torch.cuda.empty_cache()
 
     dataset = dataset.map(
         preprocess_fn,
         batched=True,
-        # load_from_cache_file=False, 
-        remove_columns=dataset.column_names  # Remove original columns to save memory
+        remove_columns=dataset.column_names,
     )
     return dataset
-    
 
 
 class CachedActivationsDataset(Dataset):

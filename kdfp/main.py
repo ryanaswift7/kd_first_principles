@@ -1,10 +1,9 @@
 from argparse import ArgumentParser
+from pathlib import Path
 from kdfp.schemas.globalConfig import GlobalConfig
 import pandas as pd
 import os
 import torch
-# from core.initalization import init_teacher, init_offline_projector
-# from core.analysis import analyze
 
 DEFAULT_CONFIG = 'kdfp/config.yaml'
 
@@ -28,22 +27,35 @@ def main(config_path: str):
     config = GlobalConfig.from_yaml(config_path)
 
     experiment_list, experiment_names = config.generate_experiment_list()
-    print(f"A total of {len(experiment_names)} experiments have been specified:")
+    n = len(experiment_names)
+    print(f"A total of {n} experiments have been specified:")
     for i, name in enumerate(experiment_names):
         assert experiment_list[i].name == name, f"Experiment name mismatch: {experiment_list[i].name} != {name}"
         print(f"    {i+1}: {name}")
 
-    baseline_results_list = config.run_baseline_tests()
+    print("\nBeginning baseline testing...")
+    results_list = config.run_baseline_tests()
+    print("Baseline testing complete!")
+
+    print("\nStarting experiment runs...")
     for i, experiment in enumerate(experiment_list):
-        print(f"Starting experiment {i}: {experiment.name.upper()}")
+        print(f"Starting experiment {i+1}/{n}: {experiment.name.upper()}")
         experiment.init()
-        break
-    #     results = experiment.run()
+        results_list.extend(experiment.run())
+        print(f"Finished experiment {i+1}/{n}: {experiment.name.upper()}")
+        # break
+
+    base_scores_dir = Path(config.directories.root + '/' + config.directories.scores).resolve()
+    base_scores_dir.mkdir(parents=True, exist_ok=True)
+    df_path = base_scores_dir / "results_df.parquet"
+    results_df = pd.DataFrame(results_list)
+    results_df.to_parquet(df_path)
+    print(f"Results dataframe saved in Parquet format to:\n\t{df_path}")
+    print(results_df)
 
     #     new_row = pd.DataFrame([dict(zip(result_df.columns.tolist(), results))])
     #     result_df = pd.concat([result_df, new_row], ignore_index=True)
 
-    #     print(f"Finished experiment {i}: {experiment.name.upper()}")
 
     # columns.extend(["average", "relative lift over baseline"])
     # analyze(result_df)

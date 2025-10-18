@@ -6,14 +6,14 @@ from pathlib import Path
 import json
 import os
 import wandb
-from typing import Optional, Dict, Any, List, Literal
+from typing import Optional, Dict, Any, Union
 import lightning.pytorch as pl
 from ray import tune
 from ray.tune import CLIReporter
 from ray.tune.schedulers import ASHAScheduler
 from kdfp.schemas.configBase import ConfigBase
 from kdfp.schemas.mixins import DtypeSerializerMixin
-from kdfp.schemas.subConfigs import HyperparamsConfig, OffProjParamsConfig, ProjectionConfig, TrainingParamsConfig
+from kdfp.schemas.subConfigs import ExpDirConfig, HyperparamsConfig, OffProjParamsConfig, ProjectionConfig, TrainingParamsConfig
 from kdfp.utils.data import ProjectorDataset
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
@@ -44,7 +44,7 @@ class OffProjModuleConfig(ConfigBase, DtypeSerializerMixin):
     alignment_beta: float
     lr: float
     weight_decay: float
-    torch_dtype: torch.dtype
+    torch_dtype: Union[str, torch.dtype]
     tied_weights: bool = False
 
 class OfflineProjectorModule(LightningModule):
@@ -52,13 +52,13 @@ class OfflineProjectorModule(LightningModule):
         super().__init__()
         # If train_config is a dict (from loading a checkpoint),
         # parse it back into a TeacherTrainConfig object.
-        # if isinstance(train_config, dict):
-        #     self.train_config = OffProjModuleConfig(**train_config)
-        # else:
-        #     # Otherwise (on initial creation), use the object directly.
-        #     self.train_config = train_config
+        if isinstance(train_config, dict):
+            self.train_config = OffProjModuleConfig(**train_config)
+        else:
+            # Otherwise (on initial creation), use the object directly.
+            self.train_config = train_config
 
-        self.train_config = train_config
+        # self.train_config = train_config
         self.save_hyperparameters({"train_config": self.train_config.model_dump()})
         
         # Encoder: teacher -> student space (i.e. DOWN)
@@ -116,8 +116,8 @@ class OfflineProjectorModule(LightningModule):
         
         # Total weighted loss
         total_loss = (
-            (1.0 - self.hparams.alignment_beta) * recon_loss +
-            self.hparams.alignment_beta * align_loss
+            (1.0 - self.train_config.alignment_beta) * recon_loss +
+            self.train_config.alignment_beta * align_loss
         )
         
         return {
@@ -189,8 +189,8 @@ class OfflineProjectorModule(LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
             self.parameters(), 
-            lr=self.hparams.lr, 
-            weight_decay=self.hparams.weight_decay
+            lr=self.train_config.lr, 
+            weight_decay=self.train_config.weight_decay
         )
         # scheduler = 
         return optimizer
@@ -207,6 +207,7 @@ class OfflineProjectorModule(LightningModule):
                projection: ProjectionConfig,
                hyperparams: HyperparamsConfig,
                training_params: TrainingParamsConfig,
+               dirs: ExpDirConfig,
                val_split: float = 0.1,
                test_split: float = 0.1,) -> 'OfflineProjectorModule':  #Tuple[Any, Dict[str, Any], Any, Dict[str, float], Dict[str, float]]:
         """Create and train projector with multi-objective loss"""
@@ -230,7 +231,7 @@ class OfflineProjectorModule(LightningModule):
         def tune_asha(num_trials: int):
             search_space: Dict[str, Any] = {
                 "batch_size": tune.choice(hyperparams.batch_sizes),
-                "learning_rate": tune.qloguniform(hyperparams.lr.mini, hyperparams.lr.maxi, 5e-6),
+                "learning_rate": tune.qloguniform(hyperparams.lr.mini, hyperparams.lr.maxi, 5e-7),
                 "weight_decay": tune.qloguniform(hyperparams.weight_decay.mini, hyperparams.weight_decay.maxi, 5e-6),
                 "max_grad_norm": tune.quniform(hyperparams.max_grad_norm.mini, hyperparams.max_grad_norm.maxi, 1e-3),
                 "tied_weights": tune.choice([True, False]),
@@ -254,7 +255,9 @@ class OfflineProjectorModule(LightningModule):
                     checkpoint_score_attribute="kdfp_off_proj/val_total_weighted_loss",
                     checkpoint_score_order="min",
                 ),
-                failure_config=ray.tune.FailureConfig(max_failures=5),
+                failure_config=ray.tune.FailureConfig(
+                    max_failures=training_params.resources.max_failures),
+                storage_path=dirs.ray,
             )
             
             scheduler = ASHAScheduler(
@@ -271,7 +274,7 @@ class OfflineProjectorModule(LightningModule):
                     mode="min",
                     num_samples=num_trials,
                     scheduler=scheduler,
-                    max_concurrent_trials=(training_params.resources.num_available_gpus // training_params.resources.projector.num_gpus_per_trial,),
+                    max_concurrent_trials=(training_params.resources.num_available_gpus // training_params.resources.projector.num_gpus_per_trial),
                 ),
             )
             return tuner.fit()
@@ -286,8 +289,10 @@ class OfflineProjectorModule(LightningModule):
         Path(path).mkdir(parents=True, exist_ok=True)
         save_path = f"{path}/{self.model_file}"
         torch.save(self.state_dict(), save_path)
+
+        assert self.train_config
         
-        with open(f"{path}/config.json", "w") as f:
+        with open(f"{path}/pl_config.json", "w") as f:
             # cfg = self.train_config.model_dump()
             # json.dump({"train_config": cfg}, f, indent=4)
             json.dump(self.train_config.model_dump(), f, indent=4)
@@ -298,7 +303,7 @@ class OfflineProjectorModule(LightningModule):
     def load_pretrained(cls, path: str):
         """Load model from saved configuration"""
         # Load configuration
-        with open(f"{path}/config.json", "w") as f:
+        with open(f"{path}/pl_config.json", "r") as f:
             hparams = json.load(f)
 
         cfg = OffProjModuleConfig(**hparams)

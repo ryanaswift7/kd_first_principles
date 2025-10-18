@@ -8,7 +8,7 @@ class OnlineProjector(nn.Module):
                  student_dim: int, 
                  direction: ProjectionDirection,
                  torch_dtype: torch.dtype):
-        super.__init__()
+        super(OnlineProjector, self).__init__()
         self.teacher_dim = teacher_dim
         self.student_dum = student_dim
         self.direction = direction

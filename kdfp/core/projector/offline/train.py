@@ -13,7 +13,7 @@ from ray.train.torch import TorchTrainer
 from kdfp.schemas.subConfigs import TrainingParamsConfig
 from kdfp.utils.data import ProjectorDataset
 from .projectorDataModule import ProjectorDataModule
-from .offlineProjector import OfflineProjectorModule
+from .offlineProjector import OffProjModuleConfig, OfflineProjectorModule
 
 from pathlib import Path
 from typing import Union
@@ -32,7 +32,7 @@ def train_projector_per_worker(
         student_dim: int,
         alignment_beta: float,
         training_params: TrainingParamsConfig,
-        max_epochs: int = 10,
+        max_epochs: int,
         val_split: float = 0.1,
         test_split: float = 0.1,):
     """Training function for Ray Tune"""
@@ -48,8 +48,7 @@ def train_projector_per_worker(
         val_split=val_split,
         test_split=test_split,
     )
-    
-    model = OfflineProjectorModule(
+    cfg = OffProjModuleConfig(
         teacher_dim=teacher_dim,
         student_dim=student_dim,
         alignment_beta=alignment_beta,
@@ -58,6 +57,7 @@ def train_projector_per_worker(
         weight_decay=config["weight_decay"],
         torch_dtype=training_params.torch_dtype,
     )
+    model = OfflineProjectorModule(train_config=cfg)
     
     trainer = Trainer(
         devices="auto",

@@ -35,7 +35,6 @@ class GlobalConfig(ConfigBase):
     offline_projector_params: OffProjParamsConfig
     lm_params: LMParamsConfig
     training_params: TrainingParamsConfig
-
     hook_types: Dict[str, List[str]] = Field(..., description="Keys 'single' and 'per_layer' with lists of hook names")
     projection_variants: Dict[str, List[str]] = Field(..., description="Keys 'directions' and 'training_methods'")
     objective_weight_variants: List[str]
@@ -52,11 +51,6 @@ class GlobalConfig(ConfigBase):
         if not all(key in allowed_keys for key in v.keys()):
             raise ValueError(f'hook_types can only contain the keys: {allowed_keys}')
         return v
-    
-    # validator to parse dtype string into an actual dtype
-    @field_validator('torch_dtype')
-    def validate_dtype(cls, v):
-        return getattr(torch, v)
     
     @model_validator(mode='after')
     def generate_both_hook_lists(self) -> 'GlobalConfig':
@@ -102,7 +96,7 @@ class GlobalConfig(ConfigBase):
         tasks = []
         # binary_tasks = []
         for k, v in self.tasks.items():
-            t = TaskSpec(task_name=k, dataset_name=v.dataset_name, subset=v.subset)
+            t = TaskSpec(name=k, dataset_name=v.dataset_name, subset=v.subset)
             tasks.append(t)
         return tasks
     
@@ -136,6 +130,8 @@ class GlobalConfig(ConfigBase):
         base_cache_dir = self.directories.root + '/' + self.directories.cache
         base_model_dir = self.directories.root + '/' + self.directories.models
         base_scores_dir = self.directories.root + '/' + self.directories.scores
+        ray_dir = self.directories.root + '/' + self.directories.ray
+        lightning_dir = self.directories.root + '/' + self.directories.lightning
 
         experiment_list = []
 
@@ -150,10 +146,10 @@ class GlobalConfig(ConfigBase):
                                         if proj_train == ProjectorTraining.OFFLINE.value:
                                             proj_str += f"_align_{off_proj_align_beta}"
                                         proj_str += '-'
-                                        teacher = LMConfig(model_name=self.teacher_name,
+                                        teacher_cfg = LMConfig(model_name=self.teacher_name,
                                                      hook_list=self.hooks.teacher.narrow,
                                                      d_model=self.dims.teacher.narrow)
-                                        student = LMConfig(model_name=self.students.narrow.name,
+                                        student_cfg = LMConfig(model_name=self.students.narrow.name,
                                                      hook_list=self.hooks.student.narrow,
                                                      d_model=self.dims.student.narrow)
                                         projection_direction = proj_dir
@@ -163,10 +159,10 @@ class GlobalConfig(ConfigBase):
 
                                     elif reduction == StudentReduction.SHALLOW:
                                         proj_str = ""
-                                        teacher = LMConfig(model_name=self.teacher_name,
+                                        teacher_cfg = LMConfig(model_name=self.teacher_name,
                                                      hook_list=self.hooks.teacher.shallow,
                                                      d_model=self.dims.teacher.shallow)
-                                        student = LMConfig(model_name=self.students.shallow.name,
+                                        student_cfg = LMConfig(model_name=self.students.shallow.name,
                                                      hook_list=self.hooks.student.shallow,
                                                      d_model=self.dims.student.shallow)
                                         projection_direction = None
@@ -189,16 +185,19 @@ class GlobalConfig(ConfigBase):
                                     cache_dir = base_cache_dir if projector_training == ProjectorTraining.OFFLINE.value else None
                                     projector_directory = f"{base_model_dir}/offline_projectors/off_proj_{offline_projector_alignment_beta}" if offline_projector_alignment_beta else None
                                     exp_dirs = ExpDirConfig(cache=cache_dir,
-                                                            off_proj_model=projector_directory,
-                                                            teacher_models=f"{base_model_dir}/teachers/{teacher.model_name}",
-                                                            student_model=f"{base_model_dir}/students/{exp_name}",
-                                                            student_scores=f"{base_scores_dir}/students/{exp_name}")
+                                                            off_proj_models=projector_directory,
+                                                            teacher_models=f"{base_model_dir}/teachers/{teacher_cfg.model_name}",
+                                                            student_models=f"{base_model_dir}/students/{exp_name}",
+                                                            student_scores=f"{base_scores_dir}/students/{exp_name}",
+                                                            ray=ray_dir,
+                                                            lightning=lightning_dir,)
+
                                     exp = ExperimentConfig(
                                         name=exp_name,
                                         dirs=exp_dirs,
                                         reduction=reduction,
-                                        teacher=teacher,
-                                        student_cfg=student,
+                                        teacher_cfg=teacher_cfg,
+                                        student_cfg=student_cfg,
                                         training_params=self.training_params,
                                         lm_params=self.lm_params,
                                         projection=projection_cfg,
@@ -207,7 +206,6 @@ class GlobalConfig(ConfigBase):
                                         jsd_beta=jsd_beta,
                                         hyperparams=self.hyperparams,
                                         tasks=self.tasks,
-                                        torch_dtype=self.torch_dtype,
                                     )
                                     experiment_list.append(exp)
 
@@ -216,11 +214,14 @@ class GlobalConfig(ConfigBase):
         ft_shallow_student = ExperimentConfig(
             name=SHALLOW_FT_NAME,
             dirs=ExpDirConfig(cache=None,
-                              teacher_models=f"{base_model_dir}/{self.teacher_name}",
-                              student_model=f"{base_model_dir}/{SHALLOW_FT_NAME}",
-                              student_scores=f"{base_scores_dir}/{SHALLOW_FT_NAME}"),
+                              off_proj_models=None,
+                              teacher_models=f"{base_model_dir}/teachers/{self.teacher_name}",
+                              student_models=f"{base_model_dir}/students/{SHALLOW_FT_NAME}",
+                              student_scores=f"{base_scores_dir}/students/{SHALLOW_FT_NAME}",
+                              ray=ray_dir,
+                              lightning=lightning_dir,),
             reduction=StudentReduction.SHALLOW,
-            teacher=LMConfig(model_name=self.teacher_name,
+            teacher_cfg=LMConfig(model_name=self.teacher_name,
                        d_model=self.dims.teacher.shallow),
             student_cfg=LMConfig(model_name=self.students.shallow.name,
                        layer_reduction_factor=self.students.shallow.factor,
@@ -233,17 +234,19 @@ class GlobalConfig(ConfigBase):
             jsd_beta=None,
             hyperparams=self.hyperparams,
             tasks=self.tasks,
-            torch_dtype=self.torch_dtype,
         )
         NARROW_FT_NAME = "narrow_ft"
         ft_narrow_student = ExperimentConfig(
             name=NARROW_FT_NAME,
             dirs=ExpDirConfig(cache=None,
-                              teacher_models=f"{base_model_dir}/{self.teacher_name}",
-                              student_model=f"{base_model_dir}/{NARROW_FT_NAME}",
-                              student_scores=f"{base_scores_dir}/{NARROW_FT_NAME}"),
+                              off_proj_models=None,
+                              teacher_models=f"{base_model_dir}/teachers/{self.teacher_name}",
+                              student_models=f"{base_model_dir}/students/{NARROW_FT_NAME}",
+                              student_scores=f"{base_scores_dir}/students/{NARROW_FT_NAME}",
+                              ray=ray_dir,
+                              lightning=lightning_dir,),
             reduction=StudentReduction.NARROW,
-            teacher=LMConfig(model_name=self.teacher_name,
+            teacher_cfg=LMConfig(model_name=self.teacher_name,
                        d_model=self.dims.teacher.narrow),
             student_cfg=LMConfig(model_name=self.students.narrow.name,
                        d_model=self.dims.student.narrow),
@@ -255,7 +258,6 @@ class GlobalConfig(ConfigBase):
             jsd_beta=None,
             hyperparams=self.hyperparams,
             tasks=self.tasks,
-            torch_dtype=self.torch_dtype,
         )
 
         experiment_list.extend([ft_shallow_student, ft_narrow_student])
@@ -268,17 +270,22 @@ class GlobalConfig(ConfigBase):
         # - I use this to filter out the duplicates
         unique_experiment_list = list(set(experiment_list))
         exp_names = [e.name for e in unique_experiment_list]
-        self.sorted_experiment_list = sorted(unique_experiment_list, key=lambda exp: exp.name)
+        sorted_experiment_list = sorted(unique_experiment_list, key=lambda exp: exp.name)
 
-        return self.sorted_experiment_list, sorted(exp_names)
+        return sorted_experiment_list, sorted(exp_names)
 
     def run_baseline_tests(self) -> List[dict]:
+        pl.seed_everything(seed=self.training_params.seed, workers=True)
         results_list = []
-        trainer = pl.Trainer(
-            accelerator='gpu',
-            devices=1,
-            deterministic=self.training_params.reproducible_backend,
-        )
+
+        def trainer_factory() -> pl.Trainer:
+            return pl.Trainer(
+                accelerator='gpu',
+                strategy='auto',
+                devices=1,
+                deterministic=self.training_params.reproducible_backend,
+                default_root_dir=self.directories.root + '/' + self.directories.lightning
+            )
         for task in self.tasks:
             base_teacher_cfg = BaselineModuleConfig(
                 model_name=self.teacher_name,
@@ -288,19 +295,20 @@ class GlobalConfig(ConfigBase):
                 batch_size=self.lm_params.test_batch_size,
                 seed=self.training_params.seed,
                 torch_dtype=self.training_params.torch_dtype,
-                num_data_workers=self.training_params.resources.teacher.num_data_workers,
+                num_data_workers=0,  # self.training_params.resources.teacher.num_data_workers,
                 n_samples=self.lm_params.num_samples,
                 layer_reduction_factor=None,)
             base_teacher_module = BaselineModule(base_teacher_cfg)
-            base_teacher_results = trainer.test(base_teacher_module)
+            base_teacher_module.print_param_count("base_teacher")
+            base_teacher_results = trainer_factory().test(model=base_teacher_module, verbose=True)
             results_list.append({
                 "EXPERIMENT": "base_teacher",
-                "TASK": task.task_name,
+                "TASK": task.name,
                 "METRIC": "accuracy",
                 "SCORE": base_teacher_results[0]['test_acc']})
             results_list.append({
                 "EXPERIMENT": "base_teacher",
-                "TASK": task.task_name,
+                "TASK": task.name,
                 "METRIC": "f1",
                 "SCORE": base_teacher_results[0]['test_f1']})
 
@@ -317,15 +325,16 @@ class GlobalConfig(ConfigBase):
                 layer_reduction_factor=None,
             )
             base_narrow_student_module = BaselineModule(base_narrow_student_cfg)
-            base_narrow_student_results = trainer.test(base_narrow_student_module)
+            base_narrow_student_module.print_param_count("base_narrow")
+            base_narrow_student_results = trainer_factory().test(base_narrow_student_module)
             results_list.append({
                 "EXPERIMENT": "base_narrow",
-                "TASK": task.task_name,
+                "TASK": task.name,
                 "METRIC": "accuracy",
                 "SCORE": base_narrow_student_results[0]['test_acc']})
             results_list.append({
                 "EXPERIMENT": "base_teacher",
-                "TASK": task.task_name,
+                "TASK": task.name,
                 "METRIC": "f1",
                 "SCORE": base_narrow_student_results[0]['test_f1']})
 
@@ -337,20 +346,21 @@ class GlobalConfig(ConfigBase):
                 batch_size=self.lm_params.test_batch_size,
                 seed=self.training_params.seed,
                 torch_dtype=self.training_params.torch_dtype,
-                num_data_workers=self.training_params.resources.teacher.num_data_workers,
+                num_data_workers=0,  # self.training_params.resources.teacher.num_data_workers,
                 n_samples=self.lm_params.num_samples,
                 layer_reduction_factor=self.students.shallow.factor,
             )
             base_shallow_student_module = BaselineModule(base_shallow_student_cfg)
-            base_shallow_student_results = trainer.test(base_shallow_student_module)
+            base_shallow_student_module.print_param_count("base_shallow")
+            base_shallow_student_results = trainer_factory().test(base_shallow_student_module)
             results_list.append({
                 "EXPERIMENT": "base_shallow",
-                "TASK": task.task_name,
+                "TASK": task.name,
                 "METRIC": "accuracy",
                 "SCORE": base_shallow_student_results[0]['test_acc']})
             results_list.append({
                 "EXPERIMENT": "base_teacher",
-                "TASK": task.task_name,
+                "TASK": task.name,
                 "METRIC": "f1",
                 "SCORE": base_shallow_student_results[0]['test_f1']})
         return results_list

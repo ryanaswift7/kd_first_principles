@@ -1,9 +1,6 @@
 from pydantic import BaseModel, field_validator, model_validator, field_serializer
 from fractions import Fraction
 from typing import Any, Dict, Literal, Union, Optional, List
-import torch.nn as nn
-from kdfp.core.projector.offline.offlineProjector import OfflineProjectorModule
-from kdfp.core.projector.online.onlineProjector import OnlineProjector
 from kdfp.schemas.configBase import ConfigBase
 import os
 from kdfp.schemas.mixins import DtypeSerializerMixin
@@ -69,6 +66,8 @@ class BaseDirConfig(ConfigBase):
     cache: str
     models: str
     scores: str
+    ray: str
+    lightning: str
 
 class ExpDirConfig(ConfigBase):
     cache: Optional[str] = None
@@ -76,12 +75,16 @@ class ExpDirConfig(ConfigBase):
     teacher_models: str
     student_models: str
     student_scores: str
+    ray: str
+    lightning: str
 
     @model_validator(mode='after')
     def make_paths_absolute(self):
         self.teacher_models = os.path.abspath(self.teacher_models)
         self.student_models = os.path.abspath(self.student_models)
         self.student_scores = os.path.abspath(self.student_scores)
+        self.ray = os.path.abspath(self.ray)
+        self.lightning = os.path.abspath(self.lightning)
         if self.cache:
             self.cache = os.path.abspath(self.cache)
         if self.off_proj_models:
@@ -120,9 +123,10 @@ class ResourceConfig(ConfigBase):
     num_data_workers: int
     num_ray_workers: int
     num_cpus_per_trial: int
-    num_gpus_per_trial: int
+    num_gpus_per_trial: float
 
 class ExperimentResources(ConfigBase):
+    max_failures: int
     num_available_gpus: int
     projector: ResourceConfig
     teacher: ResourceConfig
@@ -132,7 +136,6 @@ class TrainingParamsConfig(ConfigBase, DtypeSerializerMixin):
     seed: int
     seq_len: int
     reproducible_backend: bool
-    num_data_workers: int
     device: str
     torch_dtype: Union[str, torch.dtype]
     resources: ExperimentResources

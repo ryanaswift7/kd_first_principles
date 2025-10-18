@@ -35,7 +35,7 @@ import ray.train
 import uuid
 
 from kdfp.schemas.configBase import ConfigBase
-from kdfp.schemas.subConfigs import HyperparamsConfig, LMParamsConfig, TrainingParamsConfig
+from kdfp.schemas.subConfigs import ExpDirConfig, HyperparamsConfig, LMParamsConfig, TrainingParamsConfig
 from kdfp.schemas.tasks import TaskSpec
 from kdfp.schemas.mixins import DtypeSerializerMixin, MCEvalMixin
 from kdfp.utils.data import load_task_data
@@ -64,15 +64,13 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
 
         # If train_config is a dict (from loading a checkpoint),
         # parse it back into a TeacherTrainConfig object.
-        # if isinstance(train_config, dict):
-        #     self.train_config = TeacherModuleConfig(**train_config)
-        # else:
-        #     # Otherwise (on initial creation), use the object directly.
-        #     self.train_config = train_config
-        self.train_config = train_config
+        if isinstance(train_config, dict):
+            self.train_config = TeacherModuleConfig(**train_config)
+        else:
+            # Otherwise (on initial creation), use the object directly.
+            self.train_config = train_config
+        # self.train_config = train_config
 
-        # Now self.train_config is guaranteed to be a TeacherTrainConfig object,
-        # and you can safely call .model_dump()
         self.save_hyperparameters({"train_config": self.train_config.model_dump()})
 
         
@@ -113,7 +111,7 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
         
     @property
     def model_file(self):
-        return gen_teacher_weights_filename(self.train_config.task.task_name)
+        return gen_teacher_weights_filename(self.train_config.task.name)
         
     def forward(self, input_ids, attention_mask, labels=None):
         return self.model(
@@ -226,13 +224,14 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
         lm_params: LMParamsConfig,
         hyperparams: HyperparamsConfig,
         training_params: TrainingParamsConfig,
+        dirs: ExpDirConfig,
     ):
         """Create a teacher for a given task using hyperparameter tuning with Ray Tune"""
 
         # os.environ["RAY_TRAIN_V2_ENABLED"] = '1'
         # torch.set_float32_matmul_precision('medium')
         pl.seed_everything(training_params.seed, workers=True)
-        run_name = f'teacher_{task.task_name}'
+        run_name = f'teacher_{task.name}'
         
         def train_teacher_per_worker(config):
             if training_params.reproducible_backend:
@@ -247,7 +246,7 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
                 weight_decay=config["weight_decay"],
                 max_grad_norm=config["max_grad_norm"],
                 n_samples=lm_params.num_samples,
-                num_workers=training_params.resources.teacher.num_data_workers,
+                num_data_workers=training_params.resources.teacher.num_data_workers,
                 seed=training_params.seed,
                 torch_dtype=training_params.torch_dtype,
             )
@@ -296,8 +295,9 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
                     checkpoint_score_attribute="val_acc",
                     checkpoint_score_order="max",
                 ),
-                failure_config=ray.tune.FailureConfig(max_failures=5),
-                storage_path="/research-storage/lab/ryanswif/kd_first_principles/ray-shenan/"
+                failure_config=ray.tune.FailureConfig(
+                    max_failures=training_params.resources.max_failures),
+                storage_path=dirs.ray,
             )
             ray_ptl_trainer = ray.train.torch.TorchTrainer(
                 train_teacher_per_worker,
@@ -337,16 +337,16 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
         save_path = f"{path}/{self.model_file}"
         torch.save(self.model.state_dict(), save_path)
 
-        with open(f"{path}/config.json", "w") as f:
+        with open(f"{path}/pl_config.json", "w") as f:
             # cfg = self.train_config.model_dump()
             # json.dump({"train_config": cfg}, f, indent=4)
             json.dump(self.train_config.model_dump(), f, indent=4)
 
-        print(f"Teacher for task {self.train_config.task.task_name} saved to {path}")
+        print(f"Teacher for task {self.train_config.task.name} saved to {path}")
         
     @classmethod
     def load_pretrained(cls, path: str) -> 'TeacherModule':
-        with open(f"{path}/config.json", "w") as f:
+        with open(f"{path}/pl_config.json", "r") as f:
             hparams = json.load(f)
         cfg = TeacherModuleConfig(**hparams)
         teacher_module = cls(train_config=cfg)

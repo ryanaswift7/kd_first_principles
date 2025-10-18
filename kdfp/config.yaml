@@ -2,7 +2,7 @@ teacher_name: &teacher_name EleutherAI/pythia-1.4b-deduped
 students: 
   shallow:
     name: *teacher_name
-    factor: 1/3
+    factor: 1/6
   narrow:
     name: EleutherAI/pythia-410m-deduped
 
@@ -11,6 +11,8 @@ directories:
   cache: cache
   models: models
   scores: scores
+  ray: ray
+  lightning: lightning
 
 offline_projector_params:
   alignment_betas: [0.5]  # [0.0, 0.25, 0.5, 0.75, 1.0]
@@ -39,7 +41,8 @@ training_params:
   reproducible_backend: true
   device: 'cuda'
   torch_dtype: bfloat16
-  resources: 
+  resources:
+    max_failures: 0
     num_available_gpus: 2
     projector:
       num_data_workers: 0
@@ -47,12 +50,12 @@ training_params:
       num_cpus_per_trial: 1
       num_gpus_per_trial: 0.25
     teacher:
-      num_data_workers: 4
+      num_data_workers: 0
       num_ray_workers: 1
       num_cpus_per_trial: 6
       num_gpus_per_trial: 0.5
     student:
-      num_data_workers: 4
+      num_data_workers: 0
       num_ray_workers: 1
       num_cpus_per_trial: 6
       num_gpus_per_trial: 2.0
@@ -68,8 +71,8 @@ hook_types:
     - "hook_resid_post"
 
 projection_variants:
-  directions: ['up']  # ["up", "down"]
-  training_methods: ["online", "offline", "randomized"]
+  directions: ["up", "down"]
+  training_methods: ["offline", "online", "randomized"]
 
 objective_weight_variants:
   # - "only_outputs"
@@ -112,8 +115,6 @@ tasks:
   # boolq:
   #   dataset_name: aps/super_glue
   #   subset: boolq
-  # logiqa2:
-  #   dataset_name: baber/logiqa2
   # piqa:
   #   dataset_name: baber/piqa
   # sciq:
@@ -122,5 +123,7 @@ tasks:
   #   dataset_name: allenai/winogrande
   #   subset: winogrande_xl
 
+  # logiqa2:
+  #   dataset_name: baber/logiqa2
 
   

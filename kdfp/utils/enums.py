@@ -1,15 +1,15 @@
 from enum import Enum
 
-class ProjectorTraining(Enum):
+class ProjectorTraining(str, Enum):
     ONLINE = "online"
     OFFLINE = "offline"
     RANDOMIZED = "randomized"
 
-class StudentReduction(Enum):
+class StudentReduction(str, Enum):
     NARROW = "narrow"
     SHALLOW = "shallow"
 
-class ProjectionDirection(Enum):
+class ProjectionDirection(str, Enum):
     UP = 'up'
     DOWN = 'down'
 

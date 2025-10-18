@@ -1,8 +1,15 @@
 import torch
-from pydantic import field_serializer
+from pydantic import field_serializer, field_validator
+from transformer_lens import HookedTransformer
 
 class DtypeSerializerMixin:
     """A mixin to provide serialization for a 'dtype' field."""
+    @field_validator('torch_dtype')
+    def validate_dtype(cls, v):
+        if isinstance(v, str):
+            v = getattr(torch, v)
+        return v
+    
     @field_serializer('torch_dtype')
     def serialize_dtype(self, torch_dtype: torch.dtype) -> str:
         # Converts torch.float32 -> "float32"
@@ -10,9 +17,6 @@ class DtypeSerializerMixin:
     
 class MCEvalMixin:
     def _shared_eval_step(self, model, batch, batch_idx):
-        """
-        Corrected, efficient, and vectorized eval step.
-        """
         # The batch contains tensors of shape [batch_size, num_task_choices, seq_len]
         batch_size, num_choices, seq_len = batch['input_ids'].shape
         true_labels = batch['label']
@@ -24,9 +28,11 @@ class MCEvalMixin:
 
         # 2. Perform one forward pass for all choices in the batch
         with torch.no_grad():
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        
-        logits = outputs.logits
+            if isinstance(model, HookedTransformer):
+                logits = model(input_ids)
+            else:
+                outputs = model(input_ids)
+                logits = outputs.logits
 
         # --- Add the debugging check for safety ---
         if torch.isnan(logits).any() or torch.isinf(logits).any():
