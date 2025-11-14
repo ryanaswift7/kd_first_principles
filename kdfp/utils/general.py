@@ -1,3 +1,4 @@
+import datetime
 import os
 import torch
 import numpy as np
@@ -128,3 +129,8 @@ def set_device(device: str):
             print(f"Using CUDA device: {torch.cuda.get_device_name(torch.cuda.current_device())}")
     else:
         print(f"CUDA not available, using {torch.cuda.get_device_name(torch.cuda.current_device())}")
+
+
+def get_timestamp() -> str:
+    now = datetime.datetime.now()
+    return now.strftime("%Y%m%d_%H%M%S")

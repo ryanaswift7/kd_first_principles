@@ -217,6 +217,7 @@ class OfflineProjectorModule(LightningModule):
         run_name = f'off_proj_{projection.offline_projector_alignment_beta}'
 
         train_func = partial(train_projector_per_worker,
+                             run_name=run_name,
                              teacher_cache_dir=teacher_cache_dir,
                              student_cache_dir=student_cache_dir,
                              teacher_dim=teacher_dim,
@@ -230,7 +231,7 @@ class OfflineProjectorModule(LightningModule):
         # NOTE: CANNOT USE RAY TRAIN V2 (at least on single node)
         def tune_asha(num_trials: int):
             search_space: Dict[str, Any] = {
-                "batch_size": tune.choice(hyperparams.batch_sizes),
+                "batch_size": tune.choice([2048]),  # tune.choice(hyperparams.batch_sizes),
                 "learning_rate": tune.qloguniform(hyperparams.lr.mini, hyperparams.lr.maxi, 5e-7),
                 "weight_decay": tune.qloguniform(hyperparams.weight_decay.mini, hyperparams.weight_decay.maxi, 5e-6),
                 "max_grad_norm": tune.quniform(hyperparams.max_grad_norm.mini, hyperparams.max_grad_norm.maxi, 1e-3),

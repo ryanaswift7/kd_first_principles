@@ -356,5 +356,5 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
         teacher_module.model_name = path
         teacher_module.tokenizer = AutoTokenizer.from_pretrained(path)
 
-        print(f"Teacher for task {hparams["task"].name} loaded from {path}")
+        print(f"Teacher for task {teacher_module.train_config.task.name.upper()} loaded from {path}")
         return teacher_module

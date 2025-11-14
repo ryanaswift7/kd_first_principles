@@ -1,5 +1,6 @@
 from typing import Dict, Any
 from lightning.pytorch import Trainer
+from lightning.pytorch.loggers import WandbLogger
 from ray.train.lightning import (
     RayDDPStrategy,
     RayLightningEnvironment,
@@ -25,7 +26,8 @@ import tempfile
 import torch
 
 def train_projector_per_worker(
-        config: Dict[str, Any], 
+        config: Dict[str, Any],
+        run_name: str,
         teacher_cache_dir: Union[str, Path],
         student_cache_dir: Union[str, Path],
         teacher_dim: int,
@@ -72,6 +74,11 @@ def train_projector_per_worker(
         enable_checkpointing=False,
         deterministic=training_params.reproducible_backend,
         check_val_every_n_epoch=1,
+        logger=WandbLogger(
+                name=f"{run_name}_tune_{uuid.uuid4().hex[:6]}",
+                project="kdfp",
+                group="off_proj_search",
+            )
     )
     trainer = prepare_trainer(trainer)
     

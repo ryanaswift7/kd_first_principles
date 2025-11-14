@@ -1,11 +1,14 @@
 from argparse import ArgumentParser
+import datetime
 from pathlib import Path
 from kdfp.schemas.globalConfig import GlobalConfig
 import pandas as pd
 import os
 import torch
 
-DEFAULT_CONFIG = 'kdfp/config.yaml'
+from kdfp.utils.general import get_timestamp
+
+DEFAULT_CONFIG = 'kdfp/configs/base.yaml'
 
 def parse_cli_args():
     """Parse CLI arguments for the kdfp command"""
@@ -33,24 +36,47 @@ def main(config_path: str):
         assert experiment_list[i].name == name, f"Experiment name mismatch: {experiment_list[i].name} != {name}"
         print(f"    {i+1}: {name}")
 
-    print("\nBeginning baseline testing...")
-    results_list = config.run_baseline_tests()
-    print("Baseline testing complete!")
+    results_list = []
+    
+    if config.training_params.get_baselines:
+        print("\nBeginning baseline testing...")
+        results_list.extend(config.run_baseline_tests())
+        print("Baseline testing complete!")
 
     print("\nStarting experiment runs...")
     for i, experiment in enumerate(experiment_list):
-        print(f"Starting experiment {i+1}/{n}: {experiment.name.upper()}")
+        if "narrow" not in experiment.name:
+            print(f"Skipping experiment {i+1}/{n}: {experiment.name.upper()}")
+            continue
+
+        print(f"\nStarting experiment {i+1}/{n}: {experiment.name.upper()}")
         experiment.init()
-        results_list.extend(experiment.run())
+
+        # Now that teachers have certainly been initialized, get benchmark scores.
+        # We can get them from any experiment and only need to do it once, might as well
+        # do the first one
+
+        if i == 0 and config.training_params.get_baselines:
+            print(f"\nBeginning teacher testing...")
+            results_list.extend(experiment.test_teachers(mode=config.training_params.testing_mode))
+            print(f"Teacher testing complete!\n")
+
+        if config.training_params.run_or_test == 'run':
+            # use this to create, then test models
+            results_list.extend(experiment.run())  
+        else:
+            # use this to test existing models
+            results_list.extend(experiment.test_student(mode=config.training_params.testing_mode))  
+
         print(f"Finished experiment {i+1}/{n}: {experiment.name.upper()}")
-        # break
 
     base_scores_dir = Path(config.directories.root + '/' + config.directories.scores).resolve()
     base_scores_dir.mkdir(parents=True, exist_ok=True)
-    df_path = base_scores_dir / "results_df.parquet"
+    df_path = base_scores_dir / f"results_df_{get_timestamp()}.parquet"
     results_df = pd.DataFrame(results_list)
     results_df.to_parquet(df_path)
-    print(f"Results dataframe saved in Parquet format to:\n\t{df_path}")
+    results_df.to_markdown(base_scores_dir / f"results_df_{get_timestamp()}.md")
+    print(f"Results dataframe for experiment configuration {config_path} saved in Parquet format to:\n\t{df_path}\n")
     print(results_df)
 
     #     new_row = pd.DataFrame([dict(zip(result_df.columns.tolist(), results))])

@@ -16,25 +16,30 @@ class RandomizedProjector(nn.Module):
         self.torch_dtype = torch_dtype
 
         """
-        It only makes sense to construct student_dim orthonormal vectors
-        from the teacher_dim space, and not the other way around
-        (because is it impossible for there to be more mutually orthogonal
-        vectors than there are dimensions).
+        Here I'm using the binary coin implementation of the JL Lemma from
+        Achlioptas (2003), which:
+        - creates a projection matrix P of size (student_dim, teacher_dim)
+        - each entry P_ij chosen independently with:
+            - P_ij = +1 with probability 1/2
+            - P_ij = -1 with probability 1/2
+        - the final P is scaled by 1/sqrt(k)
 
-        Thus only the JL Lemma only holds for the down projection. I am also
-        trying the upward projection, though the same theoretical guarantees
-        do not apply. For that, I simply transpose the Q matrix from QR decomp
+        NOTE: JL Lemma only applies to dimension reduction (i.e. down direction)
+        Even though there are no theoretical guarantees, the upward direction
+        (scaled by 1/sqrt(teacher_dim) instead of 1/sqrt(student_dim)) is tested
+        to evaluate performance empirically
         """
-        random_matrix = torch.randn(teacher_dim, student_dim)
-        # Perform QR decomposition to get the orthonormal matrix Q
-        projection_matrix, _ = torch.linalg.qr(random_matrix)
-        projection_matrix = projection_matrix.to(torch_dtype)
+        p = torch.randint(0, 2, (teacher_dim, student_dim), dtype=torch_dtype)
+        p = 2 * p - 1
+        p /= torch.sqrt(torch.tensor(student_dim))
 
         if direction == ProjectionDirection.UP:
-            projection_matrix = projection_matrix.T
+            scaling_adjustment = torch.sqrt(torch.tensor(student_dim)) / torch.sqrt(torch.tensor(teacher_dim))
+            p = p.T * scaling_adjustment
 
-        self.register_buffer('projection_matrix', projection_matrix)
+        self.register_buffer('projection_matrix', p)
 
     def forward(self, x):
-        # F.linear has an implicit transpose, so I have to transpose it back
+        # F.linear has an implicit transpose, so I transpose it back
+        # I could instead create a transposed matrix, but I find this more intuitive
         return F.linear(x, self.projection_matrix.T)

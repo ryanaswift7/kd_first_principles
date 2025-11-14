@@ -1,7 +1,9 @@
+import os
 import shutil
 from typing import Optional, Literal, List, Dict, Any, Union
 import lightning.pytorch as pl
 from transformers import AutoModelForCausalLM
+from kdfp.core.hf_tester import HFTesterModule, HFTesterModuleConfig
 from kdfp.core.projector.offline.offlineProjector import gen_off_proj_weights_filename
 from kdfp.core.projector.randomized import RandomizedProjector
 from kdfp.core.student.student import StudentModule
@@ -26,6 +28,10 @@ import torch.nn as nn
 from kdfp.utils.enums import (StudentReduction, ProjectorTraining)
 import torch
 import pandas as pd
+import warnings
+
+from kdfp.utils.general import get_timestamp
+from kdfp.utils.results import generate_result
 
 class ExperimentConfig(ConfigBase):
     name: str
@@ -185,7 +191,7 @@ class ExperimentConfig(ConfigBase):
 
     def init_teacher_by_task(self, task: TaskSpec) -> None:
         # save_dir = f"{self.dirs.teacher_model}/{task.task_name}"
-        teacher_weights_file = Path(self.dirs.teacher_models) / task.name / gen_teacher_weights_filename(task.name)
+        teacher_weights_file = Path(self.dirs.teacher_model) / task.name / gen_teacher_weights_filename(task.name)
         if teacher_weights_file.exists():
             print(f"Pretrained teacher for task '{task.name}' located at: {str(teacher_weights_file)}")
         else:
@@ -197,7 +203,7 @@ class ExperimentConfig(ConfigBase):
                 training_params=self.training_params,
                 dirs=self.dirs,
             )
-            t.save_pretrained(path=f"{self.dirs.teacher_models}/{task.name}")
+            t.save_pretrained(path=f"{self.dirs.teacher_model}/{task.name}")
 
 
     def init(self) -> None:
@@ -207,18 +213,10 @@ class ExperimentConfig(ConfigBase):
             self.init_teacher_by_task(task)
 
     def cleanup_log_dirs(self) -> None:
-        # print("\n\n\n" + "="*60)
-        # print("CLEANING UP LOGS AT:")
-        # print("RAY: ",self.dirs.ray)
-        # print("LIGHTNING: ", self.dirs.lightning)
-        # print("="*60 + "\n\n\n")
-
         shutil.rmtree(self.dirs.ray, ignore_errors=True)
         shutil.rmtree(self.dirs.lightning, ignore_errors=True)
 
-    def run(self) -> List[dict]:
-        results_list = []
-        def trainer_factory() -> pl.Trainer:
+    def test_trainer_factory(self) -> pl.Trainer:
             return pl.Trainer(
                 accelerator='gpu',
                 strategy='auto',
@@ -226,9 +224,21 @@ class ExperimentConfig(ConfigBase):
                 deterministic=self.training_params.reproducible_backend,
                 default_root_dir=self.dirs.lightning,
             )
+
+    def run(self) -> List[dict]:
+        results_list = []
+        
         for i, task in enumerate(self.tasks):
             print(f"\nRunning task {i+1}/{len(self.tasks)}: '{task.name.upper()}'...")
-            student = StudentModule.create(
+
+            # DO NOT OVERWRITE EXISTING MODELS
+            model_save_dir = f"{self.dirs.student_model}/{task.name}"
+            if os.path.isdir(model_save_dir) and os.listdir(model_save_dir):
+                warnings.warn("Student model directory exists and is not empty!\n" + 
+                              f"Skipping experiment {self.name.upper()} to avoid overwriting models...")
+                continue
+
+            student_module = StudentModule.create(
                 exp_name=self.name,
                 dirs=self.dirs,
                 student_cfg=self.student_cfg,
@@ -240,21 +250,107 @@ class ExperimentConfig(ConfigBase):
                 projection=self.projection,
                 jsd_beta=self.jsd_beta,
                 objective_weights=self.objective_weights)
-            student.save_pretrained(f"{self.dirs.student_models}/{task.name}")
-            results = trainer_factory().test(model=student, verbose=True)
-            results_list.append({
-                "EXPERIMENT": self.name,
-                "TASK": task.name,
-                "METRIC": "accuracy",
-                "SCORE": results[0]['test_acc']})
-            results_list.append({
-                "EXPERIMENT": self.name,
-                "TASK": task.name,
-                "METRIC": "f1",
-                "SCORE": results[0]['test_f1']})
-            print(f"\nFinished task {i+1}/{len(self.tasks)}: '{task.name.upper()}'!")
+            student_module.save_pretrained(model_save_dir)
+            results = self.test_trainer_factory().test(model=student_module, verbose=True)
+            new_result = generate_result(
+                name=self.name,
+                model=student_module.student,
+                task_name=task.name,
+                metric_name="accuracy",
+                score=results[0]['test_acc'],)
+            results_list.append(new_result)
+            new_result_df = pd.DataFrame([new_result])
 
-            
+            scores_dir = Path(f"{self.dirs.student_scores}/{task.name}")
+            scores_dir.mkdir(parents=True, exist_ok=True)
+            new_result_df.to_parquet(scores_dir / f"results_df_{get_timestamp()}.parquet")
+
+            print(f"\nFinished task {i+1}/{len(self.tasks)}: '{task.name.upper()}'!")
         self.cleanup_log_dirs()
         return results_list
+    
+    def test_student(self, mode: Literal['pl', 'hf']) -> List[dict]:
+        print(f"Running tests on student {self.name}...")
+        results_list = []
+
+        for i, task in enumerate(self.tasks):
+            print(f"\nBenchmarking student {self.name} on task {task.name.upper()}...")
+            student_save_dir = f"{self.dirs.student_model}/{task.name}"
+            if mode == 'pl':
+                student_module = StudentModule.load_pretrained(student_save_dir)
+            else:
+                student_test_cfg = HFTesterModuleConfig(
+                    model_path=student_save_dir,
+                    tokenizer_name=self.student_cfg.model_name,
+                    task=task,
+                    seq_len=self.training_params.seq_len,
+                    batch_size=self.lm_params.test_batch_size,
+                    seed=self.training_params.seed,
+                    torch_dtype=self.training_params.torch_dtype,
+                    num_data_workers=self.training_params.resources.student.num_data_workers,
+                    n_samples=self.lm_params.num_samples)
+                student_module = HFTesterModule(student_test_cfg)
+            results = self.test_trainer_factory().test(model=student_module, verbose=True)
+            new_result = generate_result(
+                name=self.name,
+                model=student_module.student,
+                task_name=task.name,
+                metric_name="accuracy",
+                score=results[0]['test_acc'],)
+            results_list.append(new_result)
+            new_result_df = pd.DataFrame([new_result])
+
             
+            scores_dir = Path(f"{self.dirs.student_scores}/{task.name}")
+            scores_dir.mkdir(parents=True, exist_ok=True)
+            new_result_df.to_parquet(scores_dir / f"results_df_{get_timestamp()}.parquet")
+
+            print(f"Finished with task {task.name.upper()}!")
+        self.cleanup_log_dirs()
+        return results_list
+
+
+    def test_teachers(self, mode: Literal['pl', 'hf']) -> List[dict]:
+        print(f"Running tests on teachers...")
+        results_list = []
+
+        for i, task in enumerate(self.tasks):
+            print(f"\nBenchmarking teacher finetuned on task {task.name.upper()}...")
+            teacher_save_dir = f"{self.dirs.teacher_model}/{task.name}"
+
+            if mode == 'pl':
+                teacher_module = TeacherModule.load_pretrained(teacher_save_dir)
+                # adjust current n_samples to respect new config (used for quick debugging)
+                teacher_module.train_config.n_samples = self.lm_params.num_samples
+            else:
+                teacher_test_cfg = HFTesterModuleConfig(
+                    model_path=teacher_save_dir,
+                    tokenizer_name=self.teacher_cfg.model_name,
+                    task=task,
+                    seq_len=self.training_params.seq_len,
+                    batch_size=self.lm_params.test_batch_size,
+                    seed=self.training_params.seed,
+                    torch_dtype=self.training_params.torch_dtype,
+                    num_data_workers=self.training_params.resources.teacher.num_data_workers,
+                    n_samples=self.lm_params.num_samples)
+                teacher_module = HFTesterModule(teacher_test_cfg)
+
+            results = self.test_trainer_factory().test(model=teacher_module, verbose=True)
+            new_result = generate_result(
+                name="teacher_ft",
+                model=teacher_module.model,
+                task_name=task.name,
+                metric_name="accuracy",
+                score=results[0]['test_acc'],)
+            results_list.append(new_result)
+            new_result_df = pd.DataFrame([new_result])
+
+            scores_dir = Path(f"{self.dirs.teacher_scores}/{task.name}")
+            scores_dir.mkdir(parents=True, exist_ok=True)
+            new_result_df.to_parquet(scores_dir / f"results_df_{get_timestamp()}.parquet")
+            
+            print(f"Finished with task {task.name.upper()}!")
+        self.cleanup_log_dirs()
+        return results_list
+
+

@@ -1,21 +1,32 @@
+# running on server4
+
+# FIXME:  I am manually setting the batch size for off proj training
+#         by going into create() because I don't want to implement
+#         a better fix yet
+
 teacher_name: &teacher_name EleutherAI/pythia-1.4b-deduped
 students: 
   shallow:
     name: *teacher_name
-    factor: 1/6
+    layer_reduction_factor: 1/6
   narrow:
     name: EleutherAI/pythia-410m-deduped
+    kd_layer_filter_factors: ['1']  # [1/4, 1/2, 3/4, '1']
+
 
 directories:
   root: results
   cache: cache
   models: models
   scores: scores
-  ray: ray
-  lightning: lightning
+  # ray and lightning are deleted after every run,
+  # so I need to separated them bc the drive is shared
+  # across servers
+  ray: ray-server4
+  lightning: lightning-server4
 
 offline_projector_params:
-  alignment_betas: [0.5]  # [0.0, 0.25, 0.5, 0.75, 1.0]
+  alignment_betas: [0.0, 0.25, 0.5, 0.75, 1.0]
   training_args:
     dataset: 
       name: common-pile/comma_v0.1_training_dataset
@@ -23,42 +34,46 @@ offline_projector_params:
       split: train
       shuffle: false
       token_rename: false
-    total_tokens: 1024  # 1000000
+    total_tokens: 1000000
     cache_batch_size: 8
-    num_epochs: 1
-    n_trials: 1
+    num_epochs: 5
+    n_trials: 8
     force_cache_all: false
 
 lm_params:
-  num_samples: 8  # null
-  num_epochs: 1
-  n_trials: 1
+  num_samples: null
+  num_epochs: 5
+  n_trials: 8  # 15
   test_batch_size: 64
 
 training_params:
+  get_baselines: false
+  run_or_test: run
+  testing_mode: pl  # hf
+
   seed: 44 # [3, 27, 44]
-  seq_len: 128  # 2048
+  seq_len: 256  # 2048
   reproducible_backend: true
   device: 'cuda'
   torch_dtype: bfloat16
   resources:
-    max_failures: 0
-    num_available_gpus: 2
+    max_failures: 10
+    num_available_gpus: 1  # 2
     projector:
       num_data_workers: 0
       num_ray_workers: 1
-      num_cpus_per_trial: 1
-      num_gpus_per_trial: 0.25
+      num_cpus_per_trial: 6
+      num_gpus_per_trial: 0.2  # 1.0
     teacher:
       num_data_workers: 0
       num_ray_workers: 1
       num_cpus_per_trial: 6
-      num_gpus_per_trial: 0.5
+      num_gpus_per_trial: 0.5  # 1.0
     student:
       num_data_workers: 0
       num_ray_workers: 1
       num_cpus_per_trial: 6
-      num_gpus_per_trial: 2.0
+      num_gpus_per_trial: 0.5  # 1.0
 
 
 hook_types:
@@ -71,8 +86,8 @@ hook_types:
     - "hook_resid_post"
 
 projection_variants:
-  directions: ["up", "down"]
-  training_methods: ["offline", "online", "randomized"]
+  directions: ["down"]  # ["up", "down"]
+  training_methods: ["offline"]  # ["offline", "online", "randomized"]
 
 objective_weight_variants:
   # - "only_outputs"
@@ -122,8 +137,5 @@ tasks:
   # winogrande:
   #   dataset_name: allenai/winogrande
   #   subset: winogrande_xl
-
-  # logiqa2:
-  #   dataset_name: baber/logiqa2
 
   

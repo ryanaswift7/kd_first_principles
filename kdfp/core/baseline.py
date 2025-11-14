@@ -91,7 +91,6 @@ class BaselineModule(pl.LightningModule, MCEvalMixin):
 
 
     def test_step(self, batch, batch_idx):
-        print("RUNNING TEST STEP")
         preds, true_labels, correct_choice_loss = self._shared_eval_step(
             model=self.model,
             batch=batch,

@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Optional, Union
 import uuid
 import lightning.pytorch as pl
+from lightning.pytorch.loggers import WandbLogger
 import ray
 import torch
 from torch.utils.data import DataLoader
@@ -22,6 +23,7 @@ from ray.train.lightning import (
     prepare_trainer,
 )
 from ray.tune.schedulers import ASHAScheduler
+from ray.air.integrations.wandb import WandbLoggerCallback
 
 from kdfp.core.projector.identity.identityProjector import IdentityProjector
 from kdfp.core.projector.offline.offlineProjector import OfflineProjectorModule, gen_off_proj_weights_filename
@@ -118,10 +120,12 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         )
         self.test_metrics = self.val_metrics.clone(prefix='test_')
 
+        # self.train_losses = []
+
         
     def load_teacher(self) -> HookedTransformer:
         teacher_hf = AutoModelForCausalLM.from_pretrained(
-            f"{self.train_config.dirs.teacher_models}/{self.train_config.task.name}")
+            f"{self.train_config.dirs.teacher_model}/{self.train_config.task.name}")
         # load base teacher
         teacher_tl = HookedTransformer.from_pretrained_no_processing(
             self.train_config.teacher_cfg.model_name,
@@ -136,8 +140,8 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         # print("="*60)
         tl_teacher_weights = convert_neox_to_hooked_weights(neox_model=teacher_hf, cfg=teacher_tl.cfg)
         teacher_tl.load_state_dict(tl_teacher_weights, strict=False)
-        teacher_tl.eval()
-        return teacher_tl
+        # teacher_tl.eval()
+        return teacher_tl.eval()
 
     def load_student(self) -> HookedTransformer:
         if self.train_config.student_cfg.layer_reduction_factor:
@@ -253,6 +257,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 if act in student_hooks[i]:
                     assert act in teacher_hooks[i], f"Expected to find teacher's '{act}' activation, but found {teacher_hooks[i]}"
                     weight = getattr(obj_weights, act)
+                    # print(f"Grabbed activation: {act}")
                     if self.train_config.projection:
                         if self.train_config.projection.direction == ProjectionDirection.UP:
                             raw_loss = mse(
@@ -417,7 +422,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             trainer = pl.Trainer(
                 devices="auto",
                 accelerator="auto",
-                strategy=RayDDPStrategy(),
+                strategy=RayDDPStrategy(find_unused_parameters=True),
                 plugins=[RayLightningEnvironment()],
                 callbacks=[RayTrainReportCallback()],
                 max_epochs=lm_params.num_epochs,
@@ -427,6 +432,11 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 enable_checkpointing=False,
                 deterministic=training_params.reproducible_backend,
                 check_val_every_n_epoch=1,
+                logger=WandbLogger(
+                    name=f"{run_name}_tune_{uuid.uuid4().hex[:6]}",
+                    project="kdfp",
+                    group="jsd_beta_search",
+                )
             )
             trainer = prepare_trainer(trainer)
             module.train()
@@ -460,6 +470,11 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 failure_config=ray.tune.FailureConfig(
                     max_failures=training_params.resources.max_failures),
                 storage_path=dirs.ray,
+                # callbacks=[WandbLoggerCallback(
+                #     project="kdfp",
+                #     group="students",
+                #     run_name=f"{run_name}_tune_{uuid.uuid4().hex[:6]}",
+                # )]
             )
             ray_ptl_trainer = ray.train.torch.TorchTrainer(
                 train_student_per_worker,
@@ -520,10 +535,11 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
 
     @classmethod
     def load_pretrained(cls, path: str) -> 'StudentModule':
-        with open(f"{path}/pl_config.json", "w") as f:
+        with open(f"{path}/pl_config.json", "r") as f:
             hparams = json.load(f)
         cfg = StudentModuleConfig(**hparams)
         student_module = cls(train_config=cfg)
         student_tl_state_dict = torch.load(Path(path)/student_module.model_file, weights_only=True)
         student_module.student.load_state_dict(student_tl_state_dict)
+        print(f"Student {student_module.train_config.name.upper()} for task {student_module.train_config.task.name} loaded from {path}")
         return student_module

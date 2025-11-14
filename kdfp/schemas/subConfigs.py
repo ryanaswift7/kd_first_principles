@@ -9,15 +9,33 @@ import torch
 
 class LayerReductionConfig(ConfigBase):
     name: str
-    factor: Union[str, float]
+    layer_reduction_factor: Union[str, float]
 
-    @field_validator('factor')
+    @field_validator('layer_reduction_factor')
     def convert_to_float(cls, v):
         f = float(Fraction(v))
         return f
 
 class DimReductionConfig(ConfigBase):
     name: str
+    kd_layer_filter_factors: List[Union[str, float]]
+
+    @field_validator('kd_layer_filter_factors')
+    def convert_to_float(cls, v):
+        try:
+            return [float(Fraction(str(f))) for f in v]
+        except ValueError as e:
+            # This will catch invalid strings like "abc"
+            raise ValueError(f"Invalid fraction or float string in list: {e}")
+        except TypeError as e:
+            # This might catch if the list contains something unexpected like None
+            raise TypeError(f"Invalid type in list: {e}")
+        
+class NumLayersConfig(ConfigBase):
+    student_narrow: int
+    student_shallow: int
+    teacher_narrow: int
+    teacher_shallow: int
 
 class StudentConfigs(ConfigBase):
     shallow: LayerReductionConfig
@@ -72,16 +90,18 @@ class BaseDirConfig(ConfigBase):
 class ExpDirConfig(ConfigBase):
     cache: Optional[str] = None
     off_proj_models: Optional[str] = None
-    teacher_models: str
-    student_models: str
+    teacher_model: str
+    teacher_scores: str
+    student_model: str
     student_scores: str
     ray: str
     lightning: str
 
     @model_validator(mode='after')
     def make_paths_absolute(self):
-        self.teacher_models = os.path.abspath(self.teacher_models)
-        self.student_models = os.path.abspath(self.student_models)
+        self.teacher_model = os.path.abspath(self.teacher_model)
+        self.teacher_scores = os.path.abspath(self.teacher_scores)
+        self.student_model = os.path.abspath(self.student_model)
         self.student_scores = os.path.abspath(self.student_scores)
         self.ray = os.path.abspath(self.ray)
         self.lightning = os.path.abspath(self.lightning)
@@ -133,6 +153,9 @@ class ExperimentResources(ConfigBase):
     student: ResourceConfig
 
 class TrainingParamsConfig(ConfigBase, DtypeSerializerMixin):
+    get_baselines: bool
+    run_or_test: Literal['run', 'test']
+    testing_mode: Literal['pl', 'hf']
     seed: int
     seq_len: int
     reproducible_backend: bool
