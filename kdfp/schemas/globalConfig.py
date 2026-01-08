@@ -195,10 +195,12 @@ class GlobalConfig(ConfigBase):
                                                         hook_list=self.hooks.teacher.shallow,
                                                         d_model=self.dims.teacher.shallow,
                                                         n_layers=self.layers.teacher_shallow)
-                                            student_cfg = LMConfig(model_name=self.students.shallow.name,
-                                                        hook_list=self.hooks.student.shallow,
-                                                        d_model=self.dims.student.shallow,
-                                                        n_layers=self.layers.student_shallow)
+                                            student_cfg = LMConfig(
+                                                model_name=self.students.shallow.name,
+                                                layer_reduction_factor=self.students.shallow.layer_reduction_factor,
+                                                hook_list=self.hooks.student.shallow,
+                                                d_model=self.dims.student.shallow,
+                                                n_layers=self.layers.student_shallow)
                                             projection_direction = None
                                             projector_training = None
                                             offline_projector_alignment_beta = None
