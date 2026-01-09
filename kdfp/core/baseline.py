@@ -1,14 +1,15 @@
-from typing import Union, Optional
-import torch
+from typing import Optional, Union
+
 import lightning.pytorch as pl
+import torch
 import torchmetrics
+from torch.utils.data import DataLoader
 from torchmetrics import Accuracy, F1Score
 from transformer_lens import HookedTransformer
-from torch.utils.data import DataLoader
 
 from kdfp.schemas.configBase import ConfigBase
 from kdfp.schemas.mixins import DtypeSerializerMixin, MCEvalMixin
-from kdfp.schemas.tasks import TaskSpec
+from kdfp.schemas.tasks import TaskInstance
 from kdfp.utils.data import load_task_data
 from kdfp.utils.shallow_model_loading import load_shallow
 
@@ -16,7 +17,7 @@ from kdfp.utils.shallow_model_loading import load_shallow
 class BaselineModuleConfig(ConfigBase, DtypeSerializerMixin):
     model_name: str
     is_shallow: bool
-    task: TaskSpec
+    task: TaskInstance
     seq_len: int
     batch_size: int
     seed: int
@@ -24,6 +25,7 @@ class BaselineModuleConfig(ConfigBase, DtypeSerializerMixin):
     num_data_workers: Optional[int] = None
     n_samples: Optional[int] = None
     layer_reduction_factor: Optional[float] = None
+
 
 class BaselineModule(pl.LightningModule, MCEvalMixin):
     def __init__(self, train_config):
@@ -37,17 +39,18 @@ class BaselineModule(pl.LightningModule, MCEvalMixin):
         if self.train_config.is_shallow:
             self.model, self.tokenizer, _ = load_shallow(
                 model_name=self.train_config.model_name,
-                mode='tl',
+                mode="tl",
                 layer_reduction_factor=self.train_config.layer_reduction_factor,
-                selection_method='linspace',
-                torch_dtype=self.train_config.torch_dtype)
+                selection_method="linspace",
+                torch_dtype=self.train_config.torch_dtype,
+            )
         else:
             self.model = HookedTransformer.from_pretrained_no_processing(
-                self.train_config.model_name,
-                dtype=self.train_config.torch_dtype)
+                self.train_config.model_name, dtype=self.train_config.torch_dtype
+            )
             self.tokenizer = self.model.tokenizer
 
-        if self.train_config.task.task_type == 'multiclass':
+        if self.train_config.task.task_type == "multiclass":
             acc = Accuracy(task=self.train_config.task.task_type, num_classes=4)
             f1 = F1Score(task=self.train_config.task.task_type, num_classes=4)
         else:  # binary
@@ -60,7 +63,7 @@ class BaselineModule(pl.LightningModule, MCEvalMixin):
                 "acc": acc,
                 "f1": f1,
             },
-            prefix="test_"
+            prefix="test_",
         )
 
     def _format_params(self, num_params: int) -> str:
@@ -78,25 +81,25 @@ class BaselineModule(pl.LightningModule, MCEvalMixin):
     def print_param_count(self, name: Optional[str]) -> None:
         """Prints the total and trainable parameter counts in a human-readable format."""
         total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        trainable_params = sum(
+            p.numel() for p in self.model.parameters() if p.requires_grad
+        )
 
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         if name:
             print(f"{name.upper()} PARAMETER COUNTS:")
-            
+
         # Use the helper function to format the output
         print(f"Total parameters:     {self._format_params(total_params)}")
         print(f"Trainable parameters: {self._format_params(trainable_params)}")
-        print("="*60)
-
+        print("=" * 60)
 
     def test_step(self, batch, batch_idx):
         preds, true_labels, correct_choice_loss = self._shared_eval_step(
-            model=self.model,
-            batch=batch,
-            batch_idx=batch_idx)
+            model=self.model, batch=batch, batch_idx=batch_idx
+        )
         self.test_metrics.update(preds, true_labels)
-        self.log('test_loss', correct_choice_loss, sync_dist=True)
+        self.log("test_loss", correct_choice_loss, sync_dist=True)
         return {"test_loss": correct_choice_loss}
 
     def on_test_epoch_end(self):
@@ -108,12 +111,14 @@ class BaselineModule(pl.LightningModule, MCEvalMixin):
             task=self.train_config.task,
             tokenizer=self.tokenizer,
             seq_len=self.train_config.seq_len,
-            split='test',
-            n_samples=self.train_config.n_samples)
-                
+            split="test",
+            n_samples=self.train_config.n_samples,
+        )
+
         return DataLoader(
             dataset,
             batch_size=self.train_config.batch_size,
             shuffle=False,
             num_workers=self.train_config.num_data_workers,
-            pin_memory=True)
+            pin_memory=True,
+        )

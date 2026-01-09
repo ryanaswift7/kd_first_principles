@@ -1,12 +1,17 @@
-teacher_name: &teacher_name EleutherAI/pythia-1.4b-deduped
-students: 
+suite_title: &suite 'base'
+models: 
+  teacher:
+    name: &teacher_name EleutherAI/pythia-2.8b-deduped
+    layer_reduction_factor: null
+    kd_layer_filter_factors: [1]
+  pretrained:
+    name: EleutherAI/pythia-1.4b-deduped
+    layer_reduction_factor: null
+    kd_layer_filter_factors: [1]
   shallow:
     name: *teacher_name
-    layer_reduction_factor: 1/6
-  narrow:
-    name: EleutherAI/pythia-410m-deduped
-    kd_layer_filter_factors: ['1']  # [1/4, 1/2, 3/4, '1']
-
+    kd_layer_filter_factors: [1]
+    layer_reduction_factor: 0.45
 
 directories:
   root: results
@@ -17,19 +22,7 @@ directories:
   lightning: lightning
 
 offline_projector_params:
-  alignment_betas: [0.5]  # [0.0, 0.25, 0.5, 0.75, 1.0]
-  training_args:
-    dataset: 
-      name: common-pile/comma_v0.1_training_dataset
-      subset: null
-      split: train
-      shuffle: false
-      token_rename: false
-    total_tokens: 1000000
-    cache_batch_size: 8
-    num_epochs: 1
-    n_trials: 8
-    force_cache_all: false
+  
 
 lm_params:
   num_samples: null
@@ -38,33 +31,59 @@ lm_params:
   test_batch_size: 64
 
 training_params:
-  get_baselines: false
-  run_or_test: run
-  testing_mode: pl  # hf
-
-  seed: 44 # [3, 27, 44]
+  seeds: [3] # [3, 27, 44]  # 44
   seq_len: 256  # 2048
+  train_batch_size: 8  # 48
+  test_batch_size: 16  # 128
+  num_samples: null
+  num_epochs: 4
+  n_trials: 25  # 8
   reproducible_backend: true
   device: 'cuda'
   torch_dtype: bfloat16
+
+  controls:
+    # baselines are finetuned student and teacher,
+    # and student and teacher with no training
+    finetune_teacher: true
+    get_baselines: false
+    run_or_test: run
+    testing_mode: pl  # hf
+
+  objective:
+    jsd_betas: [0.5]  # [0.0, 0.25, 0.5, 0.75, 1.0]
+    weight_variants:
+      # - "only_outputs"
+      - "balanced"
+      # - "no_embed"
+      # - "no_attn_scores"
+      # - "no_attn_out"
+      # - "no_mlp"
+      # - "no_resid"
+      # - "with_embed"
+      # - "with_attn_scores"
+      # - "with_attn_out"
+      # - "with_mlp"
+      # - "with_resid"
+
   resources:
-    max_failures: 10
+    max_failures: 1  # 10
     num_available_gpus: 2
-    projector:
-      num_data_workers: 0
-      num_ray_workers: 1
-      num_cpus_per_trial: 12
-      num_gpus_per_trial: 1.0
+    stream_data: false
     teacher:
-      num_data_workers: 0
+      num_data_workers: 12
       num_ray_workers: 1
       num_cpus_per_trial: 12
       num_gpus_per_trial: 1.0
     student:
-      num_data_workers: 0
+      num_data_workers: 12
       num_ray_workers: 1
       num_cpus_per_trial: 12
       num_gpus_per_trial: 1.0
+
+  wandb:
+    project: 'kdfp-ted'
+    group: *suite
 
 
 hook_types:
@@ -76,40 +95,60 @@ hook_types:
     - "hook_mlp_out"
     - "hook_resid_post"
 
-projection_variants:
+projection:
   directions: ["up", "down"]
   training_methods: ["offline", "online", "randomized"]
+  offline_params:
+    alignment_betas: [0.5]  # [0.0, 0.25, 0.5, 0.75, 1.0]
+    training_args:
+      dataset: 
+        name: common-pile/comma_v0.1_training_dataset
+        subset: null
+        split: train
+        shuffle: false
+        token_rename: false
+      total_tokens: 1000000
+      cache_batch_size: 8
+      num_epochs: 1
+      n_trials: 8
+      force_cache_all: false
 
-objective_weight_variants:
-  # - "only_outputs"
-  - "balanced"
-  # - "no_embed"
-  # - "no_attn_scores"
-  # - "no_attn_out"
-  # - "no_mlp"
-  # - "no_resid"
-  # - "with_embed"
-  # - "with_attn_scores"
-  # - "with_attn_out"
-  # - "with_mlp"
-  # - "with_resid"
 
-jsd_betas: [0.5]  # [0.0, 0.25, 0.5, 0.75, 1.0]
+hparams:
+  fixed:
+    teacher:
+      lr: 2e-5
+      weight_decay: 2e-4
+      max_grad_norm: 0.5
+    pretrained:
+      ft:
+        lr: 3.4e-5
+        weight_decay: 1e-2
+        max_grad_norm: 2.0
+        temperature: 1.0
 
-hyperparams:
-  lr:
-    mini: 1e-6
-    maxi: 1e-4  # [1e-6, 5e-6, 1e-5, 5e-5]
-  weight_decay:
-    mini: 1e-4
-    maxi: 0.1  # [1e-5, 1e-3, 1e-2, 0.1]
-  temperature:
-    mini: 0.1
-    maxi: 2.0  # [0.1, 0.5, 1.0, 2.0]
-  max_grad_norm:
-    mini: 0.1
-    maxi: 2.0  # [0.1, 0.5, 1.0, 2.0]
-  batch_sizes: [8]  # [8, 16, 32]
+      kd: null
+    shallow:
+      ft:
+        lr: 4.9e-5
+        weight_decay: 3e-4
+        max_grad_norm: 0.4
+        temperature: 3e-1
+      kd: null
+
+  tune:
+    lr:
+      mini: 1e-6
+      maxi: 1e-3  # [1e-6, 5e-6, 1e-5, 5e-5]
+    weight_decay:
+      mini: 1e-4
+      maxi: 0.1  # [1e-5, 1e-3, 1e-2, 0.1]
+    temperature:
+      mini: 0.1
+      maxi: 2.0  # [0.1, 0.5, 1.0, 2.0]
+    max_grad_norm:
+      mini: 0.1
+      maxi: 2.0  # [0.1, 0.5, 1.0, 2.0]
 
 tasks:
   hellaswag:

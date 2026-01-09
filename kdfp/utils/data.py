@@ -1,43 +1,47 @@
-import os
-import torch
-from torch.utils.data import Dataset, ConcatDataset
-from datasets import load_dataset, load_dataset_builder
-from functools import partial
-import pandas as pd
-from tqdm.auto import tqdm
-from typing import Optional, List
-from pydantic import BaseModel, field_validator, model_validator
-from kdfp.schemas.tasks import TaskSpec
-import random
 import json
+import os
+import random
+from functools import partial
 from pathlib import Path
-import warnings
-from filelock import FileLock
+from typing import List, Optional
+
+import pandas as pd
+import torch
+from datasets import load_dataset
+from pydantic import BaseModel, field_validator, model_validator
+from torch.utils.data import ConcatDataset, Dataset
+from tqdm.auto import tqdm
+
+from kdfp.schemas.tasks import TaskInstance
+
 
 def _preprocess(examples, seq_len, tokenizer, token_rename: bool):
     # Preprocess the examples
     tokenized_examples = tokenizer(
-        examples['text'], 
-        return_tensors="pt", 
-        truncation=True, 
-        padding='max_length', 
-        max_length=seq_len
+        examples["text"],
+        return_tensors="pt",
+        truncation=True,
+        padding="max_length",
+        max_length=seq_len,
     )
-    
+
     # Rename 'input_ids' to 'tokens'
     if token_rename:
         tokenized_examples["tokens"] = tokenized_examples.pop("input_ids")
-    
+
     return tokenized_examples
 
-def load_data(tokenizer,
-              seq_len: int,
-              dataset_name: str,
-              subset: Optional[str] = None,
-              split: str = "train",
-              token_rename: bool = False,
-              n_samples: Optional[int] = None,
-              streaming: bool = True) -> Dataset:
+
+def load_data(
+    tokenizer,
+    seq_len: int,
+    dataset_name: str,
+    subset: Optional[str] = None,
+    split: str = "train",
+    token_rename: bool = False,
+    n_samples: Optional[int] = None,
+    streaming: bool = True,
+) -> Dataset:
     if subset:
         dataset = load_dataset(
             dataset_name,
@@ -54,14 +58,13 @@ def load_data(tokenizer,
             trust_remote_code=True,
             streaming=True,
         )
-    
+
     if n_samples:
         dataset = dataset.take(n_samples)
 
-    preprocess_fn = partial(_preprocess,
-                            seq_len=seq_len,
-                            tokenizer=tokenizer,
-                            token_rename=token_rename)
+    preprocess_fn = partial(
+        _preprocess, seq_len=seq_len, tokenizer=tokenizer, token_rename=token_rename
+    )
     dataset = dataset.map(
         preprocess_fn,
         batched=True,
@@ -81,26 +84,28 @@ def _format_arc(examples, split: str):
         split (str): The dataset split, e.g., 'train' or 'validation'.
     """
     # Get the number of examples in the batch
-    num_examples = len(examples['id'])
-    
-    if split == 'train':
+    num_examples = len(examples["id"])
+
+    if split == "train":
         # For TRAINING: Create a single, correct question-answer pair.
         texts = []
         for i in range(num_examples):
-            question = examples['question'][i]
-            choices = examples['choices'][i]['text']
-            choice_labels = examples['choices'][i]['label'] # e.g., ['A', 'B', 'C', 'D']
-            answer_key = examples['answerKey'][i] # e.g., 'C'
+            question = examples["question"][i]
+            choices = examples["choices"][i]["text"]
+            choice_labels = examples["choices"][i][
+                "label"
+            ]  # e.g., ['A', 'B', 'C', 'D']
+            answer_key = examples["answerKey"][i]  # e.g., 'C'
 
             # Find the 0-indexed integer for the correct answer
             correct_idx = choice_labels.index(answer_key)
             correct_answer_text = choices[correct_idx]
-            
+
             # Format as a complete and correct QA pair
             text = f"Question: {question}\nAnswer: {correct_answer_text}"
             texts.append(text)
-            
-        return texts, None # No separate labels needed for training
+
+        return texts, None  # No separate labels needed for training
 
     else:
         # For VALIDATION: Create all possible QA pairs for each example
@@ -108,10 +113,10 @@ def _format_arc(examples, split: str):
         all_choice_texts = []
         labels = []
         for i in range(num_examples):
-            question = examples['question'][i]
-            choices = examples['choices'][i]['text']
-            choice_labels = examples['choices'][i]['label']
-            answer_key = examples['answerKey'][i]
+            question = examples["question"][i]
+            choices = examples["choices"][i]["text"]
+            choice_labels = examples["choices"][i]["label"]
+            answer_key = examples["answerKey"][i]
 
             # Find the 0-indexed label
             label_idx = choice_labels.index(answer_key)
@@ -121,8 +126,9 @@ def _format_arc(examples, split: str):
             for choice in choices:
                 text = f"Question: {question}\nAnswer: {choice}"
                 all_choice_texts.append(text)
-            
+
         return all_choice_texts, labels
+
 
 def _format_hellaswag(examples, split: str):
     """
@@ -133,13 +139,13 @@ def _format_hellaswag(examples, split: str):
                                    flattened into a single list, plus the labels.
     """
     # Get the number of examples in the batch
-    num_examples = len(examples['ctx'])
-    
-    if split == 'train':
+    num_examples = len(examples["ctx"])
+
+    if split == "train":
         texts = []
         for i in range(num_examples):
-            context = examples['ctx'][i]
-            correct_ending = examples['endings'][i][int(examples['label'][i])]
+            context = examples["ctx"][i]
+            correct_ending = examples["endings"][i][int(examples["label"][i])]
             texts.append(context + " " + correct_ending)
         # No labels needed for training
         return texts, None
@@ -148,11 +154,12 @@ def _format_hellaswag(examples, split: str):
         all_choice_texts = []
         labels = []
         for i in range(num_examples):
-            context = examples['ctx'][i]
-            for choice in examples['endings'][i]:
+            context = examples["ctx"][i]
+            for choice in examples["endings"][i]:
                 all_choice_texts.append(context + " " + choice)
-            labels.append(int(examples['label'][i]))
+            labels.append(int(examples["label"][i]))
         return all_choice_texts, labels
+
 
 def _format_piqa(examples, split: str):
     """
@@ -163,24 +170,24 @@ def _format_piqa(examples, split: str):
         split (str): The dataset split, e.g., 'train' or 'validation'.
     """
     # Get the number of examples in the batch
-    num_examples = len(examples['goal'])
-    
-    if split == 'train':
+    num_examples = len(examples["goal"])
+
+    if split == "train":
         # For TRAINING: Create a single, correct goal-solution pair.
         texts = []
         for i in range(num_examples):
-            goal = examples['goal'][i]
-            sol1 = examples['sol1'][i]
-            sol2 = examples['sol2'][i]
+            goal = examples["goal"][i]
+            sol1 = examples["sol1"][i]
+            sol2 = examples["sol2"][i]
             # The 'label' is already a 0-indexed integer (0 or 1)
-            correct_label = examples['label'][i]
+            correct_label = examples["label"][i]
             correct_solution = sol1 if correct_label == 0 else sol2
-            
+
             # Format as a complete and correct goal-solution pair
             text = f"Goal: {goal}\nSolution: {correct_solution}"
             texts.append(text)
-            
-        return texts, None # No separate labels needed for training
+
+        return texts, None  # No separate labels needed for training
 
     else:
         # For VALIDATION: Create both possible goal-solution pairs for each example
@@ -188,19 +195,20 @@ def _format_piqa(examples, split: str):
         all_choice_texts = []
         labels = []
         for i in range(num_examples):
-            goal = examples['goal'][i]
-            sol1 = examples['sol1'][i]
-            sol2 = examples['sol2'][i]
-            label_idx = examples['label'][i]
-            
+            goal = examples["goal"][i]
+            sol1 = examples["sol1"][i]
+            sol2 = examples["sol2"][i]
+            label_idx = examples["label"][i]
+
             labels.append(label_idx)
 
             # Create a formatted string for both possible solutions
             text1 = f"Goal: {goal}\nSolution: {sol1}"
             text2 = f"Goal: {goal}\nSolution: {sol2}"
             all_choice_texts.extend([text1, text2])
-            
+
         return all_choice_texts, labels
+
 
 def _format_boolq(examples, split: str):
     """
@@ -211,26 +219,26 @@ def _format_boolq(examples, split: str):
         split (str): The dataset split, e.g., 'train' or 'validation'.
     """
     # Get the number of examples in the batch
-    num_examples = len(examples['question'])
-    
+    num_examples = len(examples["question"])
+
     # Define the fixed choices and their mapping from the boolean label
     # This ensures consistency: False -> 0 -> "no", True -> 1 -> "yes"
     choices = ["no", "yes"]
 
-    if split == 'train':
+    if split == "train":
         # For TRAINING: Create a single, correct question-answer pair.
         texts = []
         for i in range(num_examples):
-            context = examples['passage'][i]
-            question = examples['question'][i]
+            context = examples["passage"][i]
+            question = examples["question"][i]
             # Determine the correct answer string based on the boolean label
-            correct_answer_text = "yes" if examples['label'][i] else "no"
-            
+            correct_answer_text = "yes" if examples["label"][i] else "no"
+
             # Format as a complete and correct QA pair
             text = f"Passage: {context}\nQuestion: {question}?\nAnswer: {correct_answer_text}"
             texts.append(text)
-            
-        return texts, None # No separate labels needed for training
+
+        return texts, None  # No separate labels needed for training
 
     else:
         # For VALIDATION: Create both possible QA pairs for each example
@@ -238,19 +246,20 @@ def _format_boolq(examples, split: str):
         all_choice_texts = []
         labels = []
         for i in range(num_examples):
-            context = examples['passage'][i]
-            question = examples['question'][i]
-            
+            context = examples["passage"][i]
+            question = examples["question"][i]
+
             # Determine the 0-indexed label (0 for "no", 1 for "yes")
-            label_idx = 1 if examples['label'][i] else 0
+            label_idx = 1 if examples["label"][i] else 0
             labels.append(label_idx)
 
             # Create a formatted string for both of the fixed choices ("no", "yes")
             for choice in choices:
                 text = f"Passage: {context}\nQuestion: {question}?\nAnswer: {choice}"
                 all_choice_texts.append(text)
-            
+
         return all_choice_texts, labels
+
 
 def _format_logiqa(examples, split: str):
     """
@@ -261,24 +270,24 @@ def _format_logiqa(examples, split: str):
         split (str): The dataset split, e.g., 'train' or 'validation'.
     """
     # Get the number of examples in the batch
-    num_examples = len(examples['id'])
-    
-    if split == 'train':
+    num_examples = len(examples["id"])
+
+    if split == "train":
         # For TRAINING: Create a single, correct question-answer pair.
         texts = []
         for i in range(num_examples):
-            context = examples['text'][i]
-            question = examples['question'][i]
+            context = examples["text"][i]
+            question = examples["question"][i]
             choices = examples["options"][i]
             # The 'answer' is already a 0-indexed integer
-            correct_answer_idx = examples['answer'][i]
+            correct_answer_idx = examples["answer"][i]
             correct_answer_text = choices[correct_answer_idx]
-            
+
             # Format as a complete and correct QA pair
             text = f"Passage: {context}\nQuestion: {question}\nAnswer: {correct_answer_text}"
             texts.append(text)
-            
-        return texts, None # No separate labels needed for training
+
+        return texts, None  # No separate labels needed for training
 
     else:
         # For VALIDATION: Create four possible QA pairs for each example
@@ -286,19 +295,20 @@ def _format_logiqa(examples, split: str):
         all_choice_texts = []
         labels = []
         for i in range(num_examples):
-            context = examples['text'][i]
-            question = examples['question'][i]
+            context = examples["text"][i]
+            question = examples["question"][i]
             choices = examples["options"][i]
-            label_idx = examples['answer'][i]
-            
+            label_idx = examples["answer"][i]
+
             labels.append(label_idx)
 
             # Create a formatted string for each of the four choices
             for choice in choices:
                 text = f"Passage: {context}\nQuestion: {question}\nAnswer: {choice}"
                 all_choice_texts.append(text)
-            
+
         return all_choice_texts, labels
+
 
 def _format_sciq(examples, split: str):
     """
@@ -309,21 +319,21 @@ def _format_sciq(examples, split: str):
         split (str): The dataset split, e.g., 'train' or 'validation'.
     """
     # Get the number of examples in the batch
-    num_examples = len(examples['question'])
-    
-    if split == 'train':
+    num_examples = len(examples["question"])
+
+    if split == "train":
         # For TRAINING: Create a single, correct question-answer pair.
         texts = []
         for i in range(num_examples):
-            context = examples['support'][i]
-            question = examples['question'][i]
-            correct_answer = examples['correct_answer'][i]
-            
+            context = examples["support"][i]
+            question = examples["question"][i]
+            correct_answer = examples["correct_answer"][i]
+
             # Format as a complete and correct QA pair
             text = f"Context: {context}\nQuestion: {question}\nAnswer: {correct_answer}"
             texts.append(text)
-            
-        return texts, None # No separate labels needed for training
+
+        return texts, None  # No separate labels needed for training
 
     else:
         # For VALIDATION: Create four possible QA pairs for each example
@@ -331,21 +341,21 @@ def _format_sciq(examples, split: str):
         all_choice_texts = []
         labels = []
         for i in range(num_examples):
-            context = examples['support'][i]
-            question = examples['question'][i]
-            correct_answer = examples['correct_answer'][i]
-            
+            context = examples["support"][i]
+            question = examples["question"][i]
+            correct_answer = examples["correct_answer"][i]
+
             # Assemble all four choices
             choices = [
-                correct_answer, 
-                examples["distractor1"][i], 
-                examples["distractor2"][i], 
-                examples["distractor3"][i]
+                correct_answer,
+                examples["distractor1"][i],
+                examples["distractor2"][i],
+                examples["distractor3"][i],
             ]
-            
+
             # Shuffle the choices to avoid positional bias
             random.shuffle(choices)
-            
+
             # Find the new 0-indexed label of the correct answer
             label_idx = choices.index(correct_answer)
             labels.append(label_idx)
@@ -354,9 +364,10 @@ def _format_sciq(examples, split: str):
             for choice in choices:
                 text = f"Context: {context}\nQuestion: {question}\nAnswer: {choice}"
                 all_choice_texts.append(text)
-            
+
         return all_choice_texts, labels
-    
+
+
 def _format_winogrande(examples, split: str):
     """
     Formats Winogrande examples for either training or NLL-based evaluation.
@@ -366,23 +377,23 @@ def _format_winogrande(examples, split: str):
         split (str): The dataset split, e.g., 'train' or 'validation'.
     """
     # Get the number of examples in the batch
-    num_examples = len(examples['sentence'])
-    
-    if split == 'train':
+    num_examples = len(examples["sentence"])
+
+    if split == "train":
         # For TRAINING: Create a single, correctly filled-in sentence for each example.
         texts = []
         for i in range(num_examples):
-            sentence = examples['sentence'][i]
-            option1 = examples['option1'][i]
-            option2 = examples['option2'][i]
+            sentence = examples["sentence"][i]
+            option1 = examples["option1"][i]
+            option2 = examples["option2"][i]
             # The 'answer' in the dataset is 1-based, so we determine the correct text
-            correct_option = option1 if examples['answer'][i] == '1' else option2
-            
+            correct_option = option1 if examples["answer"][i] == "1" else option2
+
             # Replace the pronoun placeholder '_' with the correct option
-            filled_sentence = sentence.replace('_', correct_option, 1)
+            filled_sentence = sentence.replace("_", correct_option, 1)
             texts.append(filled_sentence)
-            
-        return texts, None # No separate labels needed for training
+
+        return texts, None  # No separate labels needed for training
 
     else:
         # For VALIDATION: Create all possible sentences (2 for each example)
@@ -390,26 +401,29 @@ def _format_winogrande(examples, split: str):
         all_choice_texts = []
         labels = []
         for i in range(num_examples):
-            sentence = examples['sentence'][i]
-            option1 = examples['option1'][i]
-            option2 = examples['option2'][i]
-            
+            sentence = examples["sentence"][i]
+            option1 = examples["option1"][i]
+            option2 = examples["option2"][i]
+
             # Create both possible sentences
-            text_option1 = sentence.replace('_', option1, 1)
-            text_option2 = sentence.replace('_', option2, 1)
+            text_option1 = sentence.replace("_", option1, 1)
+            text_option2 = sentence.replace("_", option2, 1)
             all_choice_texts.extend([text_option1, text_option2])
-            
+
             # The 'answer' is 1 or 2; convert it to a 0-indexed label
-            label_idx = int(examples['answer'][i]) - 1
+            label_idx = int(examples["answer"][i]) - 1
             labels.append(label_idx)
-            
+
         return all_choice_texts, labels
 
-def _preprocess_task_ft(examples,
-                        split: str,
-                        task: TaskSpec,
-                        seq_len: int,
-                        tokenizer,):
+
+def _preprocess_task_ft(
+    examples,
+    split: str,
+    task: TaskInstance,
+    seq_len: int,
+    tokenizer,
+):
     if "hellaswag" in task.name:
         texts, labels = _format_hellaswag(examples, split=split)
     elif "winogrande" in task.name:
@@ -426,15 +440,14 @@ def _preprocess_task_ft(examples,
         texts, labels = _format_arc(examples, split=split)
     else:
         raise ValueError(f"Task {task.name} is not currently supported.")
-    
 
     # Tokenize all text inputs at once
     tokenized = tokenizer(
         texts,
         max_length=seq_len,
-        padding='max_length',
+        padding="max_length",
         truncation=True,
-        return_tensors="pt"
+        return_tensors="pt",
     )
 
     # if split == 'train':
@@ -442,22 +455,22 @@ def _preprocess_task_ft(examples,
     #     tokenized['labels'] = tokenized['input_ids'].clone()
     #     return tokenized
     # else:
-    if split != 'train':
+    if split != "train":
         # For validation, reshape the tokenized outputs
         num_examples = len(labels)
-        num_choices = 4  if task.task_type == 'multiclass' else 2
+        num_choices = 4 if task.task_type == "multiclass" else 2
 
         # Reshape from [batch_size * 4, seq_len] to [batch_size, 4, seq_len]
         for key in tokenized:
             tokenized[key] = tokenized[key].view(num_examples, num_choices, -1)
-        
+
         # Add the labels to the dictionary
-        tokenized['label'] = torch.tensor(labels, dtype=torch.long)
+        tokenized["label"] = torch.tensor(labels, dtype=torch.long)
     return tokenized
 
 
 def load_task_data(
-    task: "TaskSpec",
+    task: "TaskInstance",
     tokenizer,
     seq_len: int,
     split: str,
@@ -478,11 +491,11 @@ def load_task_data(
     if not task.test_available:
         if split == "train":
             # When training, use the first 90% of the original training data.
-            actual_split = f"train"
+            actual_split = "train"
         elif split == "validation":
             # When 'test' or 'validation' is requested, use the last 10% of
             # the training data as a substitute validation set.
-            actual_split = f"train"
+            actual_split = "train"
         elif split == "test":
             actual_split = "validation"
 
@@ -530,8 +543,15 @@ def load_task_data(
 
 class CachedActivationsDataset(Dataset):
     """Dataset for working with cached activations from TransformerLens."""
-    
-    def __init__(self, cache_dir, batch_mapping_location: Optional[str] = None, target_data_path=None, preload=False, transform=None):
+
+    def __init__(
+        self,
+        cache_dir,
+        batch_mapping_location: Optional[str] = None,
+        target_data_path=None,
+        preload=False,
+        transform=None,
+    ):
         """
         Args:
             cache_dir: Directory containing the cached activation files
@@ -541,44 +561,44 @@ class CachedActivationsDataset(Dataset):
         """
         self.cache_dir = cache_dir
         self.transform = transform
-        
+
         # Load batch mapping information
         if not batch_mapping_location:
             batch_mapping_location = cache_dir
         mapping_path = os.path.join(batch_mapping_location, "batch_mapping.txt")
         self.batch_mapping = pd.read_csv(mapping_path)
-        
+
         # Create a lookup from sample index to batch file
         self.sample_to_batch = {}
         self.sample_to_position = {}
         for _, row in self.batch_mapping.iterrows():
-            batch_idx = row['batch_idx']
-            start_idx = row['start_sample_idx']
-            end_idx = row['end_sample_idx']
-            
+            batch_idx = row["batch_idx"]
+            start_idx = row["start_sample_idx"]
+            end_idx = row["end_sample_idx"]
+
             for sample_idx in range(start_idx, end_idx):
                 self.sample_to_batch[sample_idx] = batch_idx
                 # Position within the batch
                 self.sample_to_position[sample_idx] = sample_idx - start_idx
-        
+
         # Get total number of samples
         self.num_samples = max(self.sample_to_batch.keys()) + 1
-        
+
         # Load targets/labels if provided
         self.targets = None
         if target_data_path:
-            if target_data_path.endswith('.csv'):
+            if target_data_path.endswith(".csv"):
                 self.targets = pd.read_csv(target_data_path)
-            elif target_data_path.endswith('.pkl'):
+            elif target_data_path.endswith(".pkl"):
                 self.targets = pd.read_pickle(target_data_path)
             else:
                 raise ValueError("Target data must be CSV or pickle format")
-        
+
         # Check the format of the activation tensors by loading the first batch
         first_batch_path = os.path.join(cache_dir, f"batch_{0:05d}.pt")
         first_batch = torch.load(first_batch_path, weights_only=True)
         self.activation_shape = first_batch.shape[1:]  # Exclude batch dimension
-        
+
         # Preload all activations if specified
         self.preloaded_activations = {}
         if preload:
@@ -586,37 +606,41 @@ class CachedActivationsDataset(Dataset):
             unique_batches = set(self.sample_to_batch.values())
             for batch_idx in tqdm(unique_batches):
                 batch_path = os.path.join(cache_dir, f"batch_{batch_idx:05d}.pt")
-                self.preloaded_activations[batch_idx] = torch.load(batch_path, weights_only=True)
-    
+                self.preloaded_activations[batch_idx] = torch.load(
+                    batch_path, weights_only=True
+                )
+
     def __len__(self):
         return self.num_samples
-    
+
     def __getitem__(self, idx):
         # Get the batch this sample belongs to
         batch_idx = self.sample_to_batch[idx]
         position = self.sample_to_position[idx]
-        
+
         # Get activation - either from preloaded memory or disk
         if batch_idx in self.preloaded_activations:
             batch_activations = self.preloaded_activations[batch_idx]
         else:
             batch_path = os.path.join(self.cache_dir, f"batch_{batch_idx:05d}.pt")
             batch_activations = torch.load(batch_path, weights_only=True)
-        
+
         # Extract the specific activation for this sample
         # Handling different possible formats from TransformerLens
         if position < batch_activations.shape[0]:
             activation = batch_activations[position]
         else:
-            raise IndexError(f"Position {position} out of bounds for batch with shape {batch_activations.shape}")
-        
+            raise IndexError(
+                f"Position {position} out of bounds for batch with shape {batch_activations.shape}"
+            )
+
         # Apply transform if specified
         if self.transform:
             activation = self.transform(activation)
-        
+
         # Get target if available
         if self.targets is not None:
-            target = torch.tensor(self.targets.iloc[idx]['target'])
+            target = torch.tensor(self.targets.iloc[idx]["target"])
             return activation, target
         else:
             return activation
@@ -637,27 +661,27 @@ class HookCache(BaseModel):
         "arbitrary_types_allowed": True,
     }
 
-    @field_validator('cache_dir')
+    @field_validator("cache_dir")
     def ensure_cache_exists(cls, v: str) -> str:
         """Validate that the cache directory exists."""
         if not os.path.isdir(v):
             raise ValueError(f"Directory {v} does not exist.")
         return v
-    
-    @field_validator('hook_list', mode='after')
+
+    @field_validator("hook_list", mode="after")
     def ensure_hooks_in_cache(cls, v: List[str], values) -> List[str]:
         """Validate that all hook directories exist in the cache."""
-        if 'cache_dir' not in values.data:
+        if "cache_dir" not in values.data:
             return v  # cache_dir validation failed, skip this check
-            
-        cache_dir = values.data['cache_dir']
+
+        cache_dir = values.data["cache_dir"]
         for hp in v:
             if not os.path.isdir(os.path.join(cache_dir, hp)):
                 raise ValueError(f"Cache for hook {hp} not found in {cache_dir}.")
         return v
-    
-    @model_validator(mode='after')
-    def setup_datasets(self) -> 'HookCache':
+
+    @model_validator(mode="after")
+    def setup_datasets(self) -> "HookCache":
         """Initialize the dataset objects after validation."""
 
         # collect and organize hooks
@@ -677,25 +701,30 @@ class HookCache(BaseModel):
             hook_dict[hook_name] = matches
 
         # run verifications
-        all_matched_hooks = [hook for hook_list in hook_dict.values() for hook in hook_list]
+        all_matched_hooks = [
+            hook for hook_list in hook_dict.values() for hook in hook_list
+        ]
 
         if len(all_matched_hooks) != len(self.hook_list):
             unrecognized_hooks = set(self.hook_list) - set(all_matched_hooks)
             raise ValueError(f"Some hooks were not recognized: {unrecognized_hooks}")
-        
+
         def get_layer_from_hook_name(hook_name: str) -> int:
             # ex) blocks.0.hook_resid_post, or blocks.0.attn.hook_attn_scores
-            return hook_name.split('.')[1]
-        
+            return hook_name.split(".")[1]
+
         def form_cached_dataset_lists(hook_type: str) -> None:
             if hook_dict[hook_type]:
                 ds_list = []
                 for layer_hook_name in hook_dict[hook_type]:
-                    ds_list.append(CachedActivationsDataset(
-                        cache_dir=os.path.join(self.cache_dir, layer_hook_name),
-                        batch_mapping_location=self.cache_dir))
+                    ds_list.append(
+                        CachedActivationsDataset(
+                            cache_dir=os.path.join(self.cache_dir, layer_hook_name),
+                            batch_mapping_location=self.cache_dir,
+                        )
+                    )
             return ds_list
-        
+
         try:
             layer_hook_type_list = ["attn_scores", "attn_out", "mlp_out", "resid"]
             for hook_type in layer_hook_type_list:
@@ -704,34 +733,36 @@ class HookCache(BaseModel):
 
             if hook_dict["embed"]:
                 self.embed = CachedActivationsDataset(
-                        cache_dir=os.path.join(self.cache_dir, "hook_embed"),
-                        batch_mapping_location=self.cache_dir)
-                
+                    cache_dir=os.path.join(self.cache_dir, "hook_embed"),
+                    batch_mapping_location=self.cache_dir,
+                )
+
             if hook_dict["output_logits"]:
                 self.output_logits = CachedActivationsDataset(
-                        cache_dir=os.path.join(self.cache_dir, "output_logits"),
-                        batch_mapping_location=self.cache_dir)
+                    cache_dir=os.path.join(self.cache_dir, "output_logits"),
+                    batch_mapping_location=self.cache_dir,
+                )
             n = len(self.attn_scores)
             for hook_type in layer_hook_type_list:
                 v = getattr(self, hook_type, [])
-                assert len(v) == n, f"Hook type {hook_type} contains {len(v)} layers/datasets, expected {n}"
+                assert len(v) == n, (
+                    f"Hook type {hook_type} contains {len(v)} layers/datasets, expected {n}"
+                )
 
         except Exception as e:
             raise ValueError(f"Failed to initialize datasets: {str(e)}")
-        
+
         return self
-    
 
 
 class ProjectorDataset(Dataset):
     def __init__(self, teacher_cache_dir: str, student_cache_dir: str):
-
         teacher_cache_dir = os.path.abspath(teacher_cache_dir)
         student_cache_dir = os.path.abspath(student_cache_dir)
 
         # Use a single lock for both directories to prevent deadlocks
         # lock_path = f"/tmp/projector_dataset_{hash(teacher_cache_dir + student_cache_dir)}.lock"
-        
+
         # with FileLock(lock_path):
         #     teacher_ds = self._get_projector_dataset(teacher_cache_dir)
         #     student_ds = self._get_projector_dataset(student_cache_dir)
@@ -755,7 +786,7 @@ class ProjectorDataset(Dataset):
     def lock(self) -> str:
         # Use a single lock for both directories to prevent deadlocks
         lock_path = f"/tmp/projector_dataset_{hash(self.teacher_cache_dir + self.student_cache_dir)}.lock"
-        
+
         # with FileLock(lock_path):
         return lock_path
 
@@ -781,7 +812,7 @@ class ProjectorDataset(Dataset):
     def _get_projector_dataset(self, cache_dir: str):
         # with FileLock(self.lock()):
         # ignore attn_scores and output_logits bc they are not in the embedding space
-        with open(Path(cache_dir)/"caching_summary.json", "r") as f:
+        with open(Path(cache_dir) / "caching_summary.json", "r") as f:
             data = json.load(f)
         cached_hook_list = data["lm_hook_points"]
         hook_cache = HookCache(cache_dir=cache_dir, hook_list=cached_hook_list)
@@ -793,12 +824,11 @@ class ProjectorDataset(Dataset):
                 for layer in act_list:
                     dataset_list.append(layer)
         return ConcatDataset(datasets=dataset_list)
-    
+
     def __len__(self):
         return self.num_rows
-    
+
     def __getitem__(self, index):
         X_teacher = self.teacher_ds[index]
         X_student = self.student_ds[index]
         return X_teacher, X_student
-    

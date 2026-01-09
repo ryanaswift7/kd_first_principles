@@ -1,6 +1,7 @@
-import json
-from typing import Set, Dict, Any
+from typing import Any, ClassVar, Dict, Set
+
 from pydantic import BaseModel
+
 
 class ConfigBase(BaseModel):
     """
@@ -8,15 +9,17 @@ class ConfigBase(BaseModel):
     Provides standardized methods for serialization, comparison, and hashing
     using Pydantic's built-in functionality.
     """
+
     # Pydantic V2+ uses a `model_config` dictionary instead of a class `Config`
     model_config = {
-        'arbitrary_types_allowed': True,
-        'extra': 'forbid',
+        "arbitrary_types_allowed": True,
+        "extra": "forbid",
     }
 
     # Subclasses should override this set to specify fields to exclude.
     # This replaces the need to manually implement `to_dict()` everywhere.
-    _heavy_fields_to_exclude: Set[str] = set()
+    # Use ClassVar to tell Pylance/Pydantic this isn't an instance field
+    _heavy_fields_to_exclude: ClassVar[Set[str]] = set()
 
     def to_config_dict(self) -> Dict[str, Any]:
         """
