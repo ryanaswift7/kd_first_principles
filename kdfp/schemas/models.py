@@ -17,6 +17,11 @@ class DistillationPair(ConfigBase):
     student: DistillationModel
 
 
+class DistillationGroups(ConfigBase):
+    shallow: DistillationPair
+    pretrained: DistillationPair
+
+
 class ModelParser(ConfigBase):
     name: str
     layer_reduction_factor: FlexFloat = None

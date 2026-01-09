@@ -1,11 +1,13 @@
+from copy import deepcopy
 from pathlib import Path
 from typing import Dict, List, Literal, Optional
 
 import lightning.pytorch as pl
+import numpy as np
 import pandas as pd
 import torch
 import yaml
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, computed_field, field_validator, model_validator
 from transformer_lens import HookedTransformer
 
 from kdfp.core.baseline import BaselineModule, BaselineModuleConfig
@@ -13,7 +15,12 @@ from kdfp.schemas.configBase import ConfigBase
 from kdfp.schemas.directories import BaseDirConfig
 from kdfp.schemas.experimentConfig import ExperimentConfig, LMConfig, TaskInstance
 from kdfp.schemas.hparams import HparamsConfig
-from kdfp.schemas.models import ModelSelection
+from kdfp.schemas.models import (
+    DistillationGroups,
+    DistillationModel,
+    DistillationPair,
+    ModelSelection,
+)
 from kdfp.schemas.objective_weights import OBJECTIVE_WEIGHT_VARIANTS_MAP
 from kdfp.schemas.projections import ProjectionConfig
 from kdfp.schemas.tasks import TaskConfig
@@ -24,7 +31,7 @@ from kdfp.utils.enums import (
     StudentReduction,
     safe_enum,
 )
-from kdfp.utils.general import get_timestamp
+from kdfp.utils.general import get_hook_block_idx, get_timestamp
 from kdfp.utils.results import generate_result
 from kdfp.utils.shallow_model_loading import get_indices_and_num_layers_to_keep
 
@@ -43,9 +50,13 @@ class SuiteConfig(ConfigBase):
     # (e.g., 'hellaswag') and the value is its config
     tasks: Dict[str, TaskConfig]
 
-    # hooks: Optional[DistillationHooks] = None
-    # dims: Optional[DistillationDims] = None
-    # layers: Optional[NumLayersConfig] = None
+    @computed_field
+    @property
+    def task_specs(self) -> List[TaskInstance]:
+        return [
+            TaskInstance(name=name, dataset_name=cfg.dataset_name, subset=cfg.subset)
+            for name, cfg in self.tasks.items()
+        ]
 
     # validator to ensure hook point keys are expected
     @field_validator("hook_types")
@@ -56,18 +67,21 @@ class SuiteConfig(ConfigBase):
         return v
 
     @model_validator(mode="after")
-    def generate_both_hook_lists(self) -> "SuiteConfig":
-        # self.hooks = DistillationHooks()
-        (teacher_narrow_hooks, teacher_narrow_dims, teacher_narrow_n_layers) = (
-            self._generate_hook_list(model_name=self.models.teacher.name)
+    def build_distill_groups(self) -> "SuiteConfig":
+        raw_teacher_pretrained: DistillationModel = self._generate_hook_list(
+            model_name=self.models.teacher.name,
         )
-        (teacher_shallow_hooks, teacher_shallow_dims, teacher_shallow_n_layers) = (
-            self._generate_hook_list(
-                model_name=self.models.teacher.name,
-                layer_reduction_factor=self.models.shallow.layer_reduction_factor,
-                selection_method="linspace",
-            )
+
+        student_pretrained: DistillationModel = self._generate_hook_list(
+            model_name=self.models.pretrained.name,
         )
+
+        teacher_shallow: DistillationModel = self._generate_hook_list(
+            model_name=self.models.teacher.name,
+            layer_reduction_factor=self.models.shallow.layer_reduction_factor,
+            selection_method="linspace",
+        )
+
         """
         - The shallow student is first n layers because once we actually load in the shallow student,
           the first n layers will be the entire student model.
@@ -75,37 +89,64 @@ class SuiteConfig(ConfigBase):
         - NOTE: for narrow students, we initialize the full hook list here and let the
                 ExperimentConfig apply the kd_layer_filter_factors
         """
-        (student_narrow_hooks, student_narrow_dims, student_narrow_n_layers) = (
-            self._generate_hook_list(model_name=self.students.narrow.name)
+        student_shallow: DistillationModel = self._generate_hook_list(
+            model_name=self.models.shallow.name,
+            layer_reduction_factor=self.models.shallow.layer_reduction_factor,
+            selection_method="first_n",
         )
-        (student_shallow_hooks, student_shallow_dims, student_shallow_n_layers) = (
-            self._generate_hook_list(
-                model_name=self.students.shallow.name,
-                layer_reduction_factor=self.students.shallow.layer_reduction_factor,
-                selection_method="first_n",
+
+        assert raw_teacher_pretrained.d_model == teacher_shallow.d_model
+
+        # need to select teacher blocks which align with the pretrained student's
+        def _filter_teacher_hooks_for_pretrained_student(
+            raw_teacher_pretrained: DistillationModel,
+            student_pretrained: DistillationModel,
+        ) -> DistillationModel:
+            # compute block indices to keep
+            # robust to student layers <= teacher layers
+            # ensures no collisions in the block indices (i.e. full distillation across all pretrained student layers)
+            teacher_n_distilled_layers = min(
+                raw_teacher_pretrained.n_distilled_layers,
+                student_pretrained.n_distilled_layers,
             )
+            selected_blocks = np.arange(teacher_n_distilled_layers)
+            selected_blocks = (
+                selected_blocks * (raw_teacher_pretrained.n_distilled_layers - 1)
+            ) // (teacher_n_distilled_layers - 1)
+            assert len(set(selected_blocks)) == len(selected_blocks)
+            selected_blocks = set(selected_blocks)
+
+            filtered_teacher_hooks = []
+            for hook in raw_teacher_pretrained.hook_list:
+                # add in all hooks outside of transformer blocks
+                if "blocks" not in hook:
+                    filtered_teacher_hooks.append(hook)
+                else:
+                    block_idx = get_hook_block_idx(hook)
+                    if block_idx in selected_blocks:
+                        filtered_teacher_hooks.append(hook)
+
+            corrected_teacher_pretrained = deepcopy(raw_teacher_pretrained)
+            corrected_teacher_pretrained.hook_list = filtered_teacher_hooks
+            corrected_teacher_pretrained.n_distilled_layers = teacher_n_distilled_layers
+
+            return corrected_teacher_pretrained
+
+        corrected_teacher_pretrained = _filter_teacher_hooks_for_pretrained_student(
+            raw_teacher_pretrained, student_pretrained
         )
 
-        teacher_hooks = ReductionHooks(
-            narrow=teacher_narrow_hooks, shallow=teacher_shallow_hooks
+        shallow_pair = DistillationPair(
+            teacher=teacher_shallow, student=student_shallow
         )
-        student_hooks = ReductionHooks(
-            narrow=student_narrow_hooks, shallow=student_shallow_hooks
+        pretrained_pair = DistillationPair(
+            teacher=corrected_teacher_pretrained,
+            student=student_pretrained,
         )
-        self.hooks = DistillationHooks(teacher=teacher_hooks, student=student_hooks)
 
-        teacher_dims = ReductionDims(
-            narrow=teacher_narrow_dims, shallow=teacher_shallow_dims
-        )
-        student_dims = ReductionDims(
-            narrow=student_narrow_dims, shallow=student_shallow_dims
-        )
-        self.dims = DistillationDims(teacher=teacher_dims, student=student_dims)
-        self.layers = NumLayersConfig(
-            teacher_narrow=teacher_narrow_n_layers,
-            teacher_shallow=teacher_shallow_n_layers,
-            student_narrow=student_narrow_n_layers,
-            student_shallow=student_shallow_n_layers,
+        self.distill_groups = DistillationGroups(
+            shallow=shallow_pair,
+            pretrained=pretrained_pair,
         )
 
         return self
@@ -123,20 +164,12 @@ class SuiteConfig(ConfigBase):
         raw_config = yaml.safe_load(yaml_str)
         return cls(**raw_config)
 
-    def generate_task_list(self) -> List[TaskInstance]:
-        tasks = []
-        # binary_tasks = []
-        for k, v in self.tasks.items():
-            t = TaskInstance(name=k, dataset_name=v.dataset_name, subset=v.subset)
-            tasks.append(t)
-        return tasks
-
     def _generate_hook_list(
         self,
         model_name: str,
         layer_reduction_factor: Optional[float] = None,
         selection_method: Optional[Literal["linspace", "first_n"]] = None,
-    ) -> List[str]:
+    ) -> DistillationModel:
         lm = HookedTransformer.from_pretrained(model_name)
         lm_cfg = lm.cfg
         del lm
@@ -161,11 +194,15 @@ class SuiteConfig(ConfigBase):
         for idx in layer_idx_list:
             for hp in self.hook_types["per_layer"]:
                 hooks.append(f"blocks.{idx}.{hp}")
-        return hooks, d_model, n_layers_to_keep
+        return DistillationModel(
+            name=model_name,
+            hook_list=hooks,
+            d_model=d_model,
+            n_distilled_layers=n_layers_to_keep,
+            layer_reduction_factor=layer_reduction_factor,
+        )
 
     def generate_experiment_list(self, debug: bool = False) -> List[ExperimentConfig]:
-        self.tasks = self.generate_task_list()
-
         base_cache_dir = self.directories.root + "/" + self.directories.cache
         base_model_dir = self.directories.root + "/" + self.directories.models
         base_scores_dir = self.directories.root + "/" + self.directories.scores
