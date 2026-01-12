@@ -34,7 +34,7 @@ from kdfp.schemas.mixins import DtypeSerializerMixin, MCEvalMixin
 from kdfp.schemas.objective_weights import ObjectiveWeights
 from kdfp.schemas.tasks import TaskInstance
 from kdfp.utils.data import load_task_data
-from kdfp.utils.enums import ProjectionDirection, ProjectorTraining
+from kdfp.utils.enums import ProjectionDirection, ProjectionTraining
 from kdfp.utils.shallow_model_loading import load_shallow
 from kdfp.utils.weight_conversion import (
     convert_hooked_to_neox_weights,
@@ -160,7 +160,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
 
     def load_projector(self):
         if self.train_config.projection:
-            if self.train_config.projection.training == ProjectorTraining.OFFLINE:
+            if self.train_config.projection.training == ProjectionTraining.OFFLINE:
                 # weights_file = Path(self.train_config.dirs.off_proj_models)
                 p = OfflineProjectorModule.load_pretrained(
                     f"{self.train_config.dirs.off_proj_models}"
@@ -169,14 +169,14 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 return p.extract_single_direction(
                     self.train_config.projection.direction
                 ).eval()
-            elif self.train_config.projection.training == ProjectorTraining.ONLINE:
+            elif self.train_config.projection.training == ProjectionTraining.ONLINE:
                 return OnlineProjector(
                     teacher_dim=self.train_config.teacher_cfg.d_model,
                     student_dim=self.train_config.student_cfg.d_model,
                     direction=self.train_config.projection.direction,
                     torch_dtype=self.train_config.torch_dtype,
                 ).train()
-            elif self.train_config.projection.training == ProjectorTraining.RANDOMIZED:
+            elif self.train_config.projection.training == ProjectionTraining.RANDOMIZED:
                 return RandomizedProjector(
                     teacher_dim=self.train_config.teacher_cfg.d_model,
                     student_dim=self.train_config.student_cfg.d_model,

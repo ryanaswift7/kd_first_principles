@@ -2,84 +2,34 @@ import os
 import shutil
 import warnings
 from pathlib import Path
-from typing import List, Literal, Optional, Union
+from typing import List, Literal, Optional
 
 import lightning.pytorch as pl
 import pandas as pd
-from pydantic import model_validator
 
 from kdfp.core.hf_tester import HFTesterModule, HFTesterModuleConfig
-from kdfp.core.projector import OfflineProjectorModule, OnlineProjector
+from kdfp.core.projector import OfflineProjectorModule
 from kdfp.core.projector.offline.offlineProjector import gen_off_proj_weights_filename
-from kdfp.core.projector.randomized import RandomizedProjector
 from kdfp.core.student.student import StudentModule
 from kdfp.core.teacher import TeacherModule, gen_teacher_weights_filename
 from kdfp.schemas.configBase import ConfigBase
-from kdfp.schemas.directories import ExpDirConfig
+from kdfp.schemas.directories import ExpInstDirs
+from kdfp.schemas.experiments.experimentConfig import ExperimentConfig
 from kdfp.schemas.hparams import HparamsConfig
-from kdfp.schemas.lmConfig import LMConfig
-from kdfp.schemas.objective_weights import ObjectiveWeights
-from kdfp.schemas.projections import ProjectionInstance
 from kdfp.schemas.tasks import TaskInstance
 from kdfp.schemas.trainingParams import TrainingParamsConfig
 from kdfp.utils.activation_caching import activation_caching
-from kdfp.utils.enums import ProjectorTraining, StudentReduction
+from kdfp.utils.enums import ProjectionTraining
 from kdfp.utils.general import get_timestamp
 from kdfp.utils.results import generate_result
 
 
-class ExperimentConfig(ConfigBase):
-    name: str
-    reduction: StudentReduction
-    teacher_cfg: LMConfig
-    student_cfg: LMConfig
-    dirs: ExpDirConfig
+class ExperimentInstance(ConfigBase):
+    cfg: ExperimentConfig
+    dirs: ExpInstDirs
     training_params: TrainingParamsConfig
-    lm_params: LMParamsConfig
-    projection: Optional[ProjectionInstance]
-    objective_weight_variant: str
-    objective_weights: ObjectiveWeights
-    jsd_beta: Optional[float]
     hparams: HparamsConfig
-    tasks: List[TaskInstance]
-
-    @model_validator(mode="after")
-    def validate_and_transform_config(self) -> "ExperimentConfig":
-        if self.projection:
-            if self.reduction == StudentReduction.SHALLOW:
-                # all of the fields are already none but I'd prefer
-                # to also make the whole object None
-                self.projection = None
-
-            elif self.projection.training != ProjectorTraining.OFFLINE:
-                self.projection.offline_projector_alignment_beta = None
-                self.projection.offline_projector_training_args = None
-        return self
-
-    def pretty_print_config(self) -> None:
-        """Pretty-prints the complete configuration using Pydantic's JSON serialization."""
-        print(self.model_dump_json(indent=4))
-
-    def save_config_json(self, save_dir: Union[str, Path]) -> Path:
-        """
-        Saves the complete configuration to a 'config.json' file.
-
-        Args:
-            save_dir: The directory where the config file will be saved.
-
-        Returns:
-            The path to the saved JSON file.
-        """
-        save_path = Path(save_dir)
-        save_path.mkdir(parents=True, exist_ok=True)
-        file_path = save_path / "config.json"
-
-        # Pydantic's model_dump_json handles the entire serialization process,
-        # including nested models, Path objects, enums, etc.
-        file_path.write_text(self.model_dump_json(indent=4))
-
-        print(f"Configuration saved to: {file_path}")
-        return file_path
+    task_list: List[TaskInstance]
 
     # only offline projectors are initialized here bc don't want to pass in models to
     # lightning modules, so I load them in the student module
@@ -89,7 +39,7 @@ class ExperimentConfig(ConfigBase):
         # save_dir: str,
         teacher_dir: Optional[str] = None,
         student_dir: Optional[str] = None,
-    ) -> OfflineProjectorModule:
+    ) -> None:
         """Initialize the offline projector for an experiment. Defaults to pretrained teacher
         and student, but you may use a custom version instead by passing in the directories.
         """
@@ -97,11 +47,11 @@ class ExperimentConfig(ConfigBase):
         off_proj_weights_path = Path(
             self.dirs.off_proj_models
         ) / gen_off_proj_weights_filename(
-            alignment_beta=self.projection.offline_projector_alignment_beta
+            alignment_beta=self.cfg.projection.offline_alignment_beta
         )
         if off_proj_weights_path.exists():
             print(
-                f"Pretrained offline projector for with alignment beta '{self.projection.offline_projector_alignment_beta}' located at: {str(off_proj_weights_path)}"
+                f"Pretrained offline projector for with alignment beta '{self.cfg.projection.offline_alignment_beta}' located at: {str(off_proj_weights_path)}"
             )
 
             # p = OfflineProjectorModule.load_pretrained(self.dirs.off_proj_model)
@@ -161,53 +111,51 @@ class ExperimentConfig(ConfigBase):
                 val_split=0.1,
                 test_split=0.1,
             )
-            projector.save_pretrained(path=self.dirs.off_proj_models)
+            projector.save_pretrained(path=self.dirs.off_proj_models)  # type: ignore
             # load_test = OfflineProjector.load_pretrained(save_path=self.dirs.off_proj_models)
             # return projector.extract_single_direction(direction=self.projection.direction)
 
-    def init_online_projector(self):
-        return OnlineProjector(
-            teacher_dim=self.teacher_cfg.d_model,
-            student_dim=self.student_cfg.d_model,
-            direction=self.projection.direction,
-            torch_dtype=self.torch_dtype,
-        )
+    # def init_online_projector(self):
+    #     return OnlineProjector(
+    #         teacher_dim=self.cfg.distill_pair.teacher.d_model,
+    #         student_dim=self.cfg.distill_pair.student.d_model,
+    #         direction=self.cfg.projection.direction,  # type: ignore
+    #         torch_dtype=self.training_params.torch_dtype,
+    #     )
 
-    def init_randomized_projector(self):
-        return RandomizedProjector(
-            teacher_dim=self.teacher_cfg.d_model,
-            student_dim=self.student_cfg.d_model,
-            direction=self.projection.direction,
-            torch_dtype=self.torch_dtype,
-        )
+    # def init_randomized_projector(self):
+    #     return RandomizedProjector(
+    #         teacher_dim=self.cfg.distill_pair.teacher.d_model,
+    #         student_dim=self.cfg.distill_pair.student.d_model,
+    #         direction=self.cfg.projection.direction,  # type: ignore
+    #         torch_dtype=self.training_params.torch_dtype,
+    #     )  # type: ignore
 
     def init_projector(self) -> None:
         """Initialize projector for an experiment. kwargs are for init_offline_projector."""
-        if self.projection:
-            if self.projection.training == ProjectorTraining.ONLINE:
-                # self.init_online_projector()
+        if proj := self.cfg.projection:
+            if proj.training_method == ProjectionTraining.ONLINE:
                 print(
-                    f"{self.projection.training.value.upper()} projector will be initalized during the experiment."
+                    f"{proj.training_method.value.upper()} projector will be initalized during the experiment."
                 )
 
-            elif self.projection.training == ProjectorTraining.OFFLINE:
+            elif proj.training_method == ProjectionTraining.OFFLINE:
                 print(
-                    f"{self.projection.training.value.upper()} projector initializtion starting..."
+                    f"{proj.training_method.value.upper()} projector initializtion starting..."
                 )
                 self._init_offline_projector()
                 print(
-                    f"{self.projection.training.value.upper()} projector initializtion complete!"
+                    f"{proj.training_method.value.upper()} projector initializtion complete!"
                 )
 
-            elif self.projection.training == ProjectorTraining.RANDOMIZED:
-                # self.init_randomized_projector()
+            elif proj.training_method == ProjectionTraining.RANDOMIZED:
                 print(
-                    f"{self.projection.training.value.upper()} projector will be initalized during the experiment."
+                    f"{proj.training_method.value.upper()} projector will be initalized during the experiment."
                 )
 
             else:
                 raise ValueError(
-                    f"Invalid projection training specified: {self.projection.training}."
+                    f"Invalid projection training specified: {proj.training_method}."
                 )
 
         return
@@ -225,9 +173,8 @@ class ExperimentConfig(ConfigBase):
             )
         else:
             t = TeacherModule.create(
-                lm_name=self.teacher_cfg.model_name,
+                lm_name=self.cfg.distill_pair.teacher.name,
                 task=task,
-                lm_params=self.lm_params,
                 hyperparams=self.hparams,
                 training_params=self.training_params,
                 dirs=self.dirs,
@@ -235,10 +182,12 @@ class ExperimentConfig(ConfigBase):
             t.save_pretrained(path=f"{self.dirs.teacher_model}/{task.name}")
 
     def init(self) -> None:
-        """Initialize teachers, student, and projector"""
-        self.init_projector()
-        for task in self.tasks:
-            self.init_teacher_by_task(task)
+        """Initialize finetuned teachers and projectors (if necessary)"""
+        if self.cfg.projection:
+            self.init_projector()
+        if self.training_params.controls.finetune_teacher:
+            for task in self.task_list:
+                self.init_ft_teacher_by_task(task)
 
     def cleanup_log_dirs(self) -> None:
         shutil.rmtree(self.dirs.ray, ignore_errors=True)
@@ -256,15 +205,17 @@ class ExperimentConfig(ConfigBase):
     def run(self) -> List[dict]:
         results_list = []
 
-        for i, task in enumerate(self.tasks):
-            print(f"\nRunning task {i + 1}/{len(self.tasks)}: '{task.name.upper()}'...")
+        for i, task in enumerate(self.task_list):
+            print(
+                f"\nRunning task {i + 1}/{len(self.task_list)}: '{task.name.upper()}'..."
+            )
 
             # DO NOT OVERWRITE EXISTING MODELS
             model_save_dir = f"{self.dirs.student_model}/{task.name}"
             if os.path.isdir(model_save_dir) and os.listdir(model_save_dir):
                 warnings.warn(
                     "Student model directory exists and is not empty!\n"
-                    + f"Skipping experiment {self.name.upper()} to avoid overwriting models..."
+                    + f"Skipping experiment {self.cfg.name.upper()} to avoid overwriting models..."
                 )
                 continue
 
@@ -301,7 +252,9 @@ class ExperimentConfig(ConfigBase):
                 scores_dir / f"results_df_{get_timestamp()}.parquet"
             )
 
-            print(f"\nFinished task {i + 1}/{len(self.tasks)}: '{task.name.upper()}'!")
+            print(
+                f"\nFinished task {i + 1}/{len(self.task_list)}: '{task.name.upper()}'!"
+            )
         self.cleanup_log_dirs()
         return results_list
 
@@ -309,7 +262,7 @@ class ExperimentConfig(ConfigBase):
         print(f"Running tests on student {self.name}...")
         results_list = []
 
-        for i, task in enumerate(self.tasks):
+        for i, task in enumerate(self.task_list):
             print(f"\nBenchmarking student {self.name} on task {task.name.upper()}...")
             student_save_dir = f"{self.dirs.student_model}/{task.name}"
             if mode == "pl":
@@ -354,7 +307,7 @@ class ExperimentConfig(ConfigBase):
         print("Running tests on teachers...")
         results_list = []
 
-        for i, task in enumerate(self.tasks):
+        for i, task in enumerate(self.task_list):
             print(f"\nBenchmarking teacher finetuned on task {task.name.upper()}...")
             teacher_save_dir = f"{self.dirs.teacher_model}/{task.name}"
 

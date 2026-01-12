@@ -1,10 +1,10 @@
-from typing import List, Literal, Optional, Union
+from typing import Literal, Optional
 
 import torch
-from pydantic import computed_field
 
 from kdfp.schemas.configBase import ConfigBase
 from kdfp.schemas.mixins import DtypeSerializerMixin
+from kdfp.schemas.projections import OffProjTrainArgs
 
 
 class ResourceConfig(ConfigBase):
@@ -29,18 +29,12 @@ class TrainingControls(ConfigBase):
     testing_mode: Literal["pl", "hf"]
 
 
-class ObjectiveParams(ConfigBase):
-    weight_variants: List[str]
-    jsd_betas: List[float]
-
-
 class WandbParams(ConfigBase):
     project: str
     group: str
 
 
 class TrainingParamsConfig(ConfigBase, DtypeSerializerMixin):
-    seeds: List[int]
     seq_len: int
     train_batch_size: int
     test_batch_size: int
@@ -49,13 +43,8 @@ class TrainingParamsConfig(ConfigBase, DtypeSerializerMixin):
     n_trials: int
     reproducible_backend: bool
     device: str
-    torch_dtype: Union[str, torch.dtype]
+    torch_dtype: torch.dtype
     controls: TrainingControls
-    objective: ObjectiveParams
     resources: ExperimentResources
+    offline_projection: OffProjTrainArgs
     wandb: WandbParams
-
-    @computed_field
-    @property
-    def default_seed(self) -> int:
-        return self.seeds[0]

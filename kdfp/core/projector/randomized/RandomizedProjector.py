@@ -1,14 +1,18 @@
 import torch
 import torch.nn as nn
-from kdfp.utils.enums import ProjectionDirection
 import torch.nn.functional as F
 
+from kdfp.utils.enums import ProjectionDirection
+
+
 class RandomizedProjector(nn.Module):
-    def __init__(self,
-                 teacher_dim: int,
-                 student_dim: int,
-                 direction: ProjectionDirection,
-                 torch_dtype: torch.dtype):
+    def __init__(
+        self,
+        teacher_dim: int,
+        student_dim: int,
+        direction: ProjectionDirection,
+        torch_dtype: torch.dtype,
+    ):
         super(RandomizedProjector, self).__init__()
         self.teacher_dim = teacher_dim
         self.student_dum = student_dim
@@ -34,12 +38,14 @@ class RandomizedProjector(nn.Module):
         p /= torch.sqrt(torch.tensor(student_dim))
 
         if direction == ProjectionDirection.UP:
-            scaling_adjustment = torch.sqrt(torch.tensor(student_dim)) / torch.sqrt(torch.tensor(teacher_dim))
+            scaling_adjustment = torch.sqrt(torch.tensor(student_dim)) / torch.sqrt(
+                torch.tensor(teacher_dim)
+            )
             p = p.T * scaling_adjustment
 
-        self.register_buffer('projection_matrix', p)
+        self.register_buffer("projection_matrix", p)
 
     def forward(self, x):
         # F.linear has an implicit transpose, so I transpose it back
         # I could instead create a transposed matrix, but I find this more intuitive
-        return F.linear(x, self.projection_matrix.T)
+        return F.linear(x, self.projection_matrix.T)  # type: ignore

@@ -2,29 +2,32 @@ import torch
 from pydantic import field_serializer, field_validator
 from transformer_lens import HookedTransformer
 
+
 class DtypeSerializerMixin:
     """A mixin to provide serialization for a 'dtype' field."""
-    @field_validator('torch_dtype')
+
+    @field_validator("torch_dtype", mode="before")
     def validate_dtype(cls, v):
         if isinstance(v, str):
             v = getattr(torch, v)
         return v
-    
-    @field_serializer('torch_dtype')
+
+    @field_serializer("torch_dtype")
     def serialize_dtype(self, torch_dtype: torch.dtype) -> str:
         # Converts torch.float32 -> "float32"
-        return str(torch_dtype).split('.')[-1]
-    
+        return str(torch_dtype).split(".")[-1]
+
+
 class MCEvalMixin:
     def _shared_eval_step(self, model, batch, batch_idx):
         # The batch contains tensors of shape [batch_size, num_task_choices, seq_len]
-        batch_size, num_choices, seq_len = batch['input_ids'].shape
-        true_labels = batch['label']
+        batch_size, num_choices, seq_len = batch["input_ids"].shape
+        true_labels = batch["label"]
 
         # 1. Reshape inputs for a single, efficient forward pass
         # Shape becomes [batch_size * num_task_choices, seq_len]
-        input_ids = batch['input_ids'].view(-1, seq_len)
-        attention_mask = batch['attention_mask'].view(-1, seq_len)
+        input_ids = batch["input_ids"].view(-1, seq_len)
+        # attention_mask = batch["attention_mask"].view(-1, seq_len)
 
         # 2. Perform one forward pass for all choices in the batch
         with torch.no_grad():
@@ -43,16 +46,18 @@ class MCEvalMixin:
         shift_labels = input_ids[..., 1:].contiguous()
 
         # Use reduction='none' to get the loss for each token individually
-        loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-        
-        nll_per_token = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+
+        nll_per_token = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+        )
+
         # Reshape the per-token losses to match the sequence structure
         nll_per_token = nll_per_token.view(batch_size * num_choices, -1)
-        
+
         # Ignore the loss for padding tokens by setting them to zero
-        nll_per_token[shift_labels == self.tokenizer.pad_token_id] = 0
-        
+        nll_per_token[shift_labels == self.tokenizer.pad_token_id] = 0  # type: ignore
+
         # Sum the NLL for each sequence to get a score per choice
         nll_scores = nll_per_token.sum(dim=1)
 
@@ -62,6 +67,7 @@ class MCEvalMixin:
 
         # The prediction is the choice with the minimum NLL
         preds = torch.argmin(choice_nll_scores, dim=1)
-        correct_choice_loss = choice_nll_scores[torch.arange(batch_size), true_labels].mean()
+        correct_choice_loss = choice_nll_scores[
+            torch.arange(batch_size), true_labels
+        ].mean()
         return preds, true_labels, correct_choice_loss
-    
