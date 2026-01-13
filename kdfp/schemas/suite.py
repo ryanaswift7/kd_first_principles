@@ -1,12 +1,16 @@
 from copy import deepcopy
+from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
 
+import lightning.pytorch as pl
 import numpy as np
+import pandas as pd
 import torch
 import yaml
 from pydantic import Field, computed_field, field_validator, model_validator
 from transformer_lens import HookedTransformer
 
+from kdfp.core.baseline import BaselineModule, BaselineModuleConfig
 from kdfp.schemas.configBase import ConfigBase
 from kdfp.schemas.directories import DirectoryParser
 from kdfp.schemas.experiments.experimentInstance import (
@@ -17,23 +21,24 @@ from kdfp.schemas.experiments.experimentSpace import ExperimentSpace
 from kdfp.schemas.hparams import HparamsConfig
 from kdfp.schemas.models import (
     DistillationGroups,
-    DistillationModel,
+    DistillationModelConfig,
     DistillationPair,
     ModelSelection,
 )
 from kdfp.schemas.projections import ProjectionParser
 from kdfp.schemas.tasks import TaskConfig
-from kdfp.schemas.trainingParams import TrainingParamsConfig
-from kdfp.utils.general import get_hook_block_idx
+from kdfp.schemas.trainingParams import TrainingParams
+from kdfp.utils.general import get_hook_block_idx, get_timestamp
+from kdfp.utils.results import generate_result
 from kdfp.utils.shallow_model_loading import get_indices_and_num_layers_to_keep
 
 
-class SuiteConfig(ConfigBase):
+class Suite(ConfigBase):
     suite_title: str
     models: ModelSelection
     parsed_dirs: DirectoryParser
     experiment_space: ExperimentSpace
-    training_params: TrainingParamsConfig
+    training_params: TrainingParams
     hook_types: Dict[str, List[str]] = Field(
         ..., description="Keys 'single' and 'per_layer' with lists of hook names"
     )
@@ -60,16 +65,16 @@ class SuiteConfig(ConfigBase):
         return v
 
     @model_validator(mode="after")
-    def build_distill_groups(self) -> "SuiteConfig":
-        raw_teacher_pretrained: DistillationModel = self._generate_hook_list(
+    def build_distill_groups(self) -> "Suite":
+        raw_teacher_pretrained: DistillationModelConfig = self._generate_hook_list(
             model_name=self.models.teacher.name,
         )
 
-        student_pretrained: DistillationModel = self._generate_hook_list(
+        student_pretrained: DistillationModelConfig = self._generate_hook_list(
             model_name=self.models.pretrained.name,
         )
 
-        teacher_shallow: DistillationModel = self._generate_hook_list(
+        teacher_shallow: DistillationModelConfig = self._generate_hook_list(
             model_name=self.models.teacher.name,
             layer_reduction_factor=self.models.shallow.layer_reduction_factor,
             selection_method="linspace",
@@ -82,7 +87,7 @@ class SuiteConfig(ConfigBase):
         - NOTE: for narrow students, we initialize the full hook list here and let the
                 ExperimentConfig apply the kd_layer_filter_factors
         """
-        student_shallow: DistillationModel = self._generate_hook_list(
+        student_shallow: DistillationModelConfig = self._generate_hook_list(
             model_name=self.models.shallow.name,
             layer_reduction_factor=self.models.shallow.layer_reduction_factor,
             selection_method="first_n",
@@ -92,9 +97,9 @@ class SuiteConfig(ConfigBase):
 
         # need to select teacher blocks which align with the pretrained student's
         def _filter_teacher_hooks_for_pretrained_student(
-            raw_teacher_pretrained: DistillationModel,
-            student_pretrained: DistillationModel,
-        ) -> DistillationModel:
+            raw_teacher_pretrained: DistillationModelConfig,
+            student_pretrained: DistillationModelConfig,
+        ) -> DistillationModelConfig:
             """
             - compute block indices to keep
             - robust to student layers <= teacher layers
@@ -148,7 +153,7 @@ class SuiteConfig(ConfigBase):
 
     # Class method to load from a YAML file
     @classmethod
-    def from_yaml(cls, file_path: str) -> "SuiteConfig":
+    def from_yaml(cls, file_path: str) -> "Suite":
         with open(file_path, "r") as f:
             raw_config = yaml.safe_load(f)
         return cls(**raw_config)
@@ -158,7 +163,7 @@ class SuiteConfig(ConfigBase):
         model_name: str,
         layer_reduction_factor: Optional[float] = None,
         selection_method: Optional[Literal["linspace", "first_n"]] = None,
-    ) -> DistillationModel:
+    ) -> DistillationModelConfig:
         lm = HookedTransformer.from_pretrained(model_name)
         lm_cfg = lm.cfg
         del lm
@@ -183,7 +188,7 @@ class SuiteConfig(ConfigBase):
         for idx in layer_idx_list:
             for hp in self.hook_types["per_layer"]:
                 hooks.append(f"blocks.{idx}.{hp}")
-        return DistillationModel(
+        return DistillationModelConfig(
             name=model_name,
             hook_list=hooks,
             d_model=d_model,
@@ -227,109 +232,55 @@ class SuiteConfig(ConfigBase):
 
         return sorted_experiment_list, sorted(exp_names)
 
-    # def run_baseline_tests(self) -> List[dict]:
-    #     pl.seed_everything(seed=self.training_params.seed, workers=True)
-    #     results_list = []
+    def run_baseline_teacher_tests(self) -> List[dict]:
+        pl.seed_everything(seed=self.experiment_space.default_seed, workers=True)
+        results_list = []
 
-    #     def trainer_factory() -> pl.Trainer:
-    #         return pl.Trainer(
-    #             accelerator="gpu",
-    #             strategy="auto",
-    #             devices=1,
-    #             deterministic=self.training_params.reproducible_backend,
-    #             default_root_dir=self.parsed_dirs.root
-    #             + "/"
-    #             + self.parsed_dirs.lightning,
-    #         )
+        def trainer_factory() -> pl.Trainer:
+            return pl.Trainer(
+                accelerator="gpu",
+                strategy="auto",
+                devices=1,
+                deterministic=self.training_params.reproducible_backend,
+                default_root_dir=self.parsed_dirs.root
+                + "/"
+                + self.parsed_dirs.lightning,
+            )
 
-    #     for task in self.tasks:
-    #         base_teacher_cfg = BaselineModuleConfig(
-    #             model_name=self.teacher_name,
-    #             is_shallow=False,
-    #             task=task,
-    #             seq_len=self.training_params.seq_len,
-    #             batch_size=self.lm_params.test_batch_size,
-    #             seed=self.training_params.seed,
-    #             torch_dtype=self.training_params.torch_dtype,
-    #             num_data_workers=self.training_params.resources.teacher.num_data_workers,
-    #             n_samples=self.lm_params.num_samples,
-    #             layer_reduction_factor=None,
-    #         )
-    #         base_teacher_module = BaselineModule(base_teacher_cfg)
-    #         base_teacher_module.print_param_count("base_teacher")
-    #         base_teacher_results = trainer_factory().test(
-    #             model=base_teacher_module, verbose=True
-    #         )
-    #         results_list.append(
-    #             generate_result(
-    #                 name="base_teacher",
-    #                 model=base_teacher_module.model,
-    #                 task_name=task.name,
-    #                 metric_name="accuracy",
-    #                 score=base_teacher_results[0]["test_acc"],
-    #             )
-    #         )
+        for task in self.task_list:
+            base_teacher_cfg = BaselineModuleConfig(
+                model_name=self.models.teacher.name,
+                is_shallow=False,
+                task=task,
+                seq_len=self.training_params.seq_len,
+                batch_size=self.training_params.test_batch_size,
+                seed=self.experiment_space.default_seed,
+                torch_dtype=self.training_params.torch_dtype,
+                num_data_workers=self.training_params.resources.teacher.num_data_workers,
+                n_samples=self.training_params.num_samples,
+                layer_reduction_factor=None,
+            )
+            base_teacher_module = BaselineModule(base_teacher_cfg)
+            base_teacher_module.print_param_count("base_teacher")
+            base_teacher_results = trainer_factory().test(
+                model=base_teacher_module, verbose=True
+            )
+            results_list.append(
+                generate_result(
+                    name="base_teacher",
+                    model=base_teacher_module.model,
+                    task_name=task.name,
+                    metric_name="accuracy",
+                    score=base_teacher_results[0]["test_acc"],
+                )
+            )
 
-    #         base_narrow_student_cfg = BaselineModuleConfig(
-    #             model_name=self.students.narrow.name,
-    #             is_shallow=False,
-    #             task=task,
-    #             seq_len=self.training_params.seq_len,
-    #             batch_size=self.lm_params.test_batch_size,
-    #             seed=self.training_params.seed,
-    #             torch_dtype=self.training_params.torch_dtype,
-    #             num_data_workers=self.training_params.resources.student.num_data_workers,
-    #             n_samples=self.lm_params.num_samples,
-    #             layer_reduction_factor=None,
-    #         )
-    #         base_narrow_student_module = BaselineModule(base_narrow_student_cfg)
-    #         base_narrow_student_module.print_param_count("base_narrow")
-    #         base_narrow_student_results = trainer_factory().test(
-    #             base_narrow_student_module
-    #         )
-    #         results_list.append(
-    #             generate_result(
-    #                 name="base_narrow",
-    #                 model=base_narrow_student_module.model,
-    #                 task_name=task.name,
-    #                 metric_name="accuracy",
-    #                 score=base_narrow_student_results[0]["test_acc"],
-    #             )
-    #         )
+            scores_dir = (
+                Path(self.parsed_dirs.root) / self.parsed_dirs.scores / "baselines"
+            )
+            scores_dir.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(results_list).to_parquet(
+                scores_dir / f"results_df_{get_timestamp()}.parquet"
+            )
 
-    #         base_shallow_student_cfg = BaselineModuleConfig(
-    #             model_name=self.students.shallow.name,
-    #             is_shallow=True,
-    #             task=task,
-    #             seq_len=self.training_params.seq_len,
-    #             batch_size=self.lm_params.test_batch_size,
-    #             seed=self.training_params.seed,
-    #             torch_dtype=self.training_params.torch_dtype,
-    #             num_data_workers=self.training_params.resources.student.num_data_workers,
-    #             n_samples=self.lm_params.num_samples,
-    #             layer_reduction_factor=self.students.shallow.layer_reduction_factor,
-    #         )
-    #         base_shallow_student_module = BaselineModule(base_shallow_student_cfg)
-    #         base_shallow_student_module.print_param_count("base_shallow")
-    #         base_shallow_student_results = trainer_factory().test(
-    #             base_shallow_student_module
-    #         )
-    #         results_list.append(
-    #             generate_result(
-    #                 name="base_shallow",
-    #                 model=base_shallow_student_module.model,
-    #                 task_name=task.name,
-    #                 metric_name="accuracy",
-    #                 score=base_shallow_student_results[0]["test_acc"],
-    #             )
-    #         )
-
-    #         scores_dir = (
-    #             Path(self.parsed_dirs.root) / self.parsed_dirs.scores / "baselines"
-    #         )
-    #         scores_dir.mkdir(parents=True, exist_ok=True)
-    #         pd.DataFrame(results_list).to_parquet(
-    #             scores_dir / f"results_df_{get_timestamp()}.parquet"
-    #         )
-
-    #     return results_list
+        return results_list

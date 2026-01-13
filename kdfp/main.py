@@ -5,7 +5,7 @@ from pathlib import Path
 import pandas as pd
 import torch
 
-from kdfp.schemas.suiteConfig import SuiteConfig
+from kdfp.schemas.suite import Suite
 from kdfp.utils.general import get_timestamp
 
 DEFAULT_CONFIG = "kdfp/configs/base.yaml"
@@ -32,9 +32,9 @@ def main(config_path: str):
     os.environ["TOKENIZERS_PARALLELISM"] = "true"
     torch.set_float32_matmul_precision("medium")
 
-    config = SuiteConfig.from_yaml(config_path)
+    suite = Suite.from_yaml(config_path)
 
-    experiment_list, experiment_names = config.generate_experiment_list()
+    experiment_list, experiment_names = suite.generate_experiment_list()
     n = len(experiment_names)
     print(f"A total of {n} experiments have been specified:")
     for i, name in enumerate(experiment_names):
@@ -45,10 +45,10 @@ def main(config_path: str):
 
     results_list = []
 
-    # if config.training_params.get_baselines:
-    #     print("\nBeginning baseline testing...")
-    #     results_list.extend(config.run_baseline_tests())
-    #     print("Baseline testing complete!")
+    if suite.training_params.controls.get_baselines:
+        print("\nBeginning baseline teacher testing...")
+        results_list.extend(suite.run_baseline_teacher_tests())
+        print("Baseline teacher testing complete!")
 
     print("\nStarting experiment runs...")
     for i, experiment in enumerate(experiment_list):
@@ -59,28 +59,30 @@ def main(config_path: str):
         # We can get them from any experiment and only need to do it once, might as well
         # do the first one
 
-        # if i == 0 and config.training_params.get_baselines:
-        #     print("\nBeginning teacher testing...")
-        #     results_list.extend(
-        #         experiment.test_teachers(mode=config.training_params.controls.testing_mode)
-        #     )
-        #     print("Teacher testing complete!\n")
+        if i == 0 and suite.training_params.controls.get_baselines:
+            print("\nBeginning teacher testing...")
+            results_list.extend(
+                experiment.test_teachers(
+                    mode=suite.training_params.controls.testing_mode
+                )
+            )
+            print("Teacher testing complete!\n")
 
-        if config.training_params.controls.run_or_test == "run":
+        if suite.training_params.controls.run_or_test == "run":
             # this creates models, then tests them
             results_list.extend(experiment.run())
         else:
             # this tests existing models
             results_list.extend(
                 experiment.test_student(
-                    mode=config.training_params.controls.testing_mode
+                    mode=suite.training_params.controls.testing_mode
                 )
             )
 
         print(f"Finished experiment {i + 1}/{n}: {experiment.cfg.name.upper()}")
 
     base_scores_dir = Path(
-        config.parsed_dirs.root + "/" + config.parsed_dirs.scores
+        suite.parsed_dirs.root + "/" + suite.parsed_dirs.scores
     ).resolve()
     base_scores_dir.mkdir(parents=True, exist_ok=True)
     df_path = base_scores_dir / f"results_df_{get_timestamp()}.parquet"
@@ -91,12 +93,6 @@ def main(config_path: str):
         f"Results dataframe for experiment configuration {config_path} saved in Parquet format to:\n\t{df_path}\n"
     )
     print(results_df)
-
-    #     new_row = pd.DataFrame([dict(zip(result_df.columns.tolist(), results))])
-    #     result_df = pd.concat([result_df, new_row], ignore_index=True)
-
-    # columns.extend(["average", "relative lift over baseline"])
-    # analyze(result_df)
 
 
 def cli_main():

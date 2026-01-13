@@ -16,8 +16,12 @@ from tqdm.auto import tqdm
 # )
 from transformer_lens import HookedTransformer
 
+from kdfp.schemas.experiments.experimentConfig import ExperimentConfig
+from kdfp.schemas.models import DistillationModelConfig
+from kdfp.schemas.trainingParams import TrainingParams
+
 from .data import load_data
-from .general import cleanup_resources, set_all_seeds, set_device, set_vram_limit
+from .general import cleanup_resources
 
 
 def parse_args():
@@ -182,37 +186,17 @@ def prepare_lm_and_dataloader(
     shuffle: bool = False,
     lm_dir: Optional[str] = None,
     total_tokens: Optional[int] = None,
-    num_workers: Optional[int] = None,
+    num_workers: int = 0,
 ):
     """Load model, sae, and dataset based on args."""
     if lm_dir:
         print(f"Loading model {lm_name} from local version in {lm_dir}")
 
-    # N_DEVICES = 1
-
-    # # may be the case that there is no sae yet (lm training)
-    # sae = None
-    # if args.cache_mode in ["sae", "both"]:
-    #     sae = SAE.load_from_pretrained(args.sae_dir)
-    #     lm = HookedSAETransformer.from_pretrained_no_processing(
-    #                     args.model_name,
-    #                     **sae.cfg.model_from_pretrained_kwargs,
-    #                     n_devices=N_DEVICES,
-    #                     )
-    # else:
-    lm = HookedTransformer.from_pretrained_no_processing(
-        lm_name, dtype=torch_dtype
-    )  # , n_devices=N_DEVICES)
+    lm = HookedTransformer.from_pretrained_no_processing(lm_name, dtype=torch_dtype)
     tokenizer = lm.tokenizer
 
     if lm_dir:
         lm.load_state_dict(torch.load(f"{lm_dir}/state_dict.pt", weights_only=True))
-
-    # only load weights for modified models
-    # if not args.unmodified:
-    #     # not strict because projector parameters are saved here as well for online students
-    #     lm_weights = torch.load(f"{args.lm_dir}/weights_final.pt", weights_only=True)
-    #     lm.load_state_dict(lm_weights, strict=False)
 
     # load selected number of data samples
     n_samples = math.floor(total_tokens / seq_len) if total_tokens else None
@@ -397,43 +381,31 @@ def is_cache_complete(
 
 
 def activation_caching(
-    lm_name: str,
-    lm_hook_points: List[str],
-    dataset_name: str,
-    dataset_subset: Optional[str],
-    split: str,
-    seq_len: int,
-    batch_size: int,
+    lm_cfg: DistillationModelConfig,
     cache_dir: str,
-    torch_dtype: torch.dtype,
-    token_rename: bool = False,
-    shuffle: bool = False,
-    lm_dir: Optional[str] = None,
-    total_tokens: Optional[int] = None,
-    num_workers: Optional[int] = None,
-    force_cache_all: bool = False,
+    train_params: TrainingParams,
     cache_outputs: bool = False,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    lm_dir: Optional[str] = None,
 ) -> Tuple[str, int]:
-    lm_act_cache_dir = (
-        f"{cache_dir}/{lm_name.split('/')[1]}/{dataset_name.split('/')[1]}"
-    )
+    lm_act_cache_dir = f"{cache_dir}/{lm_cfg.name.split('/')[1]}/{train_params.offline_projection.dataset.name.split('/')[1]}"
+    os.makedirs(lm_act_cache_dir, exist_ok=True)
 
     lm, token_dl, n_samples = prepare_lm_and_dataloader(
-        lm_name=lm_name,
-        dataset_name=dataset_name,
-        dataset_subset=dataset_subset,
-        split=split,
-        seq_len=seq_len,
-        batch_size=batch_size,
-        torch_dtype=torch_dtype,
-        token_rename=token_rename,
-        shuffle=shuffle,
+        lm_name=lm_cfg.name,
+        dataset_name=train_params.offline_projection.dataset.name,
+        dataset_subset=train_params.offline_projection.dataset.subset,
+        split=train_params.offline_projection.dataset.split,
+        seq_len=train_params.seq_len,
+        batch_size=train_params.offline_projection.cache_batch_size,
+        torch_dtype=train_params.torch_dtype,
+        token_rename=train_params.offline_projection.dataset.token_rename,
+        shuffle=train_params.offline_projection.dataset.shuffle,
         lm_dir=lm_dir,
-        total_tokens=total_tokens,
-        num_workers=num_workers,
+        total_tokens=train_params.offline_projection.total_tokens,
+        num_workers=train_params.resources.projector.num_data_workers,
     )
 
+    lm_hook_points = lm_cfg.hook_list
     hook_caches = [f"{lm_act_cache_dir}/{hp}" for hp in lm_hook_points]
 
     if force_cache_all:
@@ -461,11 +433,11 @@ def activation_caching(
             model=lm,
             dataloader=token_dl,
             cache_outputs=cache_outputs,
-            hook_points=hooks_needed,  # args.hook_point,
+            hook_points=hooks_needed,
             save_dir=lm_act_cache_dir,
-            device=device,
+            device=train_params.device,
             n_samples=n_samples,
-            token_rename=token_rename,
+            token_rename=train_params.offline_projection.dataset.token_rename,
         )
         print(
             f"\nModel activation caching complete. Batch file for all hook points saved at {lm_act_cache_dir}/batch_mapping.txt"
@@ -473,26 +445,26 @@ def activation_caching(
     else:
         print(f"\nUsing existing lm activations cache at {lm_act_cache_dir}.")
 
-    cached_tokens = n_samples * seq_len
+    cached_tokens = n_samples * train_params.seq_len  # type: ignore
 
     summary = {
         "lm_hook_points": lm_hook_points,
-        "lm_name": lm_name,
-        "dataset_name": dataset_name,
-        "dataset_subset": dataset_subset,
-        "split": split,
-        "seq_len": seq_len,
-        "batch_size": batch_size,
+        "lm_name": lm.name,
+        "dataset_name": train_params.offline_projection.dataset.name,
+        "dataset_subset": train_params.offline_projection.dataset.subset,
+        "split": train_params.offline_projection.dataset.split,
+        "seq_len": train_params.seq_len,
+        "batch_size": train_params.offline_projection.cache_batch_size,
         "lm_act_cache_dir": lm_act_cache_dir,
-        "token_rename": token_rename,
-        "shuffle": shuffle,
+        "token_rename": train_params.offline_projection.dataset.token_rename,
+        "shuffle": train_params.offline_projection.dataset.shuffle,
         "lm_dir": lm_dir,
-        "total_requested_tokens": total_tokens,
+        "total_requested_tokens": train_params.offline_projection.total_tokens,
         "total_cached_tokens": cached_tokens,
-        "num_workers": num_workers,
+        "num_workers": train_params.resources.projector.num_data_workers,
         "force_cache_all": force_cache_all,
         "cache_outputs": cache_outputs,
-        "device": device,
+        "device": train_params.device,
     }
 
     # print("====== SUMMARY ======")
@@ -503,37 +475,76 @@ def activation_caching(
     with open(f"{lm_act_cache_dir}/caching_summary.json", "w") as f:
         json.dump(summary, f, indent=4)
 
-    return lm_act_cache_dir, lm.cfg.d_model  # , args.sae_act_cache_dir
+    return lm_act_cache_dir, lm_cfg.d_model
 
 
-if __name__ == "__main__":
-    args = parse_args()
-
-    set_device(args.device)
-    set_all_seeds(seed=args.seed, reproducible_backend=args.reproducible_backend)
-    if args.vram_limit_gb:
-        set_vram_limit(gb_limit=args.vram_limit_gb)
-
-    all_lm_hook_points = args.lm_hook_points.split(",")
-
-    force_cache_all = args.force
-    num_workers = args.dl_num_workers
-
-    activation_caching(
-        lm_hook_points=all_lm_hook_points,
-        lm_name=args.lm_name,
-        dataset_name=args.dataset_name,
-        dataset_subset=args.dataset_subset,
-        split=args.split,
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-        lm_act_cache_dir=args.lm_act_cache_dir,
-        token_rename=args.token_rename,
-        shuffle=args.shuffle,
-        lm_dir=args.lm_dir,
-        total_tokens=args.total_tokens,
-        num_workers=args.num_workers,
-        force_cache_all=args.force_cache_all,
-        cache_outputs=args.cache_outputs,
-        device=args.device,
+def cache_student_and_teacher_acts(
+    cfg: ExperimentConfig,
+    training_params: TrainingParams,
+    cache_dir: str,
+    cache_outputs: bool = False,
+    local_teacher_dir: Optional[str] = None,
+    local_student_dir: Optional[str] = None,
+) -> Tuple[str, int, str, int]:
+    """Cache both student and teacher activations based on experiment config."""
+    # Cache teacher activations
+    teacher_cache_dir, teacher_dim = activation_caching(
+        lm_cfg=cfg.distill_pair.teacher,
+        cache_dir=cache_dir,
+        train_params=training_params,
+        cache_outputs=cache_outputs,
+        lm_dir=local_teacher_dir,
     )
+
+    # Cache student activations
+    student_cache_dir, student_dim = activation_caching(
+        lm_cfg=cfg.distill_pair.student,
+        cache_dir=cache_dir,
+        train_params=training_params,
+        cache_outputs=cache_outputs,
+        lm_dir=local_student_dir,
+    )
+
+    return (
+        teacher_cache_dir,
+        teacher_dim,
+        student_cache_dir,
+        student_dim,
+    )
+
+
+# TODO: rework act caching to have a generalized overload
+# that will work as below
+
+
+# if __name__ == "__main__":
+#     args = parse_args()
+
+#     set_device(args.device)
+#     set_all_seeds(seed=args.seed, reproducible_backend=args.reproducible_backend)
+#     if args.vram_limit_gb:
+#         set_vram_limit(gb_limit=args.vram_limit_gb)
+
+#     all_lm_hook_points = args.lm_hook_points.split(",")
+
+#     force_cache_all = args.force
+#     num_workers = args.dl_num_workers
+
+#     activation_caching(
+#         lm_hook_points=all_lm_hook_points,
+#         lm_name=args.lm_name,
+#         dataset_name=args.dataset_name,
+#         dataset_subset=args.dataset_subset,
+#         split=args.split,
+#         seq_len=args.seq_len,
+#         batch_size=args.batch_size,
+#         lm_act_cache_dir=args.lm_act_cache_dir,
+#         token_rename=args.token_rename,
+#         shuffle=args.shuffle,
+#         lm_dir=args.lm_dir,
+#         total_tokens=args.total_tokens,
+#         num_workers=args.num_workers,
+#         force_cache_all=args.force_cache_all,
+#         cache_outputs=args.cache_outputs,
+#         device=args.device,
+#     )

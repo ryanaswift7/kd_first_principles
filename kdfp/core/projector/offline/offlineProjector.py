@@ -18,7 +18,9 @@ from ray.train.torch import TorchTrainer
 from ray.tune.schedulers import ASHAScheduler
 
 from kdfp.schemas.configBase import ConfigBase
+from kdfp.schemas.hparams import HparamsConfig
 from kdfp.schemas.mixins import DtypeSerializerMixin
+from kdfp.schemas.projections import ProjectionInstance
 from kdfp.utils.enums import ProjectionDirection
 
 
@@ -212,8 +214,8 @@ class OfflineProjectorModule(LightningModule):
         student_cache_dir: str,
         teacher_dim: int,
         student_dim: int,
-        projection: ProjectionConfig,
-        hyperparams: HyperparamsConfig,
+        projection: ProjectionInstance,
+        hyperparams: HparamsConfig,
         training_params: TrainingParamsConfig,
         dirs: ExpDirConfig,
         val_split: float = 0.1,
@@ -225,7 +227,7 @@ class OfflineProjectorModule(LightningModule):
         from .train import train_projector_per_worker
 
         pl.seed_everything(training_params.seed, workers=True)
-        run_name = f"off_proj_{projection.offline_projector_alignment_beta}"
+        run_name = f"off_proj_{projection.offline_alignment_beta}"
 
         train_func = partial(
             train_projector_per_worker,

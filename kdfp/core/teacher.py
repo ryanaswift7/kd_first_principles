@@ -86,8 +86,8 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
             acc = Accuracy(task=self.train_config.task.task_type, num_classes=4)
             f1 = F1Score(task=self.train_config.task.task_type, num_classes=4)
         else:  # binary
-            acc = Accuracy(task=self.train_config.task.task_type)
-            f1 = F1Score(task=self.train_config.task.task_type)
+            acc = Accuracy(task=self.train_config.task.task_type)  # type: ignore
+            f1 = F1Score(task=self.train_config.task.task_type)  # type: ignore
 
         # Eval metrics
         self.val_metrics = torchmetrics.MetricCollection(

@@ -17,8 +17,10 @@ from kdfp.schemas.directories import ExpInstDirs
 from kdfp.schemas.experiments.experimentConfig import ExperimentConfig
 from kdfp.schemas.hparams import HparamsConfig
 from kdfp.schemas.tasks import TaskInstance
-from kdfp.schemas.trainingParams import TrainingParamsConfig
-from kdfp.utils.activation_caching import activation_caching
+from kdfp.schemas.trainingParams import TrainingParams
+from kdfp.utils.activation_caching import (
+    cache_student_and_teacher_acts,
+)
 from kdfp.utils.enums import ProjectionTraining
 from kdfp.utils.general import get_timestamp
 from kdfp.utils.results import generate_result
@@ -27,7 +29,7 @@ from kdfp.utils.results import generate_result
 class ExperimentInstance(ConfigBase):
     cfg: ExperimentConfig
     dirs: ExpInstDirs
-    training_params: TrainingParamsConfig
+    training_params: TrainingParams
     hparams: HparamsConfig
     task_list: List[TaskInstance]
 
@@ -45,58 +47,30 @@ class ExperimentInstance(ConfigBase):
         """
         # if we already trained one, load it instead of creating another
         off_proj_weights_path = Path(
-            self.dirs.off_proj_models
+            self.dirs.off_proj_models  # type: ignore
         ) / gen_off_proj_weights_filename(
-            alignment_beta=self.cfg.projection.offline_alignment_beta
+            alignment_beta=self.cfg.projection.offline_alignment_beta  # type: ignore
         )
         if off_proj_weights_path.exists():
             print(
-                f"Pretrained offline projector for with alignment beta '{self.cfg.projection.offline_alignment_beta}' located at: {str(off_proj_weights_path)}"
+                f"Pretrained offline projector for with alignment beta '{self.cfg.projection.offline_alignment_beta}' located at: {str(off_proj_weights_path)}"  # type: ignore
             )
 
             # p = OfflineProjectorModule.load_pretrained(self.dirs.off_proj_model)
             # return p.extract_single_direction(direction=self.projection.direction)
         else:
-            # cache teacher and student acts
-            teacher_cache_dir, teacher_dim = activation_caching(
-                lm_name=self.teacher_cfg.model_name,
-                lm_hook_points=self.teacher_cfg.hook_list,
-                dataset_name=self.projection.offline_projector_training_args.dataset.name,
-                dataset_subset=self.projection.offline_projector_training_args.dataset.subset,
-                split=self.projection.offline_projector_training_args.dataset.split,
-                seq_len=self.training_params.seq_len,
-                batch_size=self.projection.offline_projector_training_args.cache_batch_size,
-                cache_dir=self.dirs.cache,
-                token_rename=self.projection.offline_projector_training_args.dataset.token_rename,
-                shuffle=self.projection.offline_projector_training_args.dataset.shuffle,
-                lm_dir=teacher_dir,
-                total_tokens=self.projection.offline_projector_training_args.total_tokens,
-                force_cache_all=self.projection.offline_projector_training_args.force_cache_all,
-                cache_outputs=False,
-                num_workers=self.training_params.resources.projector.num_data_workers,
-                device=self.training_params.device,
-                torch_dtype=self.training_params.torch_dtype,
-            )
-
-            student_cache_dir, student_dim = activation_caching(
-                lm_name=self.student_cfg.model_name,
-                lm_hook_points=self.student_cfg.hook_list,
-                dataset_name=self.projection.offline_projector_training_args.dataset.name,
-                dataset_subset=self.projection.offline_projector_training_args.dataset.subset,
-                split=self.projection.offline_projector_training_args.dataset.split,
-                seq_len=self.training_params.seq_len,
-                batch_size=self.projection.offline_projector_training_args.cache_batch_size,
-                cache_dir=self.dirs.cache,
-                token_rename=self.projection.offline_projector_training_args.dataset.token_rename,
-                shuffle=self.projection.offline_projector_training_args.dataset.shuffle,
-                lm_dir=student_dir,
-                total_tokens=self.projection.offline_projector_training_args.total_tokens,
-                force_cache_all=self.projection.offline_projector_training_args.force_cache_all,
-                cache_outputs=False,
-                num_workers=self.training_params.resources.projector.num_data_workers,
-                device=self.training_params.device,
-                torch_dtype=self.training_params.torch_dtype,
-            )
+            # cache dir should always be specified for offline projector
+            if cache_dir := self.dirs.cache:
+                (teacher_cache_dir, teacher_dim, student_cache_dir, student_dim) = (
+                    cache_student_and_teacher_acts(
+                        cfg=self.cfg,
+                        training_params=self.training_params,
+                        cache_dir=str(cache_dir),
+                        cache_outputs=False,
+                        local_teacher_dir=None,
+                        local_student_dir=None,
+                    )
+                )
 
             # create projector
             projector = OfflineProjectorModule.create(
@@ -114,22 +88,6 @@ class ExperimentInstance(ConfigBase):
             projector.save_pretrained(path=self.dirs.off_proj_models)  # type: ignore
             # load_test = OfflineProjector.load_pretrained(save_path=self.dirs.off_proj_models)
             # return projector.extract_single_direction(direction=self.projection.direction)
-
-    # def init_online_projector(self):
-    #     return OnlineProjector(
-    #         teacher_dim=self.cfg.distill_pair.teacher.d_model,
-    #         student_dim=self.cfg.distill_pair.student.d_model,
-    #         direction=self.cfg.projection.direction,  # type: ignore
-    #         torch_dtype=self.training_params.torch_dtype,
-    #     )
-
-    # def init_randomized_projector(self):
-    #     return RandomizedProjector(
-    #         teacher_dim=self.cfg.distill_pair.teacher.d_model,
-    #         student_dim=self.cfg.distill_pair.student.d_model,
-    #         direction=self.cfg.projection.direction,  # type: ignore
-    #         torch_dtype=self.training_params.torch_dtype,
-    #     )  # type: ignore
 
     def init_projector(self) -> None:
         """Initialize projector for an experiment. kwargs are for init_offline_projector."""
@@ -160,8 +118,7 @@ class ExperimentInstance(ConfigBase):
 
         return
 
-    def init_teacher_by_task(self, task: TaskInstance) -> None:
-        # save_dir = f"{self.dirs.teacher_model}/{task.task_name}"
+    def init_ft_teacher_by_task(self, task: TaskInstance) -> None:
         teacher_weights_file = (
             Path(self.dirs.teacher_model)
             / task.name
@@ -259,32 +216,34 @@ class ExperimentInstance(ConfigBase):
         return results_list
 
     def test_student(self, mode: Literal["pl", "hf"]) -> List[dict]:
-        print(f"Running tests on student {self.name}...")
+        print(f"Running tests on student {self.cfg.name}...")
         results_list = []
 
         for i, task in enumerate(self.task_list):
-            print(f"\nBenchmarking student {self.name} on task {task.name.upper()}...")
+            print(
+                f"\nBenchmarking student {self.cfg.name} on task {task.name.upper()}..."
+            )
             student_save_dir = f"{self.dirs.student_model}/{task.name}"
             if mode == "pl":
                 student_module = StudentModule.load_pretrained(student_save_dir)
             else:
                 student_test_cfg = HFTesterModuleConfig(
                     model_path=student_save_dir,
-                    tokenizer_name=self.student_cfg.model_name,
+                    tokenizer_name=self.cfg.distill_pair.student.name,
                     task=task,
                     seq_len=self.training_params.seq_len,
-                    batch_size=self.lm_params.test_batch_size,
-                    seed=self.training_params.seed,
+                    batch_size=self.training_params.test_batch_size,
+                    seed=self.cfg.seed,
                     torch_dtype=self.training_params.torch_dtype,
                     num_data_workers=self.training_params.resources.student.num_data_workers,
-                    n_samples=self.lm_params.num_samples,
+                    n_samples=self.training_params.num_samples,
                 )
                 student_module = HFTesterModule(student_test_cfg)
             results = self.test_trainer_factory().test(
                 model=student_module, verbose=True
             )
             new_result = generate_result(
-                name=self.name,
+                name=self.cfg.name,
                 model=student_module.student,
                 task_name=task.name,
                 metric_name="accuracy",
@@ -314,18 +273,18 @@ class ExperimentInstance(ConfigBase):
             if mode == "pl":
                 teacher_module = TeacherModule.load_pretrained(teacher_save_dir)
                 # adjust current n_samples to respect new config (used for quick debugging)
-                teacher_module.train_config.n_samples = self.lm_params.num_samples
+                teacher_module.train_config.n_samples = self.training_params.num_samples
             else:
                 teacher_test_cfg = HFTesterModuleConfig(
                     model_path=teacher_save_dir,
-                    tokenizer_name=self.teacher_cfg.model_name,
+                    tokenizer_name=self.cfg.distill_pair.teacher.name,
                     task=task,
                     seq_len=self.training_params.seq_len,
-                    batch_size=self.lm_params.test_batch_size,
-                    seed=self.training_params.seed,
+                    batch_size=self.training_params.test_batch_size,
+                    seed=self.cfg.seed,
                     torch_dtype=self.training_params.torch_dtype,
                     num_data_workers=self.training_params.resources.teacher.num_data_workers,
-                    n_samples=self.lm_params.num_samples,
+                    n_samples=self.training_params.num_samples,
                 )
                 teacher_module = HFTesterModule(teacher_test_cfg)
 

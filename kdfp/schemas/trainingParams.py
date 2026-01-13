@@ -7,7 +7,7 @@ from kdfp.schemas.mixins import DtypeSerializerMixin
 from kdfp.schemas.projections import OffProjTrainArgs
 
 
-class ResourceConfig(ConfigBase):
+class Resources(ConfigBase):
     num_data_workers: int
     num_ray_workers: int
     num_cpus_per_trial: int
@@ -17,9 +17,9 @@ class ResourceConfig(ConfigBase):
 class ExperimentResources(ConfigBase):
     max_failures: int
     num_available_gpus: int
-    projector: ResourceConfig
-    teacher: ResourceConfig
-    student: ResourceConfig
+    projector: Resources
+    teacher: Resources
+    student: Resources
 
 
 class TrainingControls(ConfigBase):
@@ -34,7 +34,7 @@ class WandbParams(ConfigBase):
     group: str
 
 
-class TrainingParamsConfig(ConfigBase, DtypeSerializerMixin):
+class TrainingParams(ConfigBase, DtypeSerializerMixin):
     seq_len: int
     train_batch_size: int
     test_batch_size: int

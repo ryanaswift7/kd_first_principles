@@ -4,7 +4,7 @@ from kdfp.schemas.configBase import ConfigBase
 from kdfp.utils.pydantic_custom_types import FlexFloat
 
 
-class DistillationModel(ConfigBase):
+class DistillationModelConfig(ConfigBase):
     name: str
     d_model: int
     n_distilled_layers: int
@@ -13,8 +13,8 @@ class DistillationModel(ConfigBase):
 
 
 class DistillationPair(ConfigBase):
-    teacher: DistillationModel
-    student: DistillationModel
+    teacher: DistillationModelConfig
+    student: DistillationModelConfig
 
 
 class DistillationGroups(ConfigBase):
