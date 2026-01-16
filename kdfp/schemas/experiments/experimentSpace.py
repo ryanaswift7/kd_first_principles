@@ -37,18 +37,22 @@ class ExperimentSpace(ConfigBase):
         return self.seeds[0]
 
     def generate_experiment_cfgs(
-        self, distill_groups: DistillationGroups, get_baselines: bool
+        self, suite_title: str, distill_groups: DistillationGroups, get_baselines: bool
     ) -> List[ExperimentConfig]:
-        kd_list = self.generate_kd_cfgs(distill_groups=distill_groups)
+        kd_list = self.generate_kd_cfgs(
+            suite_title=suite_title, distill_groups=distill_groups
+        )
         baseline_list = (
-            self.generate_baseline_cfgs(distill_groups=distill_groups)
+            self.generate_baseline_cfgs(
+                suite_title=suite_title, distill_groups=distill_groups
+            )
             if get_baselines
             else []
         )
         return self._apply_filter(kd_list + baseline_list)
 
     def generate_kd_cfgs(
-        self, distill_groups: DistillationGroups
+        self, suite_title: str, distill_groups: DistillationGroups
     ) -> List[ExperimentConfig]:
         """
         Generates, names, and filters the suite of experiments.
@@ -62,6 +66,7 @@ class ExperimentSpace(ConfigBase):
                 ):
                     candidates.append(
                         ExperimentConfig(
+                            suite_title=suite_title,
                             seed=seed,
                             student_type=student,
                             distill_pair=getattr(distill_groups, student.value),
@@ -88,6 +93,7 @@ class ExperimentSpace(ConfigBase):
                     ):
                         candidates.append(
                             ExperimentConfig(
+                                suite_title=suite_title,
                                 seed=seed,
                                 student_type=student,
                                 distill_pair=getattr(DistillationGroups, student.value),
@@ -107,7 +113,7 @@ class ExperimentSpace(ConfigBase):
         return candidates
 
     def generate_baseline_cfgs(
-        self, distill_groups: DistillationGroups
+        self, suite_title: str, distill_groups: DistillationGroups
     ) -> List[ExperimentConfig]:
         """
         Generates experiments to test all selected student types with finetuning and with no training,
@@ -119,6 +125,7 @@ class ExperimentSpace(ConfigBase):
         for seed, student in itertools.product(self.seeds, self.student_types):
             candidates.append(
                 ExperimentConfig(
+                    suite_title=suite_title,
                     seed=seed,
                     student_type=student,
                     distill_pair=getattr(distill_groups, student.value),
@@ -134,14 +141,17 @@ class ExperimentSpace(ConfigBase):
         for student in self.student_types:
             candidates.append(
                 ExperimentConfig(
+                    suite_title=suite_title,
                     seed=self.default_seed,
                     student_type=student,
                     distill_pair=getattr(distill_groups, student.value),
+                    objective=ObjectiveInstance(
+                        weight_str=ObjectiveWeightStr.NO_TRAIN,
+                        jsd_beta=-1,
+                    ),
                     training_type=TrainingType.NO_TRAIN,
                 )
             )
-
-        # NOTE: teacher baselines will be collected at teacher initialization
 
         return candidates
 

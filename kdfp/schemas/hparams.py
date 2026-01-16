@@ -1,6 +1,7 @@
 from typing import Optional, Union
 
 from kdfp.schemas.configBase import ConfigBase
+from kdfp.utils.enums import StudentType, TrainingType
 
 
 class MiniMaxiHyperparam(ConfigBase):
@@ -27,12 +28,45 @@ class DistillPairHparams(ConfigBase):
     kd: Optional[FixedHparamSet] = None
 
 
+class FixedOffProjHparamSet(ConfigBase):
+    batch_size: int
+    lr: float
+    weight_decay: float
+    max_grad_norm: float
+    tied_weights: bool
+
+
 class FixedParams(ConfigBase):
     teacher: Optional[FixedHparamSet] = None
     pretrained: Optional[DistillPairHparams] = None
     shallow: Optional[DistillPairHparams] = None
+    off_proj: Optional[FixedOffProjHparamSet] = None
 
 
 class HparamsConfig(ConfigBase):
     fixed: Optional[FixedParams] = None
     tune: Optional[TuneParams] = None
+
+
+def get_fixed_student_params(
+    hyperparams: HparamsConfig, student_type: StudentType, training_type: TrainingType
+):
+    if not hyperparams.fixed:
+        return None
+
+    # Map types to the specific config objects
+    try:
+        student_group = {
+            StudentType.SHALLOW: hyperparams.fixed.shallow,
+            StudentType.PRETRAINED: hyperparams.fixed.pretrained,
+        }.get(student_type)
+
+        if not student_group:
+            return None
+
+        return {
+            TrainingType.FT: student_group.ft,
+            TrainingType.KD: student_group.kd,
+        }.get(training_type)
+    except AttributeError:
+        return None

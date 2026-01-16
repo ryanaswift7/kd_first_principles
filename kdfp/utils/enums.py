@@ -28,6 +28,7 @@ class ObjectiveWeightStr(str, Enum):
     ONLY_OUTPUTS = "only_outputs"
     BALANCED = "balanced"
     FINETUNING = "finetuning"
+    NO_TRAIN = "no_train"
 
     # "No" variants
     NO_EMBED = "no_embed"

@@ -4,23 +4,27 @@ from functools import partial
 
 # from kdfp.core.projector.offline import create_with_raytune
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, cast
 
 import lightning.pytorch as pl
 import ray
 import ray.train
+import ray.train.torch
 import ray.tune
 import torch
 import torch.nn as nn
 from lightning.pytorch import LightningModule
 from ray import tune
+from ray.air.integrations.wandb import WandbLoggerCallback
 from ray.train.torch import TorchTrainer
 from ray.tune.schedulers import ASHAScheduler
 
 from kdfp.schemas.configBase import ConfigBase
-from kdfp.schemas.hparams import HparamsConfig
+from kdfp.schemas.directories import ExpInstDirs
+from kdfp.schemas.hparams import FixedOffProjHparamSet, HparamsConfig, TuneParams
 from kdfp.schemas.mixins import DtypeSerializerMixin
 from kdfp.schemas.projections import ProjectionInstance
+from kdfp.schemas.trainingParams import TrainingParams
 from kdfp.utils.enums import ProjectionDirection
 
 
@@ -82,7 +86,7 @@ class OfflineProjectorModule(LightningModule):
         )
 
     def forward(self, x, direction: Optional[ProjectionDirection] = None):
-        if direction == None:
+        if direction is None:
             # Full autoencoder: teacher -> student -> teacher
             latent = self.encoder(x)
             reconstructed = self.decoder(latent)
@@ -216,49 +220,90 @@ class OfflineProjectorModule(LightningModule):
         student_dim: int,
         projection: ProjectionInstance,
         hyperparams: HparamsConfig,
-        training_params: TrainingParamsConfig,
-        dirs: ExpDirConfig,
+        training_params: TrainingParams,
+        dirs: ExpInstDirs,
+        seed: int,
         val_split: float = 0.1,
         test_split: float = 0.1,
-    ) -> (
-        "OfflineProjectorModule"
-    ):  # Tuple[Any, Dict[str, Any], Any, Dict[str, float], Dict[str, float]]:
+    ) -> "OfflineProjectorModule":
         """Create and train projector with multi-objective loss"""
         from .train import train_projector_per_worker
 
-        pl.seed_everything(training_params.seed, workers=True)
+        pl.seed_everything(seed, workers=True)
         run_name = f"off_proj_{projection.offline_alignment_beta}"
 
         train_func = partial(
             train_projector_per_worker,
-            run_name=run_name,
             teacher_cache_dir=teacher_cache_dir,
             student_cache_dir=student_cache_dir,
             teacher_dim=teacher_dim,
             student_dim=student_dim,
-            alignment_beta=projection.offline_projector_alignment_beta,
-            max_epochs=projection.offline_projector_training_args.num_epochs,
+            alignment_beta=cast(float, projection.offline_alignment_beta),
+            max_epochs=training_params.offline_projection.num_epochs,
             val_split=val_split,
             test_split=test_split,
             training_params=training_params,
+            seed=seed,
+            batch_size=training_params.offline_projection.train_batch_size,
         )
 
         # NOTE: CANNOT USE RAY TRAIN V2 (at least on single node)
-        def tune_asha(num_trials: int):
-            search_space: Dict[str, Any] = {
-                "batch_size": tune.choice(
-                    [2048]
-                ),  # tune.choice(hyperparams.batch_sizes),
-                "learning_rate": tune.qloguniform(
-                    hyperparams.lr.mini, hyperparams.lr.maxi, 5e-7
+        def train_fixed_params(fixed_off_proj_params: FixedOffProjHparamSet):
+            fixed_config = {
+                "learning_rate": fixed_off_proj_params.lr,
+                "weight_decay": fixed_off_proj_params.weight_decay,
+                "max_grad_norm": fixed_off_proj_params.max_grad_norm,
+                "tied_weights": fixed_off_proj_params.tied_weights,
+                "wandb_run_name": f"{run_name}_fixed_{uuid.uuid4().hex[:6]}",
+            }
+
+            scaling_config = ray.train.ScalingConfig(
+                num_workers=training_params.resources.projector.num_ray_workers,
+                use_gpu=True,
+                resources_per_worker={
+                    "CPU": training_params.resources.projector.num_cpus_per_trial,
+                    "GPU": training_params.resources.projector.num_gpus_per_trial,
+                },
+                placement_strategy="PACK",
+            )
+
+            train_run_config = ray.train.RunConfig(
+                name=fixed_config["wandb_run_name"],
+                checkpoint_config=ray.train.CheckpointConfig(
+                    num_to_keep=1,
+                    checkpoint_score_attribute="kdfp_off_proj/val_total_weighted_loss",
+                    checkpoint_score_order="min",
                 ),
+                failure_config=ray.train.FailureConfig(
+                    max_failures=training_params.resources.max_failures
+                ),
+                storage_path=str(dirs.ray),
+            )
+
+            trainer = ray.train.torch.TorchTrainer(
+                train_func,
+                train_loop_config=fixed_config,
+                scaling_config=scaling_config,
+                run_config=train_run_config,
+            )
+
+            return trainer.fit()
+
+        def tune_asha(num_trials: int, tune_params: TuneParams):
+            tune_config: Dict[str, Any] = {
+                "learning_rate": tune.qloguniform(1e-5, 1e-2, 5e-6),
                 "weight_decay": tune.qloguniform(
-                    hyperparams.weight_decay.mini, hyperparams.weight_decay.maxi, 5e-6
+                    tune_params.weight_decay.mini,
+                    tune_params.weight_decay.maxi,
+                    5e-6,
                 ),
                 "max_grad_norm": tune.quniform(
-                    hyperparams.max_grad_norm.mini, hyperparams.max_grad_norm.maxi, 1e-3
+                    tune_params.max_grad_norm.mini,
+                    tune_params.max_grad_norm.maxi,
+                    1e-3,
                 ),
                 "tied_weights": tune.choice([True, False]),
+                "wandb_run_name": f"{run_name}_tune_{uuid.uuid4().hex[:6]}",
             }
             scaling_config = ray.train.ScalingConfig(
                 num_workers=training_params.resources.projector.num_ray_workers,
@@ -274,7 +319,7 @@ class OfflineProjectorModule(LightningModule):
                 scaling_config=scaling_config,
             )
             tune_run_config = ray.tune.RunConfig(
-                name=f"{run_name}_tune_{uuid.uuid4().hex[:6]}",
+                name=tune_config["wandb_run_name"],
                 checkpoint_config=ray.tune.CheckpointConfig(
                     num_to_keep=1,
                     checkpoint_score_attribute="kdfp_off_proj/val_total_weighted_loss",
@@ -283,24 +328,31 @@ class OfflineProjectorModule(LightningModule):
                 failure_config=ray.tune.FailureConfig(
                     max_failures=training_params.resources.max_failures
                 ),
-                storage_path=dirs.ray,
+                storage_path=str(dirs.ray),
+                callbacks=[
+                    WandbLoggerCallback(
+                        project=training_params.wandb.project,
+                        group=training_params.wandb.group,
+                        run_name=tune_config["wandb_run_name"],
+                    )
+                ],
             )
 
             scheduler = ASHAScheduler(
-                max_t=projection.offline_projector_training_args.num_epochs,
+                max_t=training_params.offline_projection.num_epochs,
                 grace_period=1,
                 reduction_factor=2,
             )
             tuner = ray.tune.Tuner(
-                ray_ptl_trainer,
-                param_space={"train_loop_config": search_space},
+                ray_ptl_trainer,  # type: ignore
+                param_space={"train_loop_config": tune_config},
                 run_config=tune_run_config,
                 tune_config=tune.TuneConfig(
                     metric="kdfp_off_proj/val_total_weighted_loss",
                     mode="min",
                     num_samples=num_trials,
                     scheduler=scheduler,
-                    max_concurrent_trials=(
+                    max_concurrent_trials=int(
                         training_params.resources.num_available_gpus
                         // training_params.resources.projector.num_gpus_per_trial
                     ),
@@ -308,10 +360,22 @@ class OfflineProjectorModule(LightningModule):
             )
             return tuner.fit()
 
-        results = tune_asha(
-            num_trials=projection.offline_projector_training_args.n_trials
+        fixed_off_proj = hyperparams.fixed.off_proj if hyperparams.fixed else None
+
+        if fixed_off_proj:
+            print("Training offline projector with fixed hyperparameters...")
+            best_result = train_fixed_params(fixed_off_proj_params=fixed_off_proj)
+        else:
+            assert hyperparams.tune, "No hyperparameters provided for tuning."
+            print("Tuning offline projector with ASHA...")
+            best_result = tune_asha(
+                num_trials=training_params.offline_projection.n_trials,
+                tune_params=hyperparams.tune,
+            ).get_best_result()
+
+        assert best_result.checkpoint is not None, (
+            "No checkpoint found in best Offline Projector result."
         )
-        best_result = results.get_best_result()
         with best_result.checkpoint.as_directory() as checkpoint_dir:
             return OfflineProjectorModule.load_from_checkpoint(
                 f"{checkpoint_dir}/checkpoint.ckpt"
@@ -326,8 +390,6 @@ class OfflineProjectorModule(LightningModule):
         assert self.train_config
 
         with open(f"{path}/pl_config.json", "w") as f:
-            # cfg = self.train_config.model_dump()
-            # json.dump({"train_config": cfg}, f, indent=4)
             json.dump(self.train_config.model_dump(), f, indent=4)
 
         print(f"Offline projector saved to {path}")
@@ -348,6 +410,5 @@ class OfflineProjectorModule(LightningModule):
 
         model.load_state_dict(state_dict)
         model.eval()
-        # with alignment beta {model.train_config.projection.offline_projector_alignment_beta}
         print(f"Loaded pretrained offline projector from {path}")
         return model

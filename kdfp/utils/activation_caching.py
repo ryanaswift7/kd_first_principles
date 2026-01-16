@@ -1,4 +1,3 @@
-import argparse
 import json
 import math
 import os
@@ -9,11 +8,6 @@ from typing import List, Optional, Tuple
 import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-
-# from sae_lens import (
-#     HookedSAETransformer,
-#     SAE,
-# )
 from transformer_lens import HookedTransformer
 
 from kdfp.schemas.experiments.experimentConfig import ExperimentConfig
@@ -22,156 +16,6 @@ from kdfp.schemas.trainingParams import TrainingParams
 
 from .data import load_data
 from .general import cleanup_resources
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Cache HookedTransformer activations for a dataset",
-    )
-    # parser.add_argument(
-    #     "--cache-mode",
-    #     type=str,
-    #     choices=["lm", "sae", "both"],
-    #     help="Which activations to cache: 'lm' or 'sae' or 'both'.",
-    #     required=True,
-    # )
-    parser.add_argument(
-        "--lm-name",
-        type=str,
-        help="Name of HookedTransformer model to use",
-        required=True,
-    )
-    parser.add_argument(
-        "--lm-dir",
-        type=str,
-        help="Directory containing LM's 'state_dict.pt'.",
-        required=True,
-    )
-    parser.add_argument(
-        "--lm-act-cache-dir",
-        type=str,
-        help="Directory where you would like to save the activations.",
-        required=True,
-    )
-    # parser.add_argument(
-    #     "--sae-dir",
-    #     type=str,
-    #     default=None,
-    #     help="Directory where SAE is saved to.",
-    # )
-    # parser.add_argument(
-    #     "--cache-subdir",
-    #     type=str,
-    #     help="Directory for the language model activation cache. For example, LM activations will be placed under model_dir/cache_subdir/lm_acts.",
-    #     required=True,
-    # )
-    # parser.add_argument(
-    #     "--unmodified",
-    #     action="store_true",
-    #     default=False,
-    #     help="Flag to indicate using unmodified model (i.e. baseline/student or teacher).",
-    # )
-    parser.add_argument(
-        "--dataset-name", type=str, required=True, help="HuggingFace dataset to use"
-    )
-    parser.add_argument(
-        "--dataset-subset", type=str, default=None, help="Subset of main dataset to use"
-    )
-    parser.add_argument(
-        "--split",
-        type=str,
-        default="train",
-        help="Dataset split to use (i.e. train, val, dev, test, etc.)",
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=8, help="Batch size for processing"
-    )
-    parser.add_argument(
-        "--total-tokens",
-        type=int,
-        default=None,
-        help="Total number of tokens to cache activations for.",
-    )
-    parser.add_argument(
-        "--seq-len",
-        type=int,
-        default=512,
-        help="Number of tokens to include in each sample sequence.",
-    )
-    parser.add_argument(
-        "--shuffle",
-        action="store_true",
-        default=False,
-        help="Use this flag if you want the data to be shuffled.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=44,
-        help="Set the random seed value.",
-    )
-    parser.add_argument(
-        "--reproducible-backend",
-        action="store_true",
-        default=False,
-        help="Use this flag if you need full reproducbility (i.e. in CUDA).",
-    )
-    parser.add_argument(
-        "--vram-limit-gb",
-        type=float,
-        default=None,
-        help="Set amount VRAM (in GB) to allow CUDA to use.",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Set CUDA device to use.",
-    )
-    parser.add_argument(
-        "--lm-hook-points",
-        type=str,
-        required=True,
-        help="Comma separated string of hook points to cache in LM.",
-    )
-    # parser.add_argument(
-    #     "--sae-hook-point",
-    #     type=str,
-    #     default="hook_sae_acts_post",
-    #     help="Comma separated string of hook points to cache in SAE.",
-    # )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        default=False,
-        help="Force re-caching even if existing cache appears complete",
-    )
-    parser.add_argument(
-        "--cache-outputs",
-        action="store_true",
-        default=False,
-        help="Cache LM outputs in addition to hidden activations. Doesn't apply to SAE caching",
-    )
-    parser.add_argument(
-        "--n-samples",
-        type=int,
-        default=None,
-        help="Set a maximum number of data samples to cache activations for.",
-    )
-    parser.add_argument(
-        "--token-rename",
-        action="store_true",
-        default=False,
-        help="Rename 'input_ids' to 'tokens' after tokenization. Needed (?) for training HookedTransformers",
-    )
-    parser.add_argument(
-        "--dl-num-workers",
-        type=int,
-        default=None,
-        help="Number of workers for dataloaders.",
-    )
-
-    return parser.parse_args()
 
 
 def prepare_lm_and_dataloader(
@@ -209,6 +53,7 @@ def prepare_lm_and_dataloader(
         seq_len=seq_len,
         token_rename=token_rename,
         n_samples=n_samples,
+        streaming=True,
     )
     dl = DataLoader(
         dataset,
@@ -363,7 +208,7 @@ def is_cache_complete(
                 for line in lines:
                     parts = line.strip().split(",")
                     if len(parts) >= 3:
-                        start_idx = int(parts[1])
+                        # start_idx = int(parts[1])
                         end_idx = int(parts[2])
                         total_samples = max(total_samples, end_idx)
 
@@ -408,7 +253,7 @@ def activation_caching(
     lm_hook_points = lm_cfg.hook_list
     hook_caches = [f"{lm_act_cache_dir}/{hp}" for hp in lm_hook_points]
 
-    if force_cache_all:
+    if train_params.offline_projection.force_cache_all:
         hooks_needed = lm_hook_points
     else:
         hooks_needed = []
@@ -462,7 +307,7 @@ def activation_caching(
         "total_requested_tokens": train_params.offline_projection.total_tokens,
         "total_cached_tokens": cached_tokens,
         "num_workers": train_params.resources.projector.num_data_workers,
-        "force_cache_all": force_cache_all,
+        "force_cache_all": train_params.offline_projection.force_cache_all,
         "cache_outputs": cache_outputs,
         "device": train_params.device,
     }
@@ -511,40 +356,3 @@ def cache_student_and_teacher_acts(
         student_cache_dir,
         student_dim,
     )
-
-
-# TODO: rework act caching to have a generalized overload
-# that will work as below
-
-
-# if __name__ == "__main__":
-#     args = parse_args()
-
-#     set_device(args.device)
-#     set_all_seeds(seed=args.seed, reproducible_backend=args.reproducible_backend)
-#     if args.vram_limit_gb:
-#         set_vram_limit(gb_limit=args.vram_limit_gb)
-
-#     all_lm_hook_points = args.lm_hook_points.split(",")
-
-#     force_cache_all = args.force
-#     num_workers = args.dl_num_workers
-
-#     activation_caching(
-#         lm_hook_points=all_lm_hook_points,
-#         lm_name=args.lm_name,
-#         dataset_name=args.dataset_name,
-#         dataset_subset=args.dataset_subset,
-#         split=args.split,
-#         seq_len=args.seq_len,
-#         batch_size=args.batch_size,
-#         lm_act_cache_dir=args.lm_act_cache_dir,
-#         token_rename=args.token_rename,
-#         shuffle=args.shuffle,
-#         lm_dir=args.lm_dir,
-#         total_tokens=args.total_tokens,
-#         num_workers=args.num_workers,
-#         force_cache_all=args.force_cache_all,
-#         cache_outputs=args.cache_outputs,
-#         device=args.device,
-#     )

@@ -17,6 +17,7 @@ class Resources(ConfigBase):
 class ExperimentResources(ConfigBase):
     max_failures: int
     num_available_gpus: int
+    stream_data: bool
     projector: Resources
     teacher: Resources
     student: Resources

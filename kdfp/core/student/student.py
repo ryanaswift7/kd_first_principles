@@ -1,14 +1,21 @@
 import json
+import math
 import os
 import uuid
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional
 
 import lightning.pytorch as pl
 import ray
+import ray.train
+import ray.train.torch
+import ray.tune
 import torch
+import torch.nn as nn
 import torchmetrics
+import wandb
 from lightning.pytorch.loggers import WandbLogger
+from ray.air.integrations.wandb import WandbLoggerCallback
 from ray.train.lightning import (
     RayDDPStrategy,
     RayLightningEnvironment,
@@ -16,6 +23,9 @@ from ray.train.lightning import (
     prepare_trainer,
 )
 from ray.tune.schedulers import ASHAScheduler
+from ray.tune.search import ConcurrencyLimiter
+from ray.tune.search.optuna import OptunaSearch
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from torchmetrics import Accuracy, F1Score
 from transformer_lens import HookedTransformer
@@ -29,12 +39,22 @@ from kdfp.core.projector.online.onlineProjector import OnlineProjector
 from kdfp.core.projector.randomized.RandomizedProjector import RandomizedProjector
 from kdfp.core.student.training_utils import jensen_shannon_divergence
 from kdfp.schemas.configBase import ConfigBase
-from kdfp.schemas.lmConfig import LMConfig
+from kdfp.schemas.directories import ExpInstDirs
+from kdfp.schemas.experiments.experimentConfig import ExperimentConfig
+from kdfp.schemas.hparams import (
+    FixedHparamSet,
+    HparamsConfig,
+    TuneParams,
+    get_fixed_student_params,
+)
 from kdfp.schemas.mixins import DtypeSerializerMixin, MCEvalMixin
+from kdfp.schemas.models import DistillationPair
 from kdfp.schemas.objective_weights import ObjectiveWeights
+from kdfp.schemas.projections import ProjectionInstance
 from kdfp.schemas.tasks import TaskInstance
+from kdfp.schemas.trainingParams import TrainingParams
 from kdfp.utils.data import load_task_data
-from kdfp.utils.enums import ProjectionDirection, ProjectionTraining
+from kdfp.utils.enums import ProjectionDirection, ProjectionTraining, TrainingType
 from kdfp.utils.shallow_model_loading import load_shallow
 from kdfp.utils.weight_conversion import (
     convert_hooked_to_neox_weights,
@@ -47,10 +67,10 @@ def gen_student_weights_filename(task_name: str) -> str:
 
 
 class StudentModuleConfig(ConfigBase, DtypeSerializerMixin):
-    student_cfg: LMConfig
-    teacher_cfg: LMConfig
-    dirs: ExpDirConfig
-    projection: Optional[ProjectionConfig] = None
+    exp_name: str
+    distill_pair: DistillationPair
+    dirs: ExpInstDirs
+    projection: Optional[ProjectionInstance] = None
     task: TaskInstance
     seq_len: int
     batch_size: int
@@ -59,11 +79,15 @@ class StudentModuleConfig(ConfigBase, DtypeSerializerMixin):
     weight_decay: float
     max_grad_norm: float
     seed: int
-    torch_dtype: Union[str, torch.dtype]
-    num_data_workers: Optional[int] = None
+    torch_dtype: torch.dtype
+    num_data_workers: int = 0
     n_samples: Optional[int] = None
     objective_weights: ObjectiveWeights
     jsd_beta: Optional[float]
+    total_steps: int
+    finetune_teacher: bool
+    training_type: TrainingType
+    stream_data: bool
 
 
 class StudentModule(pl.LightningModule, MCEvalMixin):
@@ -90,6 +114,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         self.projector = self.load_projector()
 
         # Add padding token if it doesn't exist
+        assert self.tokenizer is not None, "Tokenizer could not be loaded."
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -120,47 +145,53 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         # self.train_losses = []
 
     def load_teacher(self) -> HookedTransformer:
-        teacher_hf = AutoModelForCausalLM.from_pretrained(
-            f"{self.train_config.dirs.teacher_model}/{self.train_config.task.name}"
-        )
-        # load base teacher
-        teacher_tl = HookedTransformer.from_pretrained_no_processing(
-            self.train_config.teacher_cfg.model_name,
-            dtype=self.train_config.torch_dtype,
-        )
+        if self.train_config.finetune_teacher:
+            teacher_hf = AutoModelForCausalLM.from_pretrained(
+                f"{self.train_config.dirs.teacher_model}/{self.train_config.task.name}"
+            )
+            # load base teacher
+            teacher_tl = HookedTransformer.from_pretrained_no_processing(
+                self.train_config.distill_pair.teacher.name,
+                dtype=self.train_config.torch_dtype,
+            )
 
-        # load finetuned weights, convert to transformer lens format, load into teacher
-        # weights_file = Path(self.train_config.dirs.teacher_models) / gen_teacher_weights_filename(task_name=self.train_config.task.name)
-        # teacher_weights = torch.load(weights_file, weights_only=True)
-        # print("\n" + "="*60)
-        # print(teacher_weights)
-        # print("="*60)
-        tl_teacher_weights = convert_neox_to_hooked_weights(
-            neox_model=teacher_hf, cfg=teacher_tl.cfg
-        )
-        teacher_tl.load_state_dict(tl_teacher_weights, strict=False)
-        # teacher_tl.eval()
+            print(
+                f"Loading finetuned weights for teacher model on task {self.train_config.task.name}..."
+            )
+            # load finetuned weights, convert to transformer lens format, load into teacher
+            tl_teacher_weights = convert_neox_to_hooked_weights(
+                neox_model=teacher_hf, cfg=teacher_tl.cfg
+            )
+            teacher_tl.load_state_dict(tl_teacher_weights, strict=False)
+        else:
+            teacher_tl = HookedTransformer.from_pretrained_no_processing(
+                self.train_config.distill_pair.teacher.name,
+                dtype=self.train_config.torch_dtype,
+            )
         return teacher_tl.eval()
 
     def load_student(self) -> HookedTransformer:
-        if self.train_config.student_cfg.layer_reduction_factor:
+        if self.train_config.distill_pair.student.layer_reduction_factor:
             student, tokenizer, keep_indices = load_shallow(
-                model_name=self.train_config.student_cfg.model_name,
+                model_name=self.train_config.distill_pair.student.name,
                 mode="tl",
-                layer_reduction_factor=self.train_config.student_cfg.layer_reduction_factor,
+                layer_reduction_factor=self.train_config.distill_pair.student.layer_reduction_factor,
                 selection_method="linspace",
                 torch_dtype=self.train_config.torch_dtype,
             )
         else:
             student = HookedTransformer.from_pretrained_no_processing(
-                self.train_config.student_cfg.model_name,
+                self.train_config.distill_pair.student.name,
                 dtype=self.train_config.torch_dtype,
             )
         return student
 
-    def load_projector(self):
+    def load_projector(self) -> torch.nn.Module:
         if self.train_config.projection:
-            if self.train_config.projection.training == ProjectionTraining.OFFLINE:
+            if (
+                self.train_config.projection.training_method
+                == ProjectionTraining.OFFLINE
+            ):
                 # weights_file = Path(self.train_config.dirs.off_proj_models)
                 p = OfflineProjectorModule.load_pretrained(
                     f"{self.train_config.dirs.off_proj_models}"
@@ -169,23 +200,32 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 return p.extract_single_direction(
                     self.train_config.projection.direction
                 ).eval()
-            elif self.train_config.projection.training == ProjectionTraining.ONLINE:
+            elif (
+                self.train_config.projection.training_method
+                == ProjectionTraining.ONLINE
+            ):
                 return OnlineProjector(
-                    teacher_dim=self.train_config.teacher_cfg.d_model,
-                    student_dim=self.train_config.student_cfg.d_model,
+                    teacher_dim=self.train_config.distill_pair.teacher.d_model,
+                    student_dim=self.train_config.distill_pair.student.d_model,
                     direction=self.train_config.projection.direction,
                     torch_dtype=self.train_config.torch_dtype,
                 ).train()
-            elif self.train_config.projection.training == ProjectionTraining.RANDOMIZED:
+            elif (
+                self.train_config.projection.training_method
+                == ProjectionTraining.RANDOMIZED
+            ):
                 return RandomizedProjector(
-                    teacher_dim=self.train_config.teacher_cfg.d_model,
-                    student_dim=self.train_config.student_cfg.d_model,
+                    teacher_dim=self.train_config.distill_pair.teacher.d_model,
+                    student_dim=self.train_config.distill_pair.student.d_model,
                     direction=self.train_config.projection.direction,
                     torch_dtype=self.train_config.torch_dtype,
                 ).eval()
+            else:
+                raise ValueError(
+                    f"Unrecognized projection training method: {self.train_config.projection.training_method.value.upper()}"
+                )
         else:
-            # self.projector = IdentityProjector()
-            return None
+            return nn.Identity()
 
     @property
     def model_file(self):
@@ -198,8 +238,8 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
 
     def training_step(self, batch, batch_idx):
         mse = torch.nn.MSELoss()
-        student_hooks = self.train_config.student_cfg.hook_list
-        teacher_hooks = self.train_config.teacher_cfg.hook_list
+        student_hooks = self.train_config.distill_pair.student.hook_list
+        teacher_hooks = self.train_config.distill_pair.teacher.hook_list
         obj_weights = self.train_config.objective_weights
 
         input_ids = batch["input_ids"]
@@ -229,12 +269,15 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
 
         total_loss += obj_weights.true_labels * student_output.loss
 
-        # no JSD beta => finetuning => no distillation
-        if self.train_config.jsd_beta is None:
+        # finetuning => no distillation
+        if self.train_config.training_type == TrainingType.FT:
             self.log("train_loss", total_loss, sync_dist=True)
             return total_loss
 
         # distill outputs
+        assert self.train_config.jsd_beta is not None, (
+            "JSD beta must be set for KD training."
+        )
         total_loss += obj_weights.teacher_outputs * jensen_shannon_divergence(
             teacher_logits=teacher_output.logits,
             student_logits=student_output.logits,
@@ -339,7 +382,20 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             )
             if self.projector:
                 self.projector.eval()
-        return optimizer
+
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=self.train_config.total_steps,
+            eta_min=1e-9,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
 
     def train_dataloader(self):
         dataset = load_task_data(
@@ -348,6 +404,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             seq_len=self.train_config.seq_len,
             split="train",
             n_samples=self.train_config.n_samples,
+            streaming=self.train_config.stream_data,
         )
 
         dataset = dataset.shuffle(seed=self.train_config.seed, buffer_size=1000)
@@ -369,6 +426,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             seq_len=self.train_config.seq_len,
             split="validation",
             n_samples=self.train_config.n_samples,
+            streaming=self.train_config.stream_data,
         )
 
         return DataLoader(
@@ -387,6 +445,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             seq_len=self.train_config.seq_len,
             split="test",
             n_samples=self.train_config.n_samples,
+            streaming=self.train_config.stream_data,
         )
 
         return DataLoader(
@@ -401,42 +460,77 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
     @classmethod
     def create(
         cls,
-        exp_name: str,
-        student_cfg: LMConfig,
-        teacher_cfg: LMConfig,
-        dirs: ExpDirConfig,
+        cfg: ExperimentConfig,
+        dirs: ExpInstDirs,
         task: TaskInstance,
-        lm_params: LMParamsConfig,
-        hyperparams: HyperparamsConfig,
-        training_params: TrainingParamsConfig,
-        projection: ProjectionConfig,
-        jsd_beta: Optional[float],
-        objective_weights: ObjectiveWeights,
+        hyperparams: HparamsConfig,
+        training_params: TrainingParams,
     ):
-        pl.seed_everything(training_params.seed, workers=True)
-        run_name = f"student_{exp_name}"
+        pl.seed_everything(cfg.seed, workers=True)
+
+        if cfg.training_type == TrainingType.NO_TRAIN:
+            no_train_param = -1
+            no_train_config = StudentModuleConfig(
+                exp_name=cfg.name,
+                distill_pair=cfg.distill_pair,
+                dirs=dirs,
+                projection=cfg.projection,
+                task=task,
+                seq_len=training_params.seq_len,
+                batch_size=training_params.train_batch_size,
+                learning_rate=no_train_param,
+                weight_decay=no_train_param,
+                max_grad_norm=no_train_param,
+                temperature=no_train_param,
+                seed=cfg.seed,
+                torch_dtype=training_params.torch_dtype,
+                num_data_workers=training_params.resources.student.num_data_workers,
+                n_samples=training_params.num_samples,
+                jsd_beta=None,
+                objective_weights=cfg.objective.weights,
+                total_steps=no_train_param,
+                finetune_teacher=training_params.controls.finetune_teacher,
+                training_type=cfg.training_type,
+                stream_data=training_params.resources.stream_data,
+            )
+            return StudentModule(train_config=no_train_config)
+
+        run_name = f"student_{cfg.name}"
+        total_steps = math.ceil(
+            (task.n_train_samples * training_params.num_epochs)
+            / training_params.train_batch_size
+        )
 
         def train_student_per_worker(config):
             if training_params.reproducible_backend:
                 ray.train.torch.enable_reproducibility()
+
+            assert cfg.objective is not None, "Objective config must be provided."
+            assert cfg.objective.jsd_beta is not None, (
+                "JSD beta must be set for KD training."
+            )
             train_config = StudentModuleConfig(
-                student_cfg=student_cfg,
-                teacher_cfg=teacher_cfg,
+                exp_name=cfg.name,
+                distill_pair=cfg.distill_pair,
                 dirs=dirs,
-                projection=projection,
+                projection=cfg.projection,
                 task=task,
                 seq_len=training_params.seq_len,
-                batch_size=config["batch_size"],
+                batch_size=training_params.train_batch_size,
                 learning_rate=config["learning_rate"],
                 weight_decay=config["weight_decay"],
                 max_grad_norm=config["max_grad_norm"],
                 temperature=config["temperature"],
-                seed=training_params.seed,
+                seed=cfg.seed,
                 torch_dtype=training_params.torch_dtype,
                 num_data_workers=training_params.resources.student.num_data_workers,
-                n_samples=lm_params.num_samples,
-                jsd_beta=jsd_beta,
-                objective_weights=objective_weights,
+                n_samples=training_params.num_samples,
+                jsd_beta=cfg.objective.jsd_beta,
+                objective_weights=cfg.objective.weights,
+                total_steps=total_steps,
+                finetune_teacher=training_params.controls.finetune_teacher,
+                training_type=cfg.training_type,
+                stream_data=training_params.resources.stream_data,
             )
 
             module = StudentModule(train_config=train_config)
@@ -447,7 +541,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 strategy=RayDDPStrategy(find_unused_parameters=True),
                 plugins=[RayLightningEnvironment()],
                 callbacks=[RayTrainReportCallback()],
-                max_epochs=lm_params.num_epochs,
+                max_epochs=training_params.num_epochs,
                 gradient_clip_algorithm="norm",
                 gradient_clip_val=config["max_grad_norm"],
                 enable_progress_bar=False,
@@ -455,30 +549,76 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 deterministic=training_params.reproducible_backend,
                 check_val_every_n_epoch=1,
                 logger=WandbLogger(
-                    name=f"{run_name}_tune_{uuid.uuid4().hex[:6]}",
-                    project="kdfp",
-                    group="jsd_beta_search",
+                    name=config["wandb_run_name"],
+                    project=training_params.wandb.project,
+                    group=training_params.wandb.group,
                 ),
+            )
+            wandb.init(
+                project=training_params.wandb.project,
+                group=training_params.wandb.group,
+                name=config["wandb_run_name"],
+                reinit=True,
             )
             trainer = prepare_trainer(trainer)
             module.train()
             trainer.fit(module)
+            wandb.finish()
 
-        def tune_asha(num_trials: int):
-            train_loop_config = {
+        def train_fixed_params(fixed_params: FixedHparamSet):
+            fixed_config = {
+                "learning_rate": fixed_params.lr,
+                "weight_decay": fixed_params.weight_decay,
+                "max_grad_norm": fixed_params.max_grad_norm,
+                "temperature": fixed_params.temperature,
+                "wandb_run_name": f"{run_name}_fixed_{uuid.uuid4().hex[:6]}",
+            }
+            scaling_config = ray.train.ScalingConfig(
+                num_workers=training_params.resources.student.num_ray_workers,
+                use_gpu=True,
+                resources_per_worker={
+                    "CPU": training_params.resources.student.num_cpus_per_trial,
+                    "GPU": training_params.resources.student.num_gpus_per_trial,
+                },
+                placement_strategy="PACK",
+            )
+            train_run_config = ray.train.RunConfig(
+                name=f"{run_name}_fixed_{uuid.uuid4().hex[:6]}",
+                checkpoint_config=ray.tune.CheckpointConfig(
+                    num_to_keep=1,
+                    checkpoint_frequency=0,
+                    checkpoint_score_attribute="val_acc",
+                    checkpoint_score_order="max",
+                ),
+                failure_config=ray.train.FailureConfig(
+                    max_failures=training_params.resources.max_failures
+                ),
+                storage_path=str(dirs.ray),
+            )
+            trainer = ray.train.torch.TorchTrainer(
+                train_student_per_worker,
+                train_loop_config=fixed_config,
+                run_config=train_run_config,
+                scaling_config=scaling_config,
+            )
+
+            return trainer.fit()
+
+        def tune_asha(num_trials: int, tune_params: TuneParams):
+            tune_config = {
                 "learning_rate": ray.tune.qloguniform(
-                    hyperparams.lr.mini, hyperparams.lr.maxi, 1e-6
+                    tune_params.lr.mini, tune_params.lr.maxi, 1e-6
                 ),
                 "weight_decay": ray.tune.qloguniform(
-                    hyperparams.weight_decay.mini, hyperparams.weight_decay.maxi, 1e-4
+                    tune_params.weight_decay.mini, tune_params.weight_decay.maxi, 1e-4
                 ),
-                "batch_size": ray.tune.choice(hyperparams.batch_sizes),
                 "max_grad_norm": ray.tune.quniform(
-                    hyperparams.max_grad_norm.mini, hyperparams.max_grad_norm.maxi, 1e-1
+                    tune_params.max_grad_norm.mini, tune_params.max_grad_norm.maxi, 1e-1
                 ),
                 "temperature": ray.tune.quniform(
-                    hyperparams.temperature.mini, hyperparams.temperature.maxi, 1e-1
+                    tune_params.temperature.mini, tune_params.temperature.maxi, 1e-1
                 ),
+                "wandb_run_name": f"{run_name}_tune_{uuid.uuid4().hex[:6]}",
             }
             scaling_config = ray.train.ScalingConfig(
                 num_workers=training_params.resources.student.num_ray_workers,
@@ -490,7 +630,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 placement_strategy="PACK",
             )
             tune_run_config = ray.tune.RunConfig(
-                name=f"{run_name}_tune_{uuid.uuid4().hex[:6]}",
+                name=tune_config["wandb_run_name"],
                 checkpoint_config=ray.tune.CheckpointConfig(
                     num_to_keep=1,
                     checkpoint_frequency=0,
@@ -500,40 +640,70 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 failure_config=ray.tune.FailureConfig(
                     max_failures=training_params.resources.max_failures
                 ),
-                storage_path=dirs.ray,
-                # callbacks=[WandbLoggerCallback(
-                #     project="kdfp",
-                #     group="students",
-                #     run_name=f"{run_name}_tune_{uuid.uuid4().hex[:6]}",
-                # )]
+                storage_path=str(dirs.ray),
+                callbacks=[
+                    WandbLoggerCallback(
+                        project=training_params.wandb.project,
+                        group=training_params.wandb.group,
+                        run_name=tune_config["wandb_run_name"],
+                    )
+                ],
             )
             ray_ptl_trainer = ray.train.torch.TorchTrainer(
                 train_student_per_worker,
                 scaling_config=scaling_config,
             )
 
-            scheduler = ASHAScheduler(
-                max_t=lm_params.num_epochs, grace_period=1, reduction_factor=2
+            optuna_search = OptunaSearch(
+                metric="val_acc",  # Preserving your optimization goal
+                mode="max",
+                seed=cfg.seed,
+            )
+
+            search_alg = ConcurrencyLimiter(
+                optuna_search,
+                max_concurrent=math.floor(
+                    training_params.resources.num_available_gpus
+                    / training_params.resources.student.num_gpus_per_trial
+                ),
+            )
+
+            asha_scheduler = ASHAScheduler(
+                time_attr="training_iteration",
+                max_t=total_steps,
+                grace_period=1,  # Minimum number of iterations before pruning can occur
+                reduction_factor=3,
             )
             tuner = ray.tune.Tuner(
-                ray_ptl_trainer,
-                param_space={"train_loop_config": train_loop_config},
+                trainable=ray_ptl_trainer,
+                param_space={"train_loop_config": tune_config},
                 run_config=tune_run_config,
                 tune_config=ray.tune.TuneConfig(
                     metric="val_acc",
                     mode="max",
                     num_samples=num_trials,
-                    scheduler=scheduler,
-                    max_concurrent_trials=(
-                        training_params.resources.num_available_gpus
-                        // training_params.resources.student.num_gpus_per_trial
-                    ),
+                    scheduler=asha_scheduler,
+                    search_alg=search_alg,
                 ),
             )
             return tuner.fit()
 
-        results = tune_asha(num_trials=lm_params.n_trials)
-        best_result = results.get_best_result()
+        fixed_params = get_fixed_student_params(
+            hyperparams, cfg.student_type, cfg.training_type
+        )
+
+        if fixed_params:
+            best_result = train_fixed_params(fixed_params=fixed_params)
+        elif hyperparams.tune:
+            best_result = tune_asha(
+                num_trials=training_params.n_trials, tune_params=hyperparams.tune
+            ).get_best_result()
+        else:
+            raise ValueError("Neither valid fixed params nor tuning params were found.")
+
+        assert best_result.checkpoint is not None, (
+            "No checkpoint found in best Student result."
+        )
         with best_result.checkpoint.as_directory() as checkpoint_dir:
             return StudentModule.load_from_checkpoint(
                 f"{checkpoint_dir}/checkpoint.ckpt"
@@ -548,21 +718,21 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         student_hf_state_dict, _ = convert_hooked_to_neox_weights(
             self.student, cfg=self.student.cfg
         )
-        if self.train_config.student_cfg.layer_reduction_factor:
+        if self.train_config.distill_pair.student.layer_reduction_factor:
             hf, _, _ = load_shallow(
-                model_name=self.train_config.student_cfg.model_name,
+                model_name=self.train_config.distill_pair.student.name,
                 mode="hf",
-                layer_reduction_factor=self.train_config.student_cfg.layer_reduction_factor,
+                layer_reduction_factor=self.train_config.distill_pair.student.layer_reduction_factor,
                 selection_method="linspace",
                 torch_dtype=self.train_config.torch_dtype,
             )
         else:
             hf = AutoModelForCausalLM.from_pretrained(
-                self.train_config.student_cfg.model_name,
+                self.train_config.distill_pair.student.name,
                 dtype=self.train_config.torch_dtype,
             )
         hf.load_state_dict(student_hf_state_dict)
-        hf.save_pretrained(path)
+        hf.save_pretrained(path)  # type: ignore
 
         with open(f"{path}/pl_config.json", "w") as f:
             # cfg = self.train_config.model_dump()
@@ -582,6 +752,6 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         )
         student_module.student.load_state_dict(student_tl_state_dict)
         print(
-            f"Student {student_module.train_config.name.upper()} for task {student_module.train_config.task.name} loaded from {path}"
+            f"Student {student_module.train_config.exp_name.upper()} for task {student_module.train_config.task.name} loaded from {path}"
         )
         return student_module

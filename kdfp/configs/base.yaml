@@ -59,8 +59,8 @@ training_params:
   torch_dtype: bfloat16
 
   controls:
-    # baselines are finetuned student and teacher,
-    # and student and teacher with no training
+    # baselines are teacher, finetuned students, and
+    # students with no training
     finetune_teacher: false
     get_baselines: true
     run_or_test: run
@@ -70,6 +70,11 @@ training_params:
     max_failures: 1  # 10
     num_available_gpus: 2
     stream_data: false
+    projector:
+      num_data_workers: 12
+      num_ray_workers: 1
+      num_cpus_per_trial: 12
+      num_gpus_per_trial: 1.0
     teacher:
       num_data_workers: 12
       num_ray_workers: 1
@@ -90,6 +95,7 @@ training_params:
       token_rename: false
     total_tokens: 1000000
     cache_batch_size: 8
+    train_batch_size: 2048
     num_epochs: 1
     n_trials: 8
     force_cache_all: false
@@ -115,14 +121,15 @@ hparams:
       lr: 2e-5
       weight_decay: 2e-4
       max_grad_norm: 0.5
+
     pretrained:
       ft:
         lr: 3.4e-5
         weight_decay: 1e-2
         max_grad_norm: 2.0
         temperature: 1.0
-
       kd: null
+
     shallow:
       ft:
         lr: 4.9e-5
@@ -131,19 +138,21 @@ hparams:
         temperature: 3e-1
       kd: null
 
+    off_proj: null
+
   tune:
     lr:
       mini: 1e-6
-      maxi: 1e-3  # [1e-6, 5e-6, 1e-5, 5e-5]
+      maxi: 1e-3
     weight_decay:
       mini: 1e-4
-      maxi: 0.1  # [1e-5, 1e-3, 1e-2, 0.1]
+      maxi: 0.1
     temperature:
       mini: 0.1
-      maxi: 2.0  # [0.1, 0.5, 1.0, 2.0]
+      maxi: 2.0
     max_grad_norm:
       mini: 0.1
-      maxi: 2.0  # [0.1, 0.5, 1.0, 2.0]
+      maxi: 2.0
 
 tasks:
   hellaswag:

@@ -1,0 +1,177 @@
+suite_title: &suite 'base'
+models: 
+  teacher:
+    name: &teacher_name EleutherAI/pythia-2.8b-deduped
+    layer_reduction_factor: null
+    kd_layer_filter_factors: [1]
+  pretrained:
+    name: EleutherAI/pythia-1.4b-deduped
+    layer_reduction_factor: null
+    kd_layer_filter_factors: [1]
+  shallow:
+    name: *teacher_name
+    kd_layer_filter_factors: [1]
+    layer_reduction_factor: 0.45
+
+directories:
+  root: results
+  cache: cache
+  models: models
+  scores: scores
+  ray: ray
+  lightning: lightning
+
+experiment_space:
+  seeds: [3] # [3, 27, 44]
+  student_types: ["pretrained", "shallow"]
+  objective:
+    jsd_betas: [0.5]  # [0.0, 0.25, 0.5, 0.75, 1.0]
+    weight_variants:
+      # - "only_outputs"
+      - "balanced"
+      # - "no_embed"
+      # - "no_attn_scores"
+      # - "no_attn_out"
+      # - "no_mlp"
+      # - "no_resid"
+      # - "with_embed"
+      # - "with_attn_scores"
+      # - "with_attn_out"
+      # - "with_mlp"
+      # - "with_resid"
+  projection:
+    directions: ["up", "down"]
+    training_methods: ["offline", "online", "randomized"]
+    offline_alignment_betas: [0.5]  # [0.0, 0.25, 0.5, 0.75, 1.0]
+  filters:
+    include: null
+    exclude: null
+
+training_params:
+  seq_len: 256
+  train_batch_size: 8  # 48
+  test_batch_size: 16  # 128
+  num_samples: null
+  num_epochs: 1  # 4
+  n_trials: 1  # 25
+  reproducible_backend: true
+  device: cuda
+  torch_dtype: bfloat16
+
+  controls:
+    # baselines are teacher, finetuned students, and
+    # students with no training
+    finetune_teacher: false
+    get_baselines: true
+    run_or_test: run
+    testing_mode: pl  # hf
+
+  resources:
+    max_failures: 1
+    num_available_gpus: 2
+    stream_data: true
+    projector:
+      num_data_workers: 12
+      num_ray_workers: 1
+      num_cpus_per_trial: 12
+      num_gpus_per_trial: 1.0
+    teacher:
+      num_data_workers: 12
+      num_ray_workers: 1
+      num_cpus_per_trial: 12
+      num_gpus_per_trial: 1.0
+    student:
+      num_data_workers: 12
+      num_ray_workers: 1
+      num_cpus_per_trial: 12
+      num_gpus_per_trial: 1.0
+
+  offline_projection:
+    dataset: 
+      name: common-pile/comma_v0.1_training_dataset
+      subset: null
+      split: train
+      shuffle: false
+      token_rename: false
+    total_tokens: 1000000
+    cache_batch_size: 8
+    train_batch_size: 2048
+    num_epochs: 1
+    n_trials: 8
+    force_cache_all: false
+
+  wandb:
+    project: 'kdfp-ted'
+    group: *suite
+
+
+hook_types:
+  single:
+    - "hook_embed"
+  per_layer:
+    - "attn.hook_attn_scores"
+    - "hook_attn_out"
+    - "hook_mlp_out"
+    - "hook_resid_post"
+
+
+hparams:
+  fixed:
+    teacher:
+      lr: 2e-5
+      weight_decay: 2e-4
+      max_grad_norm: 0.5
+
+    pretrained:
+      ft:
+        lr: 3.4e-5
+        weight_decay: 1e-2
+        max_grad_norm: 2.0
+        temperature: 1.0
+      kd: null
+
+    shallow:
+      ft:
+        lr: 4.9e-5
+        weight_decay: 3e-4
+        max_grad_norm: 0.4
+        temperature: 3e-1
+      kd: null
+
+    off_proj: null
+
+  tune:
+    lr:
+      mini: 1e-6
+      maxi: 1e-3
+    weight_decay:
+      mini: 1e-4
+      maxi: 0.1
+    temperature:
+      mini: 0.1
+      maxi: 2.0
+    max_grad_norm:
+      mini: 0.1
+      maxi: 2.0
+
+tasks:
+  hellaswag:
+    dataset_name: Rowan/hellaswag
+  # arc_challenge:
+  #   dataset_name: allenai/ai2_arc
+  #   subset: ARC-Challenge
+  # arc_easy:
+  #   dataset_name: allenai/ai2_arc
+  #   subset: ARC-Easy
+  # boolq:
+  #   dataset_name: aps/super_glue
+  #   subset: boolq
+  # piqa:
+  #   dataset_name: baber/piqa
+  # sciq:
+  #   dataset_name: allenai/sciq
+  # winogrande:
+  #   dataset_name: allenai/winogrande
+  #   subset: winogrande_xl
+
+  

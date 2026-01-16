@@ -1,6 +1,6 @@
 import os
 from argparse import ArgumentParser
-from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 import torch
@@ -11,28 +11,15 @@ from kdfp.utils.general import get_timestamp
 DEFAULT_CONFIG = "kdfp/configs/base.yaml"
 
 
-def parse_cli_args():
-    """Parse CLI arguments for the kdfp command"""
-    parser = ArgumentParser(description="KDFP Command Line Interface")
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
-
-    # Add 'run' command
-    run_parser = subparsers.add_parser("run", help="Run the experiment pipeline")
-    run_parser.add_argument(
-        "-c",
-        "--config",
-        default=DEFAULT_CONFIG,
-        help=f"Path to config file (default: {DEFAULT_CONFIG})",
-    )
-
-    return parser.parse_args()
-
-
-def main(config_path: str):
+def run_suite(suite_config_path: str):
+    """
+    The core logic of the pipeline.
+    This can be called safely from other Python scripts.
+    """
     os.environ["TOKENIZERS_PARALLELISM"] = "true"
     torch.set_float32_matmul_precision("medium")
 
-    suite = Suite.from_yaml(config_path)
+    suite = Suite.from_yaml(suite_config_path)
 
     experiment_list, experiment_names = suite.generate_experiment_list()
     n = len(experiment_names)
@@ -55,10 +42,6 @@ def main(config_path: str):
         print(f"\nStarting experiment {i + 1}/{n}: {experiment.cfg.name.upper()}")
         experiment.init()
 
-        # Now that teachers have certainly been initialized, get benchmark scores.
-        # We can get them from any experiment and only need to do it once, might as well
-        # do the first one
-
         if i == 0 and suite.training_params.controls.get_baselines:
             print("\nBeginning teacher testing...")
             results_list.extend(
@@ -69,10 +52,8 @@ def main(config_path: str):
             print("Teacher testing complete!\n")
 
         if suite.training_params.controls.run_or_test == "run":
-            # this creates models, then tests them
             results_list.extend(experiment.run())
         else:
-            # this tests existing models
             results_list.extend(
                 experiment.test_student(
                     mode=suite.training_params.controls.testing_mode
@@ -81,30 +62,45 @@ def main(config_path: str):
 
         print(f"Finished experiment {i + 1}/{n}: {experiment.cfg.name.upper()}")
 
-    base_scores_dir = Path(
-        suite.parsed_dirs.root + "/" + suite.parsed_dirs.scores
-    ).resolve()
-    base_scores_dir.mkdir(parents=True, exist_ok=True)
-    df_path = base_scores_dir / f"results_df_{get_timestamp()}.parquet"
+    suite_scores_dir = suite.parsed_dirs.get_suite_scores_dir(suite.suite_title)
+    suite_scores_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = get_timestamp()
+    df_path = suite_scores_dir / f"results_df_{timestamp}.parquet"
     results_df = pd.DataFrame(results_list)
     results_df.to_parquet(df_path)
-    results_df.to_markdown(base_scores_dir / f"results_df_{get_timestamp()}.md")
-    print(
-        f"Results dataframe for experiment configuration {config_path} saved in Parquet format to:\n\t{df_path}\n"
-    )
-    print(results_df)
+    results_df.to_markdown(suite_scores_dir / f"results_df_{timestamp}.md")
+
+    print(f"Results saved to: {df_path}")
+    return results_df
 
 
-def cli_main():
-    """Entry point for the kdfp command"""
-    args = parse_cli_args()
+def main(config_path: Optional[str] = None):
+    """
+    Entry point that handles CLI arguments if no config_path is provided.
+    """
+    if config_path is None:
+        parser = ArgumentParser(description="KDFP Command Line Interface")
+        subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    if args.command == "run":
-        main(config_path=args.config)
+        run_parser = subparsers.add_parser("run", help="Run the experiment pipeline")
+        run_parser.add_argument(
+            "-c",
+            "--config",
+            default=DEFAULT_CONFIG,
+            help=f"Path to config file (default: {DEFAULT_CONFIG})",
+        )
+
+        args = parser.parse_args()
+
+        if args.command == "run":
+            run_suite(args.config)
+        else:
+            parser.print_help()
     else:
-        print("Usage: kdfp run [--config CONFIG_FILE]")
-        print("Run 'kdfp run --help' for more options")
+        # If config_path is passed directly (module usage)
+        run_suite(config_path)
 
 
 if __name__ == "__main__":
-    cli_main()
+    main()

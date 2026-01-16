@@ -194,4 +194,15 @@ OBJECTIVE_WEIGHT_VARIANTS_MAP = {
             "resid": 0.0,
         }
     ),
+    "no_train": ObjectiveWeights(
+        **{
+            "teacher_outputs": -1,
+            "true_labels": -1,
+            "embed": -1,
+            "attn_scores": -1,
+            "attn_out": -1,
+            "mlp": -1,
+            "resid": -1,
+        }
+    ),
 }

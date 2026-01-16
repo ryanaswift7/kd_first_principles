@@ -1,8 +1,8 @@
-import uuid
 from pathlib import Path
 from typing import Any, Dict, Union
 
 import ray.train
+import wandb
 from lightning.pytorch import Trainer
 from lightning.pytorch.loggers import WandbLogger
 from ray.train.lightning import (
@@ -12,6 +12,8 @@ from ray.train.lightning import (
     prepare_trainer,
 )
 
+from kdfp.schemas.trainingParams import TrainingParams
+
 from .offlineProjector import OfflineProjectorModule, OffProjModuleConfig
 
 # from pytorch_lightning.loggers.csv_logs import CSVLogger
@@ -20,26 +22,27 @@ from .projectorDataModule import ProjectorDataModule
 
 def train_projector_per_worker(
     config: Dict[str, Any],
-    run_name: str,
     teacher_cache_dir: Union[str, Path],
     student_cache_dir: Union[str, Path],
     teacher_dim: int,
     student_dim: int,
     alignment_beta: float,
-    training_params: TrainingParamsConfig,
+    training_params: TrainingParams,
     max_epochs: int,
+    seed: int,
+    batch_size: int,
     val_split: float = 0.1,
     test_split: float = 0.1,
 ):
     """Training function for Ray Tune"""
     if training_params.reproducible_backend:
-        ray.train.torch.enable_reproducibility()
+        ray.train.torch.enable_reproducibility()  # type: ignore
 
     datamodule = ProjectorDataModule(
         teacher_cache_dir=teacher_cache_dir,
         student_cache_dir=student_cache_dir,
-        batch_size=config["batch_size"],
-        seed=training_params.seed,
+        batch_size=batch_size,
+        seed=seed,
         num_workers=training_params.resources.projector.num_data_workers,
         val_split=val_split,
         test_split=test_split,
@@ -69,11 +72,17 @@ def train_projector_per_worker(
         deterministic=training_params.reproducible_backend,
         check_val_every_n_epoch=1,
         logger=WandbLogger(
-            name=f"{run_name}_tune_{uuid.uuid4().hex[:6]}",
-            project="kdfp",
-            group="off_proj_search",
+            name=config["wandb_run_name"],
+            project=training_params.wandb.project,
+            group=training_params.wandb.group,
         ),
     )
+    wandb.init(
+        project=training_params.wandb.project,
+        group=training_params.wandb.group,
+        name=config["wandb_run_name"],
+        reinit=True,
+    )
     trainer = prepare_trainer(trainer)
-
     trainer.fit(model, datamodule=datamodule)
+    wandb.finish()

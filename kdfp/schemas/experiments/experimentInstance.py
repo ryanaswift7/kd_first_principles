@@ -39,11 +39,11 @@ class ExperimentInstance(ConfigBase):
         self,
         # cache_dir: str,
         # save_dir: str,
-        teacher_dir: Optional[str] = None,
-        student_dir: Optional[str] = None,
+        local_teacher_dir: Optional[str] = None,
+        local_student_dir: Optional[str] = None,
     ) -> None:
         """Initialize the offline projector for an experiment. Defaults to pretrained teacher
-        and student, but you may use a custom version instead by passing in the directories.
+        and student, but you may use custom local versions instead by passing in the directories.
         """
         # if we already trained one, load it instead of creating another
         off_proj_weights_path = Path(
@@ -67,8 +67,8 @@ class ExperimentInstance(ConfigBase):
                         training_params=self.training_params,
                         cache_dir=str(cache_dir),
                         cache_outputs=False,
-                        local_teacher_dir=None,
-                        local_student_dir=None,
+                        local_teacher_dir=local_teacher_dir,
+                        local_student_dir=local_student_dir,
                     )
                 )
 
@@ -78,12 +78,13 @@ class ExperimentInstance(ConfigBase):
                 student_cache_dir=student_cache_dir,
                 teacher_dim=teacher_dim,
                 student_dim=student_dim,
-                projection=self.projection,
+                projection=self.cfg.projection,  # type: ignore
                 hyperparams=self.hparams,
                 training_params=self.training_params,
                 dirs=self.dirs,
                 val_split=0.1,
                 test_split=0.1,
+                seed=self.cfg.seed,
             )
             projector.save_pretrained(path=self.dirs.off_proj_models)  # type: ignore
             # load_test = OfflineProjector.load_pretrained(save_path=self.dirs.off_proj_models)
@@ -135,6 +136,7 @@ class ExperimentInstance(ConfigBase):
                 hyperparams=self.hparams,
                 training_params=self.training_params,
                 dirs=self.dirs,
+                seed=self.cfg.seed,
             )
             t.save_pretrained(path=f"{self.dirs.teacher_model}/{task.name}")
 
@@ -177,24 +179,18 @@ class ExperimentInstance(ConfigBase):
                 continue
 
             student_module = StudentModule.create(
-                exp_name=self.name,
+                cfg=self.cfg,
                 dirs=self.dirs,
-                student_cfg=self.student_cfg,
-                teacher_cfg=self.teacher_cfg,
                 task=task,
-                lm_params=self.lm_params,
                 hyperparams=self.hparams,
                 training_params=self.training_params,
-                projection=self.projection,
-                jsd_beta=self.jsd_beta,
-                objective_weights=self.objective_weights,
             )
             student_module.save_pretrained(model_save_dir)
             results = self.test_trainer_factory().test(
                 model=student_module, verbose=True
             )
             new_result = generate_result(
-                name=self.name,
+                name=self.cfg.name,
                 model=student_module.student,
                 task_name=task.name,
                 metric_name="accuracy",

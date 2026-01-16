@@ -9,20 +9,21 @@ class OffProjTrainArgs(ConfigBase):
     dataset: DatasetConfig
     total_tokens: int
     cache_batch_size: int
+    train_batch_size: int
     num_epochs: int
     n_trials: int
     force_cache_all: bool
 
 
-class OffProjInstance(ConfigBase):
-    alignment_beta: float
-    training_args: OffProjTrainArgs
+# class OffProjConfig(ConfigBase):
+#     alignment_beta: float
+#     training_args: OffProjTrainArgs
 
 
 class ProjectionInstance(ConfigBase):
     direction: ProjectionDirection
     training_method: ProjectionTraining
-    offline_alignment_beta: Optional[float]
+    offline_alignment_beta: Optional[float] = None
 
 
 class ProjectionParser(ConfigBase):

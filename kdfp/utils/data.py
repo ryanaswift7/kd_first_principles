@@ -36,19 +36,19 @@ def load_data(
     tokenizer,
     seq_len: int,
     dataset_name: str,
+    streaming: bool,
     subset: Optional[str] = None,
     split: str = "train",
     token_rename: bool = False,
     n_samples: Optional[int] = None,
-    streaming: bool = True,
-) -> Dataset:
+):
     if subset:
         dataset = load_dataset(
             dataset_name,
             subset,
             split=split,
             trust_remote_code=True,
-            streaming=True,
+            streaming=streaming,
         )
 
     else:
@@ -56,7 +56,7 @@ def load_data(
             dataset_name,
             split=split,
             trust_remote_code=True,
-            streaming=True,
+            streaming=streaming,
         )
 
     if n_samples:
@@ -455,6 +455,8 @@ def _preprocess_task_ft(
     #     tokenized['labels'] = tokenized['input_ids'].clone()
     #     return tokenized
     # else:
+
+    assert labels is not None, "Labels should not be None for any splits."
     if split != "train":
         # For validation, reshape the tokenized outputs
         num_examples = len(labels)
@@ -474,8 +476,9 @@ def load_task_data(
     tokenizer,
     seq_len: int,
     split: str,
+    streaming: bool,
     n_samples: Optional[int] = None,
-) -> Dataset:
+):
     """
     Loads and preprocesses a dataset for a given task.
 
@@ -505,20 +508,22 @@ def load_task_data(
             task.subset,
             split=actual_split,
             trust_remote_code=True,
-            streaming=True,
+            streaming=streaming,
         )
     else:
         dataset = load_dataset(
             task.dataset_name,
             split=actual_split,
             trust_remote_code=True,
-            streaming=True,
+            streaming=streaming,
         )
-    if not task.test_available:
+    if not task.test_available and task.ninety_percent is not None:
         if split == "train":
             dataset = dataset.take(task.ninety_percent)
         elif split == "validation":
             dataset = dataset.skip(task.ninety_percent)
+    else:
+        raise ValueError("If test_available is False, ninety_percent must be set.")
 
     if n_samples:
         dataset = dataset.take(n_samples)
@@ -565,6 +570,10 @@ class CachedActivationsDataset(Dataset):
         # Load batch mapping information
         if not batch_mapping_location:
             batch_mapping_location = cache_dir
+
+        assert batch_mapping_location is not None, (
+            "Batch mapping location must be specified"
+        )
         mapping_path = os.path.join(batch_mapping_location, "batch_mapping.txt")
         self.batch_mapping = pd.read_csv(mapping_path)
 
@@ -711,7 +720,7 @@ class HookCache(BaseModel):
 
         def get_layer_from_hook_name(hook_name: str) -> int:
             # ex) blocks.0.hook_resid_post, or blocks.0.attn.hook_attn_scores
-            return hook_name.split(".")[1]
+            return int(hook_name.split(".")[1])
 
         def form_cached_dataset_lists(hook_type: str) -> None:
             if hook_dict[hook_type]:

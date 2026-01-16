@@ -1,5 +1,4 @@
 from copy import deepcopy
-from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
 
 import lightning.pytorch as pl
@@ -196,12 +195,11 @@ class Suite(ConfigBase):
             layer_reduction_factor=layer_reduction_factor,
         )
 
-    def generate_experiment_list(
-        self, debug: bool = False
-    ) -> Tuple[List[ExperimentInstance], List[str]]:
+    def generate_experiment_list(self) -> Tuple[List[ExperimentInstance], List[str]]:
         base_dirs = self.parsed_dirs.resolve()
 
         exp_cfg_list = self.experiment_space.generate_experiment_cfgs(
+            suite_title=self.suite_title,
             distill_groups=self.distill_groups,
             get_baselines=self.training_params.controls.get_baselines,
         )
@@ -275,12 +273,12 @@ class Suite(ConfigBase):
                 )
             )
 
-            scores_dir = (
-                Path(self.parsed_dirs.root) / self.parsed_dirs.scores / "baselines"
+            base_teacher_scores_dir = (
+                self.parsed_dirs.get_suite_scores_dir(self.suite_title) / "base_teacher"
             )
-            scores_dir.mkdir(parents=True, exist_ok=True)
+            base_teacher_scores_dir.mkdir(parents=True, exist_ok=True)
             pd.DataFrame(results_list).to_parquet(
-                scores_dir / f"results_df_{get_timestamp()}.parquet"
+                base_teacher_scores_dir / f"results_df_{get_timestamp()}.parquet"
             )
 
         return results_list

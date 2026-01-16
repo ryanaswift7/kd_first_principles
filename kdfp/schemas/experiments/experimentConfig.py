@@ -24,16 +24,17 @@ class ObjectiveInstance(ConfigBase):
 
     @computed_field
     @property
-    def weights_obj(self) -> ObjectiveWeights:
+    def weights(self) -> ObjectiveWeights:
         return OBJECTIVE_WEIGHT_VARIANTS_MAP[self.weight_str]
 
 
 @dataclass
 class ExperimentConfig(ConfigBase):
+    suite_title: str
     seed: int
     student_type: StudentType
     distill_pair: DistillationPair
-    objective: Optional[ObjectiveInstance] = None
+    objective: ObjectiveInstance
     projection: Optional[ProjectionInstance] = None
     training_type: TrainingType
 
