@@ -28,18 +28,17 @@ class ObjectiveWeightStr(str, Enum):
     ONLY_OUTPUTS = "only_outputs"
     BALANCED = "balanced"
     FINETUNING = "finetuning"
-    NO_TRAIN = "no_train"
 
     # "No" variants
     NO_EMBED = "no_embed"
-    NO_ATTN_SCORES = "no_attn_scores"
+    # NO_ATTN_SCORES = "no_attn_scores"
     NO_ATTN_OUT = "no_attn_out"
     NO_MLP = "no_mlp"
     NO_RESID = "no_resid"
 
     # "With" variants
     WITH_EMBED = "with_embed"
-    WITH_ATTN_SCORES = "with_attn_scores"
+    # WITH_ATTN_SCORES = "with_attn_scores"
     WITH_ATTN_OUT = "with_attn_out"
     WITH_MLP = "with_mlp"
     WITH_RESID = "with_resid"

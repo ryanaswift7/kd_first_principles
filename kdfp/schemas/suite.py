@@ -1,20 +1,16 @@
 from copy import deepcopy
 from typing import Dict, List, Literal, Optional, Tuple
 
-import lightning.pytorch as pl
 import numpy as np
-import pandas as pd
 import torch
 import yaml
-from pydantic import Field, computed_field, field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from transformer_lens import HookedTransformer
 
-from kdfp.core.baseline import BaselineModule, BaselineModuleConfig
 from kdfp.schemas.configBase import ConfigBase
 from kdfp.schemas.directories import DirectoryParser
 from kdfp.schemas.experiments.experimentInstance import (
     ExperimentInstance,
-    TaskInstance,
 )
 from kdfp.schemas.experiments.experimentSpace import ExperimentSpace
 from kdfp.schemas.hparams import HparamsConfig
@@ -24,36 +20,36 @@ from kdfp.schemas.models import (
     DistillationPair,
     ModelSelection,
 )
-from kdfp.schemas.projections import ProjectionParser
-from kdfp.schemas.tasks import TaskConfig
+from kdfp.schemas.tasks import LMEvalTasks
 from kdfp.schemas.trainingParams import TrainingParams
-from kdfp.utils.general import get_hook_block_idx, get_timestamp
-from kdfp.utils.results import generate_result
+from kdfp.utils.general import get_hook_block_idx
 from kdfp.utils.shallow_model_loading import get_indices_and_num_layers_to_keep
 
 
 class Suite(ConfigBase):
     suite_title: str
     models: ModelSelection
-    parsed_dirs: DirectoryParser
+    directories: DirectoryParser
     experiment_space: ExperimentSpace
     training_params: TrainingParams
     hook_types: Dict[str, List[str]] = Field(
         ..., description="Keys 'single' and 'per_layer' with lists of hook names"
     )
-    projection: ProjectionParser
     hparams: HparamsConfig
     # A dictionary where the key is the task name
     # (e.g., 'hellaswag') and the value is its config
-    tasks: Dict[str, TaskConfig]
+    tasks: LMEvalTasks
+    distill_groups: DistillationGroups = Field(
+        default=None, init=False, validate_default=False
+    )  # type: ignore
 
-    @computed_field
-    @property
-    def task_list(self) -> List[TaskInstance]:
-        return [
-            TaskInstance(name=name, dataset_name=cfg.dataset_name, subset=cfg.subset)
-            for name, cfg in self.tasks.items()
-        ]
+    # @computed_field
+    # @property
+    # def task_list(self) -> List[TaskInstance]:
+    #     return [
+    #         TaskInstance(name=name, dataset_name=cfg.dataset_name, subset=cfg.subset)
+    #         for name, cfg in self.tasks.items()
+    #     ]
 
     # validator to ensure hook point keys are expected
     @field_validator("hook_types")
@@ -196,7 +192,7 @@ class Suite(ConfigBase):
         )
 
     def generate_experiment_list(self) -> Tuple[List[ExperimentInstance], List[str]]:
-        base_dirs = self.parsed_dirs.resolve()
+        base_dirs = self.directories.resolve(suite_title=self.suite_title)
 
         exp_cfg_list = self.experiment_space.generate_experiment_cfgs(
             suite_title=self.suite_title,
@@ -212,7 +208,7 @@ class Suite(ConfigBase):
                 dirs=dirs,
                 training_params=self.training_params,
                 hparams=self.hparams,
-                task_list=self.task_list,
+                tasks=self.tasks,
             )
             for (cfg, dirs) in cfg_and_dirs
         ]
@@ -230,55 +226,56 @@ class Suite(ConfigBase):
 
         return sorted_experiment_list, sorted(exp_names)
 
-    def run_baseline_teacher_tests(self) -> List[dict]:
-        pl.seed_everything(seed=self.experiment_space.default_seed, workers=True)
-        results_list = []
+    # def run_baseline_teacher_tests(self) -> List[dict]:
+    #     pl.seed_everything(seed=self.experiment_space.default_seed, workers=True)
+    #     results_list = []
 
-        def trainer_factory() -> pl.Trainer:
-            return pl.Trainer(
-                accelerator="gpu",
-                strategy="auto",
-                devices=1,
-                deterministic=self.training_params.reproducible_backend,
-                default_root_dir=self.parsed_dirs.root
-                + "/"
-                + self.parsed_dirs.lightning,
-            )
+    #     def trainer_factory() -> pl.Trainer:
+    #         return pl.Trainer(
+    #             accelerator="gpu",
+    #             strategy="auto",
+    #             devices=1,
+    #             deterministic=self.training_params.reproducible_backend,
+    #             default_root_dir=self.directories.root
+    #             + "/"
+    #             + self.directories.lightning,
+    #         )
 
-        for task in self.task_list:
-            base_teacher_cfg = BaselineModuleConfig(
-                model_name=self.models.teacher.name,
-                is_shallow=False,
-                task=task,
-                seq_len=self.training_params.seq_len,
-                batch_size=self.training_params.test_batch_size,
-                seed=self.experiment_space.default_seed,
-                torch_dtype=self.training_params.torch_dtype,
-                num_data_workers=self.training_params.resources.teacher.num_data_workers,
-                n_samples=self.training_params.num_samples,
-                layer_reduction_factor=None,
-            )
-            base_teacher_module = BaselineModule(base_teacher_cfg)
-            base_teacher_module.print_param_count("base_teacher")
-            base_teacher_results = trainer_factory().test(
-                model=base_teacher_module, verbose=True
-            )
-            results_list.append(
-                generate_result(
-                    name="base_teacher",
-                    model=base_teacher_module.model,
-                    task_name=task.name,
-                    metric_name="accuracy",
-                    score=base_teacher_results[0]["test_acc"],
-                )
-            )
+    #     for task in self.task_list:
+    #         base_teacher_cfg = BaselineModuleConfig(
+    #             model_name=self.models.teacher.name,
+    #             is_shallow=False,
+    #             task=task,
+    #             seq_len=self.training_params.seq_len,
+    #             batch_size=self.training_params.test_batch_size,
+    #             seed=self.experiment_space.default_seed,
+    #             torch_dtype=self.training_params.torch_dtype,
+    #             num_data_workers=self.training_params.resources.teacher.num_data_workers,
+    #             n_samples=self.training_params.num_samples,
+    #             layer_reduction_factor=None,
+    #             stream_data=self.training_params.resources.stream_task_data,
+    #         )
+    #         base_teacher_module = BaselineModule(base_teacher_cfg)
+    #         base_teacher_module.print_param_count("base_teacher")
+    #         base_teacher_results = trainer_factory().test(
+    #             model=base_teacher_module, verbose=True
+    #         )
+    #         results_list.append(
+    #             generate_result(
+    #                 name="base_teacher",
+    #                 model=base_teacher_module.model,
+    #                 task_name=task.name,
+    #                 metric_name="accuracy",
+    #                 score=base_teacher_results[0]["test_acc"],
+    #             )
+    #         )
 
-            base_teacher_scores_dir = (
-                self.parsed_dirs.get_suite_scores_dir(self.suite_title) / "base_teacher"
-            )
-            base_teacher_scores_dir.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame(results_list).to_parquet(
-                base_teacher_scores_dir / f"results_df_{get_timestamp()}.parquet"
-            )
+    #         base_teacher_scores_dir = (
+    #             self.directories.get_suite_scores_dir(self.suite_title) / "base_teacher"
+    #         )
+    #         base_teacher_scores_dir.mkdir(parents=True, exist_ok=True)
+    #         pd.DataFrame(results_list).to_parquet(
+    #             base_teacher_scores_dir / f"results_df_{get_timestamp()}.parquet"
+    #         )
 
-        return results_list
+    #     return results_list

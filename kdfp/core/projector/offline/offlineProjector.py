@@ -252,7 +252,6 @@ class OfflineProjectorModule(LightningModule):
             fixed_config = {
                 "learning_rate": fixed_off_proj_params.lr,
                 "weight_decay": fixed_off_proj_params.weight_decay,
-                "max_grad_norm": fixed_off_proj_params.max_grad_norm,
                 "tied_weights": fixed_off_proj_params.tied_weights,
                 "wandb_run_name": f"{run_name}_fixed_{uuid.uuid4().hex[:6]}",
             }
@@ -296,11 +295,6 @@ class OfflineProjectorModule(LightningModule):
                     tune_params.weight_decay.mini,
                     tune_params.weight_decay.maxi,
                     5e-6,
-                ),
-                "max_grad_norm": tune.quniform(
-                    tune_params.max_grad_norm.mini,
-                    tune_params.max_grad_norm.maxi,
-                    1e-3,
                 ),
                 "tied_weights": tune.choice([True, False]),
                 "wandb_run_name": f"{run_name}_tune_{uuid.uuid4().hex[:6]}",

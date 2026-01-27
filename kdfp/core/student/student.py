@@ -12,8 +12,9 @@ import ray.train.torch
 import ray.tune
 import torch
 import torch.nn as nn
-import torchmetrics
+import torch.nn.functional as F
 import wandb
+from datasets import load_dataset_builder
 from lightning.pytorch.loggers import WandbLogger
 from ray.air.integrations.wandb import WandbLoggerCallback
 from ray.train.lightning import (
@@ -27,7 +28,6 @@ from ray.tune.search import ConcurrencyLimiter
 from ray.tune.search.optuna import OptunaSearch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
-from torchmetrics import Accuracy, F1Score
 from transformer_lens import HookedTransformer
 from transformers import (
     AutoModelForCausalLM,
@@ -38,7 +38,9 @@ from kdfp.core.projector.offline.offlineProjector import OfflineProjectorModule
 from kdfp.core.projector.online.onlineProjector import OnlineProjector
 from kdfp.core.projector.randomized.RandomizedProjector import RandomizedProjector
 from kdfp.core.student.training_utils import jensen_shannon_divergence
+from kdfp.core.teacher import gen_teacher_weights_filename
 from kdfp.schemas.configBase import ConfigBase
+from kdfp.schemas.dataset import DatasetConfig
 from kdfp.schemas.directories import ExpInstDirs
 from kdfp.schemas.experiments.experimentConfig import ExperimentConfig
 from kdfp.schemas.hparams import (
@@ -51,9 +53,8 @@ from kdfp.schemas.mixins import DtypeSerializerMixin, MCEvalMixin
 from kdfp.schemas.models import DistillationPair
 from kdfp.schemas.objective_weights import ObjectiveWeights
 from kdfp.schemas.projections import ProjectionInstance
-from kdfp.schemas.tasks import TaskInstance
 from kdfp.schemas.trainingParams import TrainingParams
-from kdfp.utils.data import load_task_data
+from kdfp.utils.data import load_data
 from kdfp.utils.enums import ProjectionDirection, ProjectionTraining, TrainingType
 from kdfp.utils.shallow_model_loading import load_shallow
 from kdfp.utils.weight_conversion import (
@@ -62,8 +63,8 @@ from kdfp.utils.weight_conversion import (
 )
 
 
-def gen_student_weights_filename(task_name: str) -> str:
-    return f"student_{task_name}.bin"
+def gen_student_weights_filename() -> str:
+    return "student.bin"
 
 
 class StudentModuleConfig(ConfigBase, DtypeSerializerMixin):
@@ -71,7 +72,7 @@ class StudentModuleConfig(ConfigBase, DtypeSerializerMixin):
     distill_pair: DistillationPair
     dirs: ExpInstDirs
     projection: Optional[ProjectionInstance] = None
-    task: TaskInstance
+    dataset: DatasetConfig
     seq_len: int
     batch_size: int
     temperature: float
@@ -82,12 +83,12 @@ class StudentModuleConfig(ConfigBase, DtypeSerializerMixin):
     torch_dtype: torch.dtype
     num_data_workers: int = 0
     n_samples: Optional[int] = None
-    objective_weights: ObjectiveWeights
+    objective_weights: Optional[ObjectiveWeights]
     jsd_beta: Optional[float]
     total_steps: int
     finetune_teacher: bool
     training_type: TrainingType
-    stream_data: bool
+    streaming: bool
 
 
 class StudentModule(pl.LightningModule, MCEvalMixin):
@@ -117,6 +118,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         assert self.tokenizer is not None, "Tokenizer could not be loaded."
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
         # Data collator for language modeling
         self.data_collator = DataCollatorForLanguageModeling(
@@ -125,29 +127,16 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             return_tensors="pt",
         )
 
-        if self.train_config.task.task_type == "multiclass":
-            acc = Accuracy(task=self.train_config.task.task_type, num_classes=4)
-            f1 = F1Score(task=self.train_config.task.task_type, num_classes=4)
-        else:  # binary
-            acc = Accuracy(task=self.train_config.task.task_type)
-            f1 = F1Score(task=self.train_config.task.task_type)
-
-        # Eval metrics
-        self.val_metrics = torchmetrics.MetricCollection(
-            {
-                "acc": acc,
-                "f1": f1,
-            },
-            prefix="val_",
-        )
-        self.test_metrics = self.val_metrics.clone(prefix="test_")
-
-        # self.train_losses = []
+        # self.val_metrics = torchmetrics.MetricCollection(
+        #     {"ppl": torchmetrics.Perplexity(ignore_index=self.tokenizer.eos_token_id)},
+        #     prefix="val_",
+        # )
+        # self.test_metrics = self.val_metrics.clone(prefix="test_")
 
     def load_teacher(self) -> HookedTransformer:
         if self.train_config.finetune_teacher:
             teacher_hf = AutoModelForCausalLM.from_pretrained(
-                f"{self.train_config.dirs.teacher_model}/{self.train_config.task.name}"
+                f"{self.train_config.dirs.teacher_model}/{gen_teacher_weights_filename()}",
             )
             # load base teacher
             teacher_tl = HookedTransformer.from_pretrained_no_processing(
@@ -155,9 +144,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 dtype=self.train_config.torch_dtype,
             )
 
-            print(
-                f"Loading finetuned weights for teacher model on task {self.train_config.task.name}..."
-            )
+            print("Loading finetuned weights for teacher model...")
             # load finetuned weights, convert to transformer lens format, load into teacher
             tl_teacher_weights = convert_neox_to_hooked_weights(
                 neox_model=teacher_hf, cfg=teacher_tl.cfg
@@ -227,10 +214,6 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         else:
             return nn.Identity()
 
-    @property
-    def model_file(self):
-        return gen_student_weights_filename(self.train_config.task.name)
-
     def forward(self, input_ids, attention_mask, labels=None):
         return self.student(
             input_ids=input_ids, attention_mask=attention_mask, labels=labels
@@ -241,6 +224,9 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         student_hooks = self.train_config.distill_pair.student.hook_list
         teacher_hooks = self.train_config.distill_pair.teacher.hook_list
         obj_weights = self.train_config.objective_weights
+        assert obj_weights is not None, (
+            "Objective weights must be provided for training."
+        )
 
         input_ids = batch["input_ids"]
         total_loss = 0
@@ -341,28 +327,68 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         return total_loss
 
     def validation_step(self, batch, batch_idx):
-        preds, true_labels, correct_choice_loss = self._shared_eval_step(
-            model=self.student, batch=batch, batch_idx=batch_idx
-        )
-        self.val_metrics.update(preds, true_labels)
-        self.log("val_loss", correct_choice_loss, sync_dist=True)
-        return {"val_loss": correct_choice_loss}
+        logits = self.student(batch["input_ids"], return_type="logits")
 
-    def on_validation_epoch_end(self):
-        self.log_dict(self.val_metrics.compute(), sync_dist=True)
-        self.val_metrics.reset()
+        # 2. Align Logits and Labels
+        # TransformerLens logits are [batch, seq_len, vocab_size]
+        # We need to predict the NEXT token, so we shift:
+
+        # Shift logits: Remove the last token's prediction (it has no target)
+        shift_logits = logits[..., :-1, :].contiguous()
+
+        # Shift labels: Remove the first token (it has no history to predict it from)
+        shift_labels = batch["labels"][..., 1:].contiguous()
+
+        # 3. Calculate Cross Entropy manually
+        # 'ignore_index=-100' is the magic key that prevents NaNs from padding
+        val_loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
+
+        perplexity = torch.exp(val_loss)
+
+        self.log("val_loss", val_loss, prog_bar=True)
+        self.log("val_ppl", perplexity, prog_bar=True)
+
+        return val_loss
+
+    # def on_validation_epoch_end(self):
+    #     self.log_dict(self.val_metrics.compute(), sync_dist=True)
+    #     self.val_metrics.reset()
 
     def test_step(self, batch, batch_idx):
-        preds, true_labels, correct_choice_loss = self._shared_eval_step(
-            model=self.student, batch=batch, batch_idx=batch_idx
-        )
-        self.test_metrics.update(preds, true_labels)
-        self.log("test_loss", correct_choice_loss, sync_dist=True)
-        return {"test_loss": correct_choice_loss}
+        logits = self.student(batch["input_ids"], return_type="logits")
 
-    def on_test_epoch_end(self):
-        self.log_dict(self.test_metrics.compute(), sync_dist=True)
-        self.test_metrics.reset()
+        # 2. Align Logits and Labels
+        # TransformerLens logits are [batch, seq_len, vocab_size]
+        # We need to predict the NEXT token, so we shift:
+
+        # Shift logits: Remove the last token's prediction (it has no target)
+        shift_logits = logits[..., :-1, :].contiguous()
+
+        # Shift labels: Remove the first token (it has no history to predict it from)
+        shift_labels = batch["labels"][..., 1:].contiguous()
+
+        # 3. Calculate Cross Entropy manually
+        # 'ignore_index=-100' is the magic key that prevents NaNs from padding
+        test_loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
+
+        perplexity = torch.exp(test_loss)
+
+        self.log("test_loss", test_loss, prog_bar=True)
+        self.log("test_ppl", perplexity, prog_bar=True)
+
+        return test_loss
+
+    # def on_test_epoch_end(self):
+    #     self.log_dict(self.test_metrics.compute(), sync_dist=True)
+    #     self.test_metrics.reset()
 
     def configure_optimizers(self):
         if isinstance(self.projector, OnlineProjector):
@@ -398,13 +424,14 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         }
 
     def train_dataloader(self):
-        dataset = load_task_data(
-            task=self.train_config.task,
+        dataset = load_data(
+            dataset_name=self.train_config.dataset.name,
+            subset=self.train_config.dataset.subset,
             tokenizer=self.tokenizer,
             seq_len=self.train_config.seq_len,
             split="train",
             n_samples=self.train_config.n_samples,
-            streaming=self.train_config.stream_data,
+            streaming=self.train_config.streaming,
         )
 
         dataset = dataset.shuffle(seed=self.train_config.seed, buffer_size=1000)
@@ -418,15 +445,15 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             pin_memory=True,
         )
 
-    # NOTE: can't use self.data_collator bc we tokenized in a custom format
     def val_dataloader(self):
-        dataset = load_task_data(
-            task=self.train_config.task,
+        dataset = load_data(
+            dataset_name=self.train_config.dataset.name,
+            subset=self.train_config.dataset.subset,
             tokenizer=self.tokenizer,
             seq_len=self.train_config.seq_len,
             split="validation",
             n_samples=self.train_config.n_samples,
-            streaming=self.train_config.stream_data,
+            streaming=self.train_config.streaming,
         )
 
         return DataLoader(
@@ -434,18 +461,19 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             batch_size=self.train_config.batch_size,
             shuffle=False,
             num_workers=self.train_config.num_data_workers,
-            # collate_fn=self.data_collator,
+            collate_fn=self.data_collator,
             pin_memory=True,
         )
 
     def test_dataloader(self):
-        dataset = load_task_data(
-            task=self.train_config.task,
+        dataset = load_data(
+            dataset_name=self.train_config.dataset.name,
+            subset=self.train_config.dataset.subset,
             tokenizer=self.tokenizer,
             seq_len=self.train_config.seq_len,
             split="test",
             n_samples=self.train_config.n_samples,
-            streaming=self.train_config.stream_data,
+            streaming=self.train_config.streaming,
         )
 
         return DataLoader(
@@ -453,7 +481,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             batch_size=self.train_config.batch_size,
             shuffle=False,
             num_workers=self.train_config.num_data_workers,
-            # collate_fn=self.data_collator,
+            collate_fn=self.data_collator,
             pin_memory=True,
         )
 
@@ -462,7 +490,6 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         cls,
         cfg: ExperimentConfig,
         dirs: ExpInstDirs,
-        task: TaskInstance,
         hyperparams: HparamsConfig,
         training_params: TrainingParams,
     ):
@@ -475,7 +502,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 distill_pair=cfg.distill_pair,
                 dirs=dirs,
                 projection=cfg.projection,
-                task=task,
+                dataset=training_params.dataset,
                 seq_len=training_params.seq_len,
                 batch_size=training_params.train_batch_size,
                 learning_rate=no_train_param,
@@ -487,17 +514,21 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 num_data_workers=training_params.resources.student.num_data_workers,
                 n_samples=training_params.num_samples,
                 jsd_beta=None,
-                objective_weights=cfg.objective.weights,
+                objective_weights=None,
                 total_steps=no_train_param,
                 finetune_teacher=training_params.controls.finetune_teacher,
                 training_type=cfg.training_type,
-                stream_data=training_params.resources.stream_data,
+                streaming=training_params.resources.stream_task_data,
             )
             return StudentModule(train_config=no_train_config)
 
         run_name = f"student_{cfg.name}"
+        builder = load_dataset_builder(
+            training_params.dataset.name, training_params.dataset.subset
+        )
+        n_train_samples = builder.info.splits["train"].num_examples  # type: ignore
         total_steps = math.ceil(
-            (task.n_train_samples * training_params.num_epochs)
+            (n_train_samples * training_params.num_epochs)
             / training_params.train_batch_size
         )
 
@@ -505,16 +536,19 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             if training_params.reproducible_backend:
                 ray.train.torch.enable_reproducibility()
 
-            assert cfg.objective is not None, "Objective config must be provided."
-            assert cfg.objective.jsd_beta is not None, (
-                "JSD beta must be set for KD training."
+            assert cfg.objective is not None, (
+                "Objective config must be provided if training."
             )
+            if cfg.training_type == TrainingType.KD:
+                assert cfg.objective.jsd_beta is not None, (
+                    "JSD beta must be set for KD training."
+                )
             train_config = StudentModuleConfig(
                 exp_name=cfg.name,
                 distill_pair=cfg.distill_pair,
                 dirs=dirs,
                 projection=cfg.projection,
-                task=task,
+                dataset=training_params.dataset,
                 seq_len=training_params.seq_len,
                 batch_size=training_params.train_batch_size,
                 learning_rate=config["learning_rate"],
@@ -530,7 +564,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 total_steps=total_steps,
                 finetune_teacher=training_params.controls.finetune_teacher,
                 training_type=cfg.training_type,
-                stream_data=training_params.resources.stream_data,
+                streaming=training_params.resources.stream_task_data,
             )
 
             module = StudentModule(train_config=train_config)
@@ -554,16 +588,18 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                     group=training_params.wandb.group,
                 ),
             )
-            wandb.init(
-                project=training_params.wandb.project,
-                group=training_params.wandb.group,
-                name=config["wandb_run_name"],
-                reinit=True,
-            )
-            trainer = prepare_trainer(trainer)
-            module.train()
-            trainer.fit(module)
-            wandb.finish()
+            try:
+                wandb.init(
+                    project=training_params.wandb.project,
+                    group=training_params.wandb.group,
+                    name=config["wandb_run_name"],
+                    reinit=True,
+                )
+                trainer = prepare_trainer(trainer)
+                module.train()
+                trainer.fit(module)
+            finally:
+                wandb.finish()
 
         def train_fixed_params(fixed_params: FixedHparamSet):
             fixed_config = {
@@ -587,8 +623,8 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 checkpoint_config=ray.tune.CheckpointConfig(
                     num_to_keep=1,
                     checkpoint_frequency=0,
-                    checkpoint_score_attribute="val_acc",
-                    checkpoint_score_order="max",
+                    checkpoint_score_attribute="val_ppl",
+                    checkpoint_score_order="min",
                 ),
                 failure_config=ray.train.FailureConfig(
                     max_failures=training_params.resources.max_failures
@@ -634,8 +670,8 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 checkpoint_config=ray.tune.CheckpointConfig(
                     num_to_keep=1,
                     checkpoint_frequency=0,
-                    checkpoint_score_attribute="val_acc",
-                    checkpoint_score_order="max",
+                    checkpoint_score_attribute="val_ppl",
+                    checkpoint_score_order="min",
                 ),
                 failure_config=ray.tune.FailureConfig(
                     max_failures=training_params.resources.max_failures
@@ -655,8 +691,8 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             )
 
             optuna_search = OptunaSearch(
-                metric="val_acc",  # Preserving your optimization goal
-                mode="max",
+                metric="val_ppl",  # Preserving your optimization goal
+                mode="min",
                 seed=cfg.seed,
             )
 
@@ -679,8 +715,8 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 param_space={"train_loop_config": tune_config},
                 run_config=tune_run_config,
                 tune_config=ray.tune.TuneConfig(
-                    metric="val_acc",
-                    mode="max",
+                    metric="val_ppl",
+                    mode="min",
                     num_samples=num_trials,
                     scheduler=asha_scheduler,
                     search_alg=search_alg,
@@ -709,6 +745,10 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 f"{checkpoint_dir}/checkpoint.ckpt"
             )
 
+    @property
+    def model_file(self) -> str:
+        return gen_student_weights_filename()
+
     def save_pretrained(self, path: str):
         os.makedirs(path, exist_ok=True)
         student_tl_state_dict = self.student.state_dict()
@@ -733,13 +773,12 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             )
         hf.load_state_dict(student_hf_state_dict)
         hf.save_pretrained(path)  # type: ignore
+        self.tokenizer.save_pretrained(path)  # type: ignore
 
         with open(f"{path}/pl_config.json", "w") as f:
-            # cfg = self.train_config.model_dump()
-            # json.dump({"train_config": cfg}, f, indent=4)
             json.dump(self.train_config.model_dump(), f, indent=4)
 
-        print(f"Student for task {self.train_config.task.name} saved to {path}")
+        print(f"Student saved to {path}")
 
     @classmethod
     def load_pretrained(cls, path: str) -> "StudentModule":
@@ -751,7 +790,5 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             Path(path) / student_module.model_file, weights_only=True
         )
         student_module.student.load_state_dict(student_tl_state_dict)
-        print(
-            f"Student {student_module.train_config.exp_name.upper()} for task {student_module.train_config.task.name} loaded from {path}"
-        )
+        print(f"Student loaded from {path}")
         return student_module

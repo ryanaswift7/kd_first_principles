@@ -7,17 +7,12 @@ from kdfp.utils.enums import ProjectionDirection, ProjectionTraining
 
 class OffProjTrainArgs(ConfigBase):
     dataset: DatasetConfig
-    total_tokens: int
+    total_tokens: Optional[int] = None
     cache_batch_size: int
     train_batch_size: int
     num_epochs: int
     n_trials: int
     force_cache_all: bool
-
-
-# class OffProjConfig(ConfigBase):
-#     alignment_beta: float
-#     training_args: OffProjTrainArgs
 
 
 class ProjectionInstance(ConfigBase):

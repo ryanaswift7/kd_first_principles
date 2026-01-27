@@ -1,5 +1,8 @@
+from pathlib import Path
+from typing import Any
+
 import torch
-from pydantic import field_serializer, field_validator
+from pydantic import field_serializer, field_validator, model_serializer
 from transformer_lens import HookedTransformer
 
 
@@ -71,3 +74,25 @@ class MCEvalMixin:
             torch.arange(batch_size), true_labels
         ].mean()
         return preds, true_labels, correct_choice_loss
+
+
+class PathSerializerMixin:
+    @model_serializer(mode="wrap")
+    def serialize_paths(self, handler: Any) -> dict[str, Any]:
+        """
+        Intersects the model dump and converts any Path objects to strings.
+        """
+        # Get the standard dict from Pydantic's default handler
+        data = handler(self)
+
+        # Recursively convert Path objects to strings
+        return self._convert_paths(data)
+
+    def _convert_paths(self, obj: Any) -> Any:
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, dict):
+            return {k: self._convert_paths(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._convert_paths(i) for i in obj]
+        return obj

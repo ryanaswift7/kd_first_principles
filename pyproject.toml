@@ -16,4 +16,5 @@ dependencies = [
 packages = {find = {}}
 
 [project.scripts]
-kdfp = "kdfp.cli:main"
+kdfp = "kdfp.main:main"
+data-gen = "kdfp.utils.data_gen:main"

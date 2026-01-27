@@ -1,8 +1,14 @@
-from typing import Any, Literal, Optional, Union
+from typing import Any, List, Literal, Optional, Union
 
 from pydantic import computed_field, field_validator, model_validator
 
 from kdfp.schemas.configBase import ConfigBase
+
+
+class LMEvalTasks(ConfigBase):
+    names: List[str]
+    num_fewshots: List[int]
+
 
 TASK_PROPERTIES = {
     "boolq": {"task_type": "binary", "test_available": False, "n_train_samples": 9_427},

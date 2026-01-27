@@ -12,6 +12,7 @@ import ray.tune
 import torch
 import torchmetrics
 import wandb
+from datasets import load_dataset_builder
 from lightning.pytorch.loggers import WandbLogger
 from ray.air.integrations.wandb import WandbLoggerCallback
 from ray.train.lightning import (
@@ -25,8 +26,6 @@ from ray.tune.search import ConcurrencyLimiter
 from ray.tune.search.optuna import OptunaSearch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
-from torchmetrics import F1Score
-from torchmetrics.classification import Accuracy
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -34,22 +33,22 @@ from transformers import (
 )
 
 from kdfp.schemas.configBase import ConfigBase
+from kdfp.schemas.dataset import DatasetConfig
 from kdfp.schemas.directories import ExpInstDirs
 from kdfp.schemas.hparams import FixedHparamSet, HparamsConfig, TuneParams
 from kdfp.schemas.mixins import DtypeSerializerMixin, MCEvalMixin
-from kdfp.schemas.tasks import TaskInstance
 from kdfp.schemas.trainingParams import TrainingParams
-from kdfp.utils.data import load_task_data
+from kdfp.utils.data import load_data
 
 
-def gen_teacher_weights_filename(task_name: str) -> str:
-    return f"teacher_{task_name}.bin"
+def gen_teacher_weights_filename() -> str:
+    return "teacher_ft.bin"
 
 
 class TeacherModuleConfig(ConfigBase, DtypeSerializerMixin):
     model_name: str
     tokenizer_name: str
-    task: TaskInstance
+    dataset: DatasetConfig
     seq_len: int
     batch_size: int
     learning_rate: float
@@ -60,7 +59,7 @@ class TeacherModuleConfig(ConfigBase, DtypeSerializerMixin):
     num_data_workers: int = 0
     n_samples: Optional[int] = None
     total_steps: int
-    stream_data: bool
+    streaming: bool
 
 
 class TeacherModule(pl.LightningModule, MCEvalMixin):
@@ -91,25 +90,11 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
             return_tensors="pt",
         )
 
-        if self.train_config.task.task_type == "multiclass":
-            acc = Accuracy(task=self.train_config.task.task_type, num_classes=4)
-            f1 = F1Score(task=self.train_config.task.task_type, num_classes=4)
-        else:  # binary
-            acc = Accuracy(task=self.train_config.task.task_type)
-            f1 = F1Score(task=self.train_config.task.task_type)
-
         self.val_metrics = torchmetrics.MetricCollection(
-            {
-                "acc": acc,
-                "f1": f1,
-            },
+            {"ppl": torchmetrics.Perplexity(ignore_index=self.tokenizer.eos_token_id)},
             prefix="val_",
         )
         self.test_metrics = self.val_metrics.clone(prefix="test_")
-
-    @property
-    def model_file(self):
-        return gen_teacher_weights_filename(self.train_config.task.name)
 
     def forward(self, input_ids, attention_mask, labels=None):
         return self.model(
@@ -127,28 +112,36 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        preds, true_labels, correct_choice_loss = self._shared_eval_step(
-            model=self.model, batch=batch, batch_idx=batch_idx
-        )
-        self.val_metrics.update(preds, true_labels)
-        self.log("val_loss", correct_choice_loss, sync_dist=True)
-        return {"val_loss": correct_choice_loss}
+        outputs = self.model(**batch)
 
-    def on_validation_epoch_end(self):
-        self.log_dict(self.val_metrics.compute(), sync_dist=True)
-        self.val_metrics.reset()
+        val_loss = outputs.loss
+
+        perplexity = torch.exp(val_loss)
+
+        self.log("val_loss", val_loss, prog_bar=True)
+        self.log("val_ppl", perplexity, prog_bar=True)
+
+        return val_loss
+
+    # def on_validation_epoch_end(self):
+    #     self.log_dict(self.val_metrics.compute(), sync_dist=True)
+    #     self.val_metrics.reset()
 
     def test_step(self, batch, batch_idx):
-        preds, true_labels, correct_choice_loss = self._shared_eval_step(
-            model=self.model, batch=batch, batch_idx=batch_idx
-        )
-        self.test_metrics.update(preds, true_labels)
-        self.log("test_loss", correct_choice_loss, sync_dist=True)
-        return {"test_loss": correct_choice_loss}
+        outputs = self.model(**batch)
 
-    def on_test_epoch_end(self):
-        self.log_dict(self.test_metrics.compute(), sync_dist=True)
-        self.test_metrics.reset()
+        test_loss = outputs.loss
+
+        perplexity = torch.exp(test_loss)
+
+        self.log("test_loss", test_loss, prog_bar=True)
+        self.log("test_ppl", perplexity, prog_bar=True)
+
+        return test_loss
+
+    # def on_test_epoch_end(self):
+    #     self.log_dict(self.test_metrics.compute(), sync_dist=True)
+    #     self.test_metrics.reset()
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
@@ -171,13 +164,14 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
         }
 
     def train_dataloader(self):
-        dataset = load_task_data(
-            task=self.train_config.task,
+        dataset = load_data(
+            dataset_name=self.train_config.dataset.name,
+            subset=self.train_config.dataset.subset,
             tokenizer=self.tokenizer,
             seq_len=self.train_config.seq_len,
             split="train",
             n_samples=self.train_config.n_samples,
-            streaming=self.train_config.stream_data,
+            streaming=self.train_config.streaming,
         )
 
         dataset = dataset.shuffle(seed=self.train_config.seed, buffer_size=1000)  # type: ignore
@@ -191,15 +185,15 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
             pin_memory=True,
         )
 
-    # NOTE: can't use self.data_collator bc we tokenized in a custom format
     def val_dataloader(self):
-        dataset = load_task_data(
-            task=self.train_config.task,
+        dataset = load_data(
+            dataset_name=self.train_config.dataset.name,
+            subset=self.train_config.dataset.subset,
             tokenizer=self.tokenizer,
             seq_len=self.train_config.seq_len,
             split="validation",
             n_samples=self.train_config.n_samples,
-            streaming=self.train_config.stream_data,
+            streaming=self.train_config.streaming,
         )
 
         return DataLoader(
@@ -207,18 +201,19 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
             batch_size=self.train_config.batch_size,
             shuffle=False,
             num_workers=self.train_config.num_data_workers,
-            # collate_fn=self.data_collator,
+            collate_fn=self.data_collator,
             pin_memory=True,
         )
 
     def test_dataloader(self):
-        dataset = load_task_data(
-            task=self.train_config.task,
+        dataset = load_data(
+            dataset_name=self.train_config.dataset.name,
+            subset=self.train_config.dataset.subset,
             tokenizer=self.tokenizer,
             seq_len=self.train_config.seq_len,
             split="test",
             n_samples=self.train_config.n_samples,
-            streaming=self.train_config.stream_data,
+            streaming=self.train_config.streaming,
         )
 
         return DataLoader(
@@ -226,7 +221,7 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
             batch_size=self.train_config.batch_size,
             shuffle=False,
             num_workers=self.train_config.num_data_workers,
-            # collate_fn=self.data_collator,
+            collate_fn=self.data_collator,
             pin_memory=True,
         )
 
@@ -234,7 +229,6 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
     def create(
         cls,
         lm_name: str,
-        task: TaskInstance,
         hyperparams: HparamsConfig,
         training_params: TrainingParams,
         dirs: ExpInstDirs,
@@ -243,9 +237,13 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
         """Create a teacher for a given task using hyperparameter tuning with Ray Tune"""
 
         pl.seed_everything(seed, workers=True)
-        run_name = f"teacher_{task.name}"
+        run_name = "teacher_ft"
+        builder = load_dataset_builder(
+            training_params.dataset.name, training_params.dataset.subset
+        )
+        n_train_samples = builder.info.splits["train"].num_examples  # type: ignore
         total_steps = math.ceil(
-            (task.n_train_samples * training_params.num_epochs)
+            (n_train_samples * training_params.num_epochs)
             / training_params.train_batch_size
         )
 
@@ -255,7 +253,7 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
             train_config = TeacherModuleConfig(
                 model_name=lm_name,
                 tokenizer_name=lm_name,
-                task=task,
+                dataset=training_params.dataset,
                 seq_len=training_params.seq_len,
                 batch_size=training_params.train_batch_size,
                 learning_rate=config["learning_rate"],
@@ -266,7 +264,7 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
                 seed=seed,
                 torch_dtype=training_params.torch_dtype,
                 total_steps=total_steps,
-                stream_data=training_params.resources.stream_data,
+                streaming=training_params.resources.stream_task_data,
             )
 
             module = TeacherModule(train_config=train_config)
@@ -322,8 +320,8 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
                 checkpoint_config=ray.train.CheckpointConfig(
                     num_to_keep=1,
                     checkpoint_frequency=0,
-                    checkpoint_score_attribute="val_acc",
-                    checkpoint_score_order="max",
+                    checkpoint_score_attribute="val_ppl",
+                    checkpoint_score_order="min",
                 ),
                 failure_config=ray.train.FailureConfig(
                     max_failures=training_params.resources.max_failures
@@ -368,8 +366,8 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
                 checkpoint_config=ray.tune.CheckpointConfig(
                     num_to_keep=1,
                     checkpoint_frequency=0,
-                    checkpoint_score_attribute="val_acc",
-                    checkpoint_score_order="max",
+                    checkpoint_score_attribute="val_ppl",
+                    checkpoint_score_order="min",
                 ),
                 failure_config=ray.tune.FailureConfig(
                     max_failures=training_params.resources.max_failures
@@ -389,8 +387,8 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
             )
 
             optuna_search = OptunaSearch(
-                metric="val_acc",
-                mode="max",
+                metric="val_ppl",
+                mode="min",
                 seed=seed,
             )
             search_alg = ConcurrencyLimiter(
@@ -413,8 +411,8 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
                 param_space={"train_loop_config": tune_config},
                 run_config=tune_run_config,
                 tune_config=ray.tune.TuneConfig(
-                    metric="val_acc",
-                    mode="max",
+                    metric="val_ppl",
+                    mode="min",
                     num_samples=num_trials,
                     scheduler=asha_scheduler,
                     search_alg=search_alg,
@@ -438,6 +436,10 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
         with best_result.checkpoint.as_directory() as path:
             return TeacherModule.load_from_checkpoint(f"{path}/checkpoint.ckpt")
 
+    @property
+    def model_file(self) -> str:
+        return gen_teacher_weights_filename()
+
     def save_pretrained(self, path: str) -> None:
         """Save the model and tokenizer"""
         os.makedirs(path, exist_ok=True)
@@ -449,7 +451,7 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
         with open(f"{path}/pl_config.json", "w") as f:
             json.dump(self.train_config.model_dump(), f, indent=4)
 
-        print(f"Teacher for task {self.train_config.task.name} saved to {path}")
+        print(f"Finetuned Teacher saved to {path}")
 
     @classmethod
     def load_pretrained(cls, path: str) -> "TeacherModule":
@@ -463,7 +465,5 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
         teacher_module.train_config.model_name = path
         teacher_module.tokenizer = AutoTokenizer.from_pretrained(path)
 
-        print(
-            f"Teacher for task {teacher_module.train_config.task.name.upper()} loaded from {path}"
-        )
+        print(f"Finetuned Teacher loaded from {path}")
         return teacher_module

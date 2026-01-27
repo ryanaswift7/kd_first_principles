@@ -32,37 +32,33 @@ def run_suite(suite_config_path: str):
 
     results_list = []
 
-    if suite.training_params.controls.get_baselines:
-        print("\nBeginning baseline teacher testing...")
-        results_list.extend(suite.run_baseline_teacher_tests())
-        print("Baseline teacher testing complete!")
+    # if suite.training_params.controls.get_baselines:
+    #     print("\nBeginning baseline teacher testing...")
+    #     results_list.extend(suite.run_baseline_teacher_tests())
+    #     print("Baseline teacher testing complete!")
 
     print("\nStarting experiment runs...")
     for i, experiment in enumerate(experiment_list):
         print(f"\nStarting experiment {i + 1}/{n}: {experiment.cfg.name.upper()}")
         experiment.init()
 
-        if i == 0 and suite.training_params.controls.get_baselines:
-            print("\nBeginning teacher testing...")
-            results_list.extend(
-                experiment.test_teachers(
-                    mode=suite.training_params.controls.testing_mode
-                )
-            )
-            print("Teacher testing complete!\n")
+        # if i == 0 and suite.training_params.controls.get_baselines:
+        #     print("\nBeginning teacher testing...")
+        #     results_list.extend(
+        #         experiment.test_teachers(
+        #             mode=suite.training_params.controls.testing_mode
+        #         )
+        #     )
+        #     print("Teacher testing complete!\n")
 
         if suite.training_params.controls.run_or_test == "run":
             results_list.extend(experiment.run())
         else:
-            results_list.extend(
-                experiment.test_student(
-                    mode=suite.training_params.controls.testing_mode
-                )
-            )
+            results_list.extend(experiment.test_student())
 
         print(f"Finished experiment {i + 1}/{n}: {experiment.cfg.name.upper()}")
 
-    suite_scores_dir = suite.parsed_dirs.get_suite_scores_dir(suite.suite_title)
+    suite_scores_dir = suite.directories.get_suite_scores_dir(suite.suite_title)
     suite_scores_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = get_timestamp()

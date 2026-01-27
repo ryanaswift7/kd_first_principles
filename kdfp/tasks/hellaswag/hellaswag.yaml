@@ -5,8 +5,8 @@ dataset_path: Rowan/hellaswag
 dataset_name: null
 output_type: multiple_choice
 training_split: train
-# validation_split: validation
-test_split: test
+validation_split: validation
+test_split: null
 process_docs: !function utils.process_docs
 doc_to_text: "{{query}}"
 doc_to_target: "{{label}}"

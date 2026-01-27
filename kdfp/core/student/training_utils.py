@@ -1,13 +1,14 @@
 import torch
 import torch.nn.functional as F
 
+
 def jensen_shannon_divergence(
     teacher_logits: torch.Tensor,
     student_logits: torch.Tensor,
     beta: float,
     temperature: float,
     epsilon: float = 1e-8,
-    mask_value: float = -1e8
+    mask_value: float = -1e8,
 ) -> torch.Tensor:
     """
     Robust beta-weighted Jensen-Shannon Divergence loss for knowledge distillation
@@ -36,7 +37,11 @@ def jensen_shannon_divergence(
     # Step 1: Input Validation
     assert temperature > 0, "Temperature must be positive."
     assert 0 <= beta <= 1, "Beta must be between 0 and 1."
-    assert teacher_logits.shape == student_logits.shape, "Logits must have the same shape."
+    assert teacher_logits.shape == student_logits.shape, (
+        "Logits must have the same shape. Found teacher: {}, student: {}".format(
+            teacher_logits.shape, student_logits.shape
+        )
+    )
 
     # Step 2: Detect masked positions BEFORE any modifications
     # A position is masked if it's -inf or a large negative number in either tensor.
@@ -47,7 +52,7 @@ def jensen_shannon_divergence(
     # Step 3: Clean logits and apply temperature scaling
     p_clean = torch.where(torch.isinf(teacher_logits), mask_value, teacher_logits)
     q_clean = torch.where(torch.isinf(student_logits), mask_value, student_logits)
-    
+
     scaled_p = p_clean / temperature
     scaled_q = q_clean / temperature
 
@@ -55,18 +60,18 @@ def jensen_shannon_divergence(
     # Using log_softmax is more numerically stable than softmax followed by log.
     p_log_probs = F.log_softmax(scaled_p, dim=-1)
     q_log_probs = F.log_softmax(scaled_q, dim=-1)
-    
+
     p_probs = torch.exp(p_log_probs)
     q_probs = torch.exp(q_log_probs)
 
     # Step 5: Compute the mixture distribution M and its log-probabilities
     m_probs = beta * p_probs + (1 - beta) * q_probs
-    m_log_probs = torch.log(m_probs.clamp(min=epsilon)) # Clamp to avoid log(0)
+    m_log_probs = torch.log(m_probs.clamp(min=epsilon))  # Clamp to avoid log(0)
 
     # Step 6: Compute the two KL divergence terms element-wise
     # KL(P||M) = sum(P * (log(P) - log(M)))
     kl_p_m_elements = p_probs * (p_log_probs - m_log_probs)
-    
+
     # KL(Q||M) = sum(Q * (log(Q) - log(M)))
     kl_q_m_elements = q_probs * (q_log_probs - m_log_probs)
 
@@ -82,12 +87,12 @@ def jensen_shannon_divergence(
     if num_unmasked == 0:
         # Handle the edge case where every position is masked
         return torch.tensor(0.0, device=teacher_logits.device, dtype=jsd_elements.dtype)
-        
+
     # The sum is over all dimensions (batch, sequence, vocab)
     loss = jsd_elements.sum() / num_unmasked
 
     # Step 10: Apply T² scaling for knowledge distillation
     # This ensures the gradients are correctly scaled with respect to temperature.
-    loss = loss * (temperature ** 2)
+    loss = loss * (temperature**2)
 
     return loss

@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 from typing import Optional
 
 from pydantic import computed_field
@@ -28,13 +27,12 @@ class ObjectiveInstance(ConfigBase):
         return OBJECTIVE_WEIGHT_VARIANTS_MAP[self.weight_str]
 
 
-@dataclass
 class ExperimentConfig(ConfigBase):
     suite_title: str
     seed: int
     student_type: StudentType
     distill_pair: DistillationPair
-    objective: ObjectiveInstance
+    objective: Optional[ObjectiveInstance] = None
     projection: Optional[ProjectionInstance] = None
     training_type: TrainingType
 

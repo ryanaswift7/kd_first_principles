@@ -1,6 +1,6 @@
 from typing import Any, ClassVar, Dict, Set
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 
 class ConfigBase(BaseModel):
@@ -20,6 +20,16 @@ class ConfigBase(BaseModel):
     # This replaces the need to manually implement `to_dict()` everywhere.
     # Use ClassVar to tell Pylance/Pydantic this isn't an instance field
     _heavy_fields_to_exclude: ClassVar[Set[str]] = set()
+
+    @model_validator(mode="before")
+    @classmethod
+    def strip_computed_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # cls.model_computed_fields is a dict of all @computed_field definitions
+            computed_names = cls.model_computed_fields.keys()
+            for field in computed_names:
+                data.pop(field, None)
+        return data
 
     def to_config_dict(self) -> Dict[str, Any]:
         """

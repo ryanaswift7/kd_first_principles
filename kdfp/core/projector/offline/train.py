@@ -15,8 +15,6 @@ from ray.train.lightning import (
 from kdfp.schemas.trainingParams import TrainingParams
 
 from .offlineProjector import OfflineProjectorModule, OffProjModuleConfig
-
-# from pytorch_lightning.loggers.csv_logs import CSVLogger
 from .projectorDataModule import ProjectorDataModule
 
 
@@ -46,6 +44,8 @@ def train_projector_per_worker(
         num_workers=training_params.resources.projector.num_data_workers,
         val_split=val_split,
         test_split=test_split,
+        pin_memory=True,
+        prefetch_factor=4,
     )
     cfg = OffProjModuleConfig(
         teacher_dim=teacher_dim,
@@ -65,8 +65,6 @@ def train_projector_per_worker(
         callbacks=[RayTrainReportCallback()],
         max_epochs=max_epochs,
         accelerator="auto",
-        gradient_clip_algorithm="norm",
-        gradient_clip_val=config["max_grad_norm"],
         enable_progress_bar=False,
         enable_checkpointing=False,
         deterministic=training_params.reproducible_backend,

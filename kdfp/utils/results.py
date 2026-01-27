@@ -1,4 +1,5 @@
-from typing import Dict
+from typing import Dict, Optional
+
 
 def _format_params(num_params: int) -> str:
     """Formats a number into a human-readable string (e.g., 1.2M, 2.5B)."""
@@ -10,12 +11,16 @@ def _format_params(num_params: int) -> str:
         return f"{num_params / 1_000:.2f}K"
     else:
         return f"{num_params}"
-    
-def generate_result(name: str,
-                    model,
-                    task_name: str,
-                    metric_name: str,
-                    score: float) -> Dict:
+
+
+def generate_result(
+    name: str,
+    model,
+    task_name: str,
+    metric_name: str,
+    score: float,
+    num_fewshot: Optional[int] = None,
+) -> Dict:
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_param_str = _format_params(total_params)
@@ -26,5 +31,6 @@ def generate_result(name: str,
         "TRAINABLE_PARAMS": training_param_str,
         "TASK": task_name,
         "METRIC": metric_name,
+        "NUM_FEWSHOT": num_fewshot,
         "SCORE": score,
     }

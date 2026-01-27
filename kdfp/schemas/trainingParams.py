@@ -3,6 +3,7 @@ from typing import Literal, Optional
 import torch
 
 from kdfp.schemas.configBase import ConfigBase
+from kdfp.schemas.dataset import DatasetConfig
 from kdfp.schemas.mixins import DtypeSerializerMixin
 from kdfp.schemas.projections import OffProjTrainArgs
 
@@ -17,7 +18,7 @@ class Resources(ConfigBase):
 class ExperimentResources(ConfigBase):
     max_failures: int
     num_available_gpus: int
-    stream_data: bool
+    stream_task_data: bool
     projector: Resources
     teacher: Resources
     student: Resources
@@ -27,7 +28,6 @@ class TrainingControls(ConfigBase):
     finetune_teacher: bool
     get_baselines: bool
     run_or_test: Literal["run", "test"]
-    testing_mode: Literal["pl", "hf"]
 
 
 class WandbParams(ConfigBase):
@@ -36,6 +36,7 @@ class WandbParams(ConfigBase):
 
 
 class TrainingParams(ConfigBase, DtypeSerializerMixin):
+    dataset: DatasetConfig
     seq_len: int
     train_batch_size: int
     test_batch_size: int

@@ -17,6 +17,8 @@ from kdfp.schemas.trainingParams import TrainingParams
 from .data import load_data
 from .general import cleanup_resources
 
+# NOTE: Data streaming is hardcoded to True
+
 
 def prepare_lm_and_dataloader(
     lm_name: str,
@@ -294,7 +296,7 @@ def activation_caching(
 
     summary = {
         "lm_hook_points": lm_hook_points,
-        "lm_name": lm.name,
+        "lm_name": lm_cfg.name,
         "dataset_name": train_params.offline_projection.dataset.name,
         "dataset_subset": train_params.offline_projection.dataset.subset,
         "split": train_params.offline_projection.dataset.split,

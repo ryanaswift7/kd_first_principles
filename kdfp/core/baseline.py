@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Optional
 
 import lightning.pytorch as pl
 import torch
@@ -21,10 +21,11 @@ class BaselineModuleConfig(ConfigBase, DtypeSerializerMixin):
     seq_len: int
     batch_size: int
     seed: int
-    torch_dtype: Union[str, torch.dtype]
-    num_data_workers: Optional[int] = None
+    torch_dtype: torch.dtype
+    num_data_workers: int = 0
     n_samples: Optional[int] = None
     layer_reduction_factor: Optional[float] = None
+    stream_data: bool
 
 
 class BaselineModule(pl.LightningModule, MCEvalMixin):
@@ -37,6 +38,9 @@ class BaselineModule(pl.LightningModule, MCEvalMixin):
         self.save_hyperparameters({"train_config": self.train_config.model_dump()})
 
         if self.train_config.is_shallow:
+            assert self.train_config.layer_reduction_factor is not None, (
+                "layer_reduction_factor must be set for shallow models"
+            )
             self.model, self.tokenizer, _ = load_shallow(
                 model_name=self.train_config.model_name,
                 mode="tl",
@@ -113,6 +117,7 @@ class BaselineModule(pl.LightningModule, MCEvalMixin):
             seq_len=self.train_config.seq_len,
             split="test",
             n_samples=self.train_config.n_samples,
+            streaming=self.train_config.stream_data,
         )
 
         return DataLoader(

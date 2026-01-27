@@ -5,8 +5,7 @@ dataset_path: aps/super_glue
 dataset_name: boolq
 output_type: multiple_choice
 training_split: train
-# validation_split: validation
-test_split: test
+validation_split: validation
 doc_to_text: "{{passage}}\nQuestion: {{question}}?\nAnswer:"
 doc_to_target: label
 doc_to_choice: ["no", "yes"]

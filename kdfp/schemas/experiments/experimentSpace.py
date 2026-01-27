@@ -8,7 +8,7 @@ from kdfp.schemas.experiments.experimentConfig import (
     ExperimentConfig,
     ObjectiveInstance,
 )
-from kdfp.schemas.experiments.experimentFilter import ExperimentFilter
+from kdfp.schemas.experiments.experimentFilter import ExperimentFilters
 from kdfp.schemas.models import DistillationGroups
 from kdfp.schemas.projections import ProjectionInstance, ProjectionParser
 from kdfp.utils.enums import (
@@ -29,7 +29,7 @@ class ExperimentSpace(ConfigBase):
     student_types: List[StudentType]
     objective: ObjectiveParams
     projection: ProjectionParser
-    filter: ExperimentFilter
+    filters: ExperimentFilters
 
     @computed_field
     @property
@@ -96,7 +96,7 @@ class ExperimentSpace(ConfigBase):
                                 suite_title=suite_title,
                                 seed=seed,
                                 student_type=student,
-                                distill_pair=getattr(DistillationGroups, student.value),
+                                distill_pair=getattr(distill_groups, student.value),
                                 projection=ProjectionInstance(
                                     direction=direction,
                                     training_method=training,
@@ -145,10 +145,6 @@ class ExperimentSpace(ConfigBase):
                     seed=self.default_seed,
                     student_type=student,
                     distill_pair=getattr(distill_groups, student.value),
-                    objective=ObjectiveInstance(
-                        weight_str=ObjectiveWeightStr.NO_TRAIN,
-                        jsd_beta=-1,
-                    ),
                     training_type=TrainingType.NO_TRAIN,
                 )
             )
@@ -161,8 +157,8 @@ class ExperimentSpace(ConfigBase):
         """Filters experiments based on name matching."""
         filtered = []
 
-        include_list = self.filter.include or []
-        exclude_list = self.filter.exclude or []
+        include_list = self.filters.include or []
+        exclude_list = self.filters.exclude or []
 
         for exp in experiments:
             name = exp.name

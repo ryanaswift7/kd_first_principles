@@ -29,10 +29,8 @@ class DistillPairHparams(ConfigBase):
 
 
 class FixedOffProjHparamSet(ConfigBase):
-    batch_size: int
     lr: float
     weight_decay: float
-    max_grad_norm: float
     tied_weights: bool
 
 

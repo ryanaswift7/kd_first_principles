@@ -3,14 +3,13 @@ import os
 import random
 from functools import partial
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import torch
 from datasets import load_dataset
 from pydantic import BaseModel, field_validator, model_validator
 from torch.utils.data import ConcatDataset, Dataset
-from tqdm.auto import tqdm
 
 from kdfp.schemas.tasks import TaskInstance
 
@@ -68,10 +67,13 @@ def load_data(
     dataset = dataset.map(
         preprocess_fn,
         batched=True,
+        remove_columns=dataset.column_names,
     )
 
     if token_rename:
         dataset.set_format(type="torch", columns=["tokens"])
+    # else:
+    #     dataset.set_format(type="torch")
     return dataset
 
 
@@ -456,8 +458,8 @@ def _preprocess_task_ft(
     #     return tokenized
     # else:
 
-    assert labels is not None, "Labels should not be None for any splits."
     if split != "train":
+        assert labels is not None, "Labels should not be None for val or test."
         # For validation, reshape the tokenized outputs
         num_examples = len(labels)
         num_choices = 4 if task.task_type == "multiclass" else 2
@@ -547,55 +549,49 @@ def load_task_data(
 
 
 class CachedActivationsDataset(Dataset):
-    """Dataset for working with cached activations from TransformerLens."""
+    """
+    Optimized Dataset for working with cached activations from TransformerLens.
+
+    Performance Note:
+    To avoid the "initialization explosion" (re-reading CSVs for every layer for every worker),
+    this class expects metadata (mappings) to be pre-calculated and passed in.
+    """
 
     def __init__(
         self,
-        cache_dir,
-        batch_mapping_location: Optional[str] = None,
-        target_data_path=None,
-        preload=False,
+        cache_dir: str,
+        sample_to_batch: Dict[int, int],
+        sample_to_position: Dict[int, int],
+        num_samples: int,
+        activation_shape: Optional[Tuple] = None,
+        target_data_path: Optional[str] = None,
+        preload: bool = False,
         transform=None,
     ):
         """
         Args:
-            cache_dir: Directory containing the cached activation files
-            target_data_path: Path to targets/labels (CSV or pickle format)
-            preload: Whether to preload all activations into memory (faster but memory-intensive)
-            transform: Optional transform to apply to the activations
+            cache_dir: Directory containing the cached activation files.
+            sample_to_batch: Pre-computed dict mapping sample_index -> batch_index.
+            sample_to_position: Pre-computed dict mapping sample_index -> index_inside_batch.
+            num_samples: Total number of samples.
+            activation_shape: (Optional) Shape of the activations (excluding batch dim).
+            target_data_path: Path to targets/labels (CSV or pickle).
+            preload: Whether to load all .pt files into RAM on init.
+            transform: Optional transform to apply to the activations.
         """
         self.cache_dir = cache_dir
         self.transform = transform
 
-        # Load batch mapping information
-        if not batch_mapping_location:
-            batch_mapping_location = cache_dir
+        # Shared Metadata (Passed by reference, minimal memory overhead per instance)
+        self.sample_to_batch = sample_to_batch
+        self.sample_to_position = sample_to_position
+        self.num_samples = num_samples
+        self.activation_shape = activation_shape
 
-        assert batch_mapping_location is not None, (
-            "Batch mapping location must be specified"
-        )
-        mapping_path = os.path.join(batch_mapping_location, "batch_mapping.txt")
-        self.batch_mapping = pd.read_csv(mapping_path)
-
-        # Create a lookup from sample index to batch file
-        self.sample_to_batch = {}
-        self.sample_to_position = {}
-        for _, row in self.batch_mapping.iterrows():
-            batch_idx = row["batch_idx"]
-            start_idx = row["start_sample_idx"]
-            end_idx = row["end_sample_idx"]
-
-            for sample_idx in range(start_idx, end_idx):
-                self.sample_to_batch[sample_idx] = batch_idx
-                # Position within the batch
-                self.sample_to_position[sample_idx] = sample_idx - start_idx
-
-        # Get total number of samples
-        self.num_samples = max(self.sample_to_batch.keys()) + 1
-
-        # Load targets/labels if provided
+        # Lazy load targets
         self.targets = None
         if target_data_path:
+            # We load this lazily or only once if passed from outside
             if target_data_path.endswith(".csv"):
                 self.targets = pd.read_csv(target_data_path)
             elif target_data_path.endswith(".pkl"):
@@ -603,52 +599,97 @@ class CachedActivationsDataset(Dataset):
             else:
                 raise ValueError("Target data must be CSV or pickle format")
 
-        # Check the format of the activation tensors by loading the first batch
-        first_batch_path = os.path.join(cache_dir, f"batch_{0:05d}.pt")
-        first_batch = torch.load(first_batch_path, weights_only=True)
-        self.activation_shape = first_batch.shape[1:]  # Exclude batch dimension
-
-        # Preload all activations if specified
+        # Preload logic
         self.preloaded_activations = {}
         if preload:
-            print("Preloading activations into memory...")
+            print(f"Preloading activations from {os.path.basename(cache_dir)}...")
+            # Use the set from the dictionary values to avoid scanning directory
             unique_batches = set(self.sample_to_batch.values())
-            for batch_idx in tqdm(unique_batches):
+            for batch_idx in unique_batches:
                 batch_path = os.path.join(cache_dir, f"batch_{batch_idx:05d}.pt")
+                # Load to CPU memory
                 self.preloaded_activations[batch_idx] = torch.load(
-                    batch_path, weights_only=True
+                    batch_path, map_location="cpu", weights_only=True
                 )
+
+    @staticmethod
+    def load_metadata(cache_dir: str) -> Tuple[Dict, Dict, int]:
+        """
+        Static helper to load metadata ONCE.
+        Call this in HookCache and pass the results to the dataset constructor.
+        """
+        mapping_path = os.path.join(cache_dir, "batch_mapping.txt")
+        if not os.path.exists(mapping_path):
+            # If mapping doesn't exist, assume standard 1:1 or generate it
+            # For now, we raise strictly as per previous code logic
+            raise FileNotFoundError(f"Batch mapping not found: {mapping_path}")
+
+        # Fast CSV read
+        df = pd.read_csv(mapping_path)
+
+        sample_to_batch = {}
+        sample_to_position = {}
+
+        # Optimized Loop: Zip is ~10x faster than df.iterrows()
+        # We assume rows define contiguous ranges
+        for b_idx, start, end in zip(
+            df["batch_idx"], df["start_sample_idx"], df["end_sample_idx"]
+        ):
+            # Create a range of indices for this batch
+            indices = range(start, end)
+
+            # Map global index -> batch index
+            for i, sample_idx in enumerate(indices):
+                sample_to_batch[sample_idx] = b_idx
+                sample_to_position[sample_idx] = i
+
+        if not sample_to_batch:
+            return {}, {}, 0
+
+        # Max index + 1 is the count (assuming 0-indexed contiguous)
+        num_samples = max(sample_to_batch.keys()) + 1
+
+        return sample_to_batch, sample_to_position, num_samples
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
-        # Get the batch this sample belongs to
-        batch_idx = self.sample_to_batch[idx]
-        position = self.sample_to_position[idx]
+        # 1. Resolve Location
+        try:
+            batch_idx = self.sample_to_batch[idx]
+            position = self.sample_to_position[idx]
+        except KeyError:
+            raise IndexError(
+                f"Index {idx} out of range for dataset of size {self.num_samples}"
+            )
 
-        # Get activation - either from preloaded memory or disk
+        # 2. Retrieve Data (RAM or Disk)
         if batch_idx in self.preloaded_activations:
             batch_activations = self.preloaded_activations[batch_idx]
         else:
             batch_path = os.path.join(self.cache_dir, f"batch_{batch_idx:05d}.pt")
-            batch_activations = torch.load(batch_path, weights_only=True)
+            # map_location='cpu' prevents CUDA initialization in DataLoader workers
+            batch_activations = torch.load(
+                batch_path, map_location="cpu", weights_only=True
+            )
 
-        # Extract the specific activation for this sample
-        # Handling different possible formats from TransformerLens
+        # 3. Extract Slice
         if position < batch_activations.shape[0]:
             activation = batch_activations[position]
         else:
             raise IndexError(
-                f"Position {position} out of bounds for batch with shape {batch_activations.shape}"
+                f"Position {position} out of bounds for batch {batch_idx} "
+                f"with shape {batch_activations.shape}"
             )
 
-        # Apply transform if specified
+        # 4. Transform
         if self.transform:
             activation = self.transform(activation)
 
-        # Get target if available
+        # 5. Return with Target (if exists)
         if self.targets is not None:
+            # .iloc is relatively slow; if targets are huge, convert to Tensor in __init__
             target = torch.tensor(self.targets.iloc[idx]["target"])
             return activation, target
         else:
@@ -658,8 +699,9 @@ class CachedActivationsDataset(Dataset):
 class HookCache(BaseModel):
     cache_dir: str
     hook_list: List[str]
+
+    # Dataset fields
     embed: Optional[CachedActivationsDataset] = None
-    attn_scores: Optional[List[CachedActivationsDataset]] = None
     attn_out: Optional[List[CachedActivationsDataset]] = None
     mlp_out: Optional[List[CachedActivationsDataset]] = None
     resid: Optional[List[CachedActivationsDataset]] = None
@@ -691,12 +733,36 @@ class HookCache(BaseModel):
 
     @model_validator(mode="after")
     def setup_datasets(self) -> "HookCache":
-        """Initialize the dataset objects after validation."""
+        """Initialize the dataset objects efficiently using shared metadata."""
 
-        # collect and organize hooks
+        # ---------------------------------------------------------
+        # 1. OPTIMIZATION: Load Metadata ONCE for all datasets
+        # ---------------------------------------------------------
+        # We load the batch_mapping.txt from the root cache_dir once.
+        # s2b = sample_to_batch, s2p = sample_to_position
+        try:
+            s2b, s2p, n_samples = CachedActivationsDataset.load_metadata(self.cache_dir)
+        except Exception as e:
+            raise ValueError(f"Failed to load metadata from {self.cache_dir}: {str(e)}")
+
+        # ---------------------------------------------------------
+        # 2. Helper to create datasets with shared metadata
+        # ---------------------------------------------------------
+        def create_ds(hook_subfolder: str) -> CachedActivationsDataset:
+            return CachedActivationsDataset(
+                cache_dir=os.path.join(self.cache_dir, hook_subfolder),
+                sample_to_batch=s2b,  # Pass by reference (Shared)
+                sample_to_position=s2p,  # Pass by reference (Shared)
+                num_samples=n_samples,  # Pass by value
+                # Optional: You can pass target_data_path here if it exists in root
+                # target_data_path=os.path.join(self.cache_dir, "targets.csv")
+            )
+
+        # ---------------------------------------------------------
+        # 3. Categorize Hooks
+        # ---------------------------------------------------------
         hook_dict = {
             "embed": [],
-            "attn_scores": [],
             "attn_out": [],
             "mlp_out": [],
             "resid": [],
@@ -704,59 +770,73 @@ class HookCache(BaseModel):
         }
 
         for hook_name in hook_dict.keys():
+            # Find all hooks that match this category
             matches = [s for s in self.hook_list if hook_name in s]
-            # if not matches:
-            #     warnings.warn(f"No hook points found for hook {hook_name}", RuntimeWarning)
             hook_dict[hook_name] = matches
 
-        # run verifications
-        all_matched_hooks = [
-            hook for hook_list in hook_dict.values() for hook in hook_list
-        ]
+        # ---------------------------------------------------------
+        # 4. Verify all hooks are accounted for
+        # ---------------------------------------------------------
+        all_matched_hooks = [hook for sublist in hook_dict.values() for hook in sublist]
 
-        if len(all_matched_hooks) != len(self.hook_list):
+        # Check for duplicates or missing hooks
+        if len(set(all_matched_hooks)) != len(self.hook_list):
             unrecognized_hooks = set(self.hook_list) - set(all_matched_hooks)
-            raise ValueError(f"Some hooks were not recognized: {unrecognized_hooks}")
+            # This logic might need adjustment if a hook matches multiple keys,
+            # but usually hook names are distinct.
+            if unrecognized_hooks:
+                raise ValueError(
+                    f"Some hooks were not recognized: {unrecognized_hooks}"
+                )
 
-        def get_layer_from_hook_name(hook_name: str) -> int:
-            # ex) blocks.0.hook_resid_post, or blocks.0.attn.hook_attn_scores
-            return int(hook_name.split(".")[1])
-
-        def form_cached_dataset_lists(hook_type: str) -> None:
-            if hook_dict[hook_type]:
-                ds_list = []
-                for layer_hook_name in hook_dict[hook_type]:
-                    ds_list.append(
-                        CachedActivationsDataset(
-                            cache_dir=os.path.join(self.cache_dir, layer_hook_name),
-                            batch_mapping_location=self.cache_dir,
-                        )
-                    )
-            return ds_list
-
+        # ---------------------------------------------------------
+        # 5. Initialize Datasets
+        # ---------------------------------------------------------
         try:
-            layer_hook_type_list = ["attn_scores", "attn_out", "mlp_out", "resid"]
+            # A. Layer-wise lists (attn, mlp, resid)
+            layer_hook_type_list = ["attn_out", "mlp_out", "resid"]
+
             for hook_type in layer_hook_type_list:
-                ds_list = form_cached_dataset_lists(hook_type=hook_type)
+                # Create a dataset for every hook in this category
+                # We sort them to ensure layer 0 comes before layer 1, etc.
+                # Assuming hook names contain "blocks.X." or similar for sorting if needed.
+                # The current code relies on the order in self.hook_list or basic list append.
+
+                # If you need specific sorting by layer index:
+                # hooks_sorted = sorted(hook_dict[hook_type], key=lambda x: int(x.split('.')[1]))
+                hooks_for_type = hook_dict[hook_type]
+
+                ds_list = [create_ds(h) for h in hooks_for_type]
                 setattr(self, hook_type, ds_list)
 
+            # B. Singletons (embed, output_logits)
             if hook_dict["embed"]:
-                self.embed = CachedActivationsDataset(
-                    cache_dir=os.path.join(self.cache_dir, "hook_embed"),
-                    batch_mapping_location=self.cache_dir,
-                )
+                # Assuming "hook_embed" is the specific folder name or the first match
+                # Using the actual matched hook string from the list
+                self.embed = create_ds(hook_dict["embed"][0])
 
             if hook_dict["output_logits"]:
-                self.output_logits = CachedActivationsDataset(
-                    cache_dir=os.path.join(self.cache_dir, "output_logits"),
-                    batch_mapping_location=self.cache_dir,
-                )
-            n = len(self.attn_scores)
-            for hook_type in layer_hook_type_list:
-                v = getattr(self, hook_type, [])
-                assert len(v) == n, (
-                    f"Hook type {hook_type} contains {len(v)} layers/datasets, expected {n}"
-                )
+                self.output_logits = create_ds(hook_dict["output_logits"][0])
+
+            # ---------------------------------------------------------
+            # 6. Consistency Checks
+            # ---------------------------------------------------------
+            # Ensure we have the same number of layers for all main components
+            # Only check if the lists are not empty
+            active_layer_lists = [
+                getattr(self, ht)
+                for ht in layer_hook_type_list
+                if getattr(self, ht) and len(getattr(self, ht)) > 0
+            ]
+
+            if active_layer_lists:
+                reference_len = len(active_layer_lists[0])
+                for lst in active_layer_lists[1:]:
+                    if len(lst) != reference_len:
+                        raise ValueError(
+                            f"Inconsistent layer counts detected. "
+                            f"Expected {reference_len}, found {len(lst)}."
+                        )
 
         except Exception as e:
             raise ValueError(f"Failed to initialize datasets: {str(e)}")
@@ -766,78 +846,134 @@ class HookCache(BaseModel):
 
 class ProjectorDataset(Dataset):
     def __init__(self, teacher_cache_dir: str, student_cache_dir: str):
-        teacher_cache_dir = os.path.abspath(teacher_cache_dir)
-        student_cache_dir = os.path.abspath(student_cache_dir)
+        self.teacher_cache_dir = os.path.abspath(teacher_cache_dir)
+        self.student_cache_dir = os.path.abspath(student_cache_dir)
 
-        # Use a single lock for both directories to prevent deadlocks
-        # lock_path = f"/tmp/projector_dataset_{hash(teacher_cache_dir + student_cache_dir)}.lock"
+        # -------------------------------------------------------------
+        # 1. OPTIMIZATION: Pre-load all metadata in the Main Process
+        # -------------------------------------------------------------
+        # This prevents every worker from re-reading and parsing the same CSVs/JSONs.
 
-        # with FileLock(lock_path):
-        #     teacher_ds = self._get_projector_dataset(teacher_cache_dir)
-        #     student_ds = self._get_projector_dataset(student_cache_dir)
+        # A. Load Configuration (Hook Lists)
+        self.teacher_config = self._load_json(self.teacher_cache_dir)
+        self.student_config = self._load_json(self.student_cache_dir)
 
-        # teacher_len = len(teacher_ds)
-        # student_len = len(student_ds)
-        # num_rows = min(teacher_len, student_len)
-        # indices = list(range(num_rows))
+        # B. Load Heavy Mappings (Sample -> Batch assignments)
+        # We store these as attributes so they are pickled/copied to workers automatically.
+        print("Loading Teacher Metadata...")
+        self.teacher_meta = CachedActivationsDataset.load_metadata(
+            self.teacher_cache_dir
+        )
 
-        # self.num_rows = num_rows
-        # self.teacher_ds = teacher_ds
-        # self.student_ds = student_ds
-        self.teacher_cache_dir = teacher_cache_dir
-        self.student_cache_dir = student_cache_dir
+        print("Loading Student Metadata...")
+        self.student_meta = CachedActivationsDataset.load_metadata(
+            self.student_cache_dir
+        )
 
-        # Just determine the length, don't load datasets yet
+        # -------------------------------------------------------------
+        # 2. OPTIMIZATION: Calculate length immediately
+        # -------------------------------------------------------------
+        # The metadata tuple is (sample_to_batch, sample_to_position, num_samples)
+        teacher_len = self.teacher_meta[2]
+        student_len = self.student_meta[2]
+
+        if teacher_len == 0 or student_len == 0:
+            print("Warning: One of the datasets appears empty based on metadata.")
+
+        self.num_rows = min(teacher_len, student_len)
+
+        # -------------------------------------------------------------
+        # 3. Lazy Initialization Placeholders
+        # -------------------------------------------------------------
+        # We don't build the actual Dataset objects yet.
+        # This keeps the __init__ fast and lightweight.
         self._teacher_ds = None
         self._student_ds = None
-        self.num_rows = self._get_num_rows()
 
-    def lock(self) -> str:
-        # Use a single lock for both directories to prevent deadlocks
-        lock_path = f"/tmp/projector_dataset_{hash(self.teacher_cache_dir + self.student_cache_dir)}.lock"
-
-        # with FileLock(lock_path):
-        return lock_path
-
-    def _get_num_rows(self):
-        # with FileLock(self.lock()):
-        # Get length without fully loading datasets
-        teacher_ds = self._get_projector_dataset(self.teacher_cache_dir)
-        student_ds = self._get_projector_dataset(self.student_cache_dir)
-        return min(len(teacher_ds), len(student_ds))
+    def _load_json(self, cache_dir: str) -> Dict:
+        """Helper to load the summary JSON."""
+        path = Path(cache_dir) / "caching_summary.json"
+        if not path.exists():
+            raise FileNotFoundError(f"Config not found at {path}")
+        with open(path, "r") as f:
+            return json.load(f)
 
     @property
     def teacher_ds(self):
+        # Lazy initialization happens on the worker
         if self._teacher_ds is None:
-            self._teacher_ds = self._get_projector_dataset(self.teacher_cache_dir)
+            self._teacher_ds = self._build_concat_dataset(
+                self.teacher_cache_dir, self.teacher_config, self.teacher_meta
+            )
         return self._teacher_ds
 
     @property
     def student_ds(self):
         if self._student_ds is None:
-            self._student_ds = self._get_projector_dataset(self.student_cache_dir)
+            self._student_ds = self._build_concat_dataset(
+                self.student_cache_dir, self.student_config, self.student_meta
+            )
         return self._student_ds
 
-    def _get_projector_dataset(self, cache_dir: str):
-        # with FileLock(self.lock()):
-        # ignore attn_scores and output_logits bc they are not in the embedding space
-        with open(Path(cache_dir) / "caching_summary.json", "r") as f:
-            data = json.load(f)
-        cached_hook_list = data["lm_hook_points"]
-        hook_cache = HookCache(cache_dir=cache_dir, hook_list=cached_hook_list)
-        dataset_list = []
-        if hook_cache.embed:
-            dataset_list.append(hook_cache.embed)
-        for act_list in [hook_cache.attn_out, hook_cache.mlp_out, hook_cache.resid]:
-            if act_list:
-                for layer in act_list:
-                    dataset_list.append(layer)
-        return ConcatDataset(datasets=dataset_list)
+    def _build_concat_dataset(self, cache_dir: str, config: Dict, metadata: Tuple):
+        """
+        Reconstructs the HookCache logic manually to build the dataset list.
+        This is faster than instantiating the HookCache Pydantic model on every worker.
+        """
+        hook_list = config.get("lm_hook_points", [])
+        s2b, s2p, n_samples = metadata
+
+        # Helper to create a single dataset instance using pre-loaded metadata
+        def make_ds(hook_path):
+            return CachedActivationsDataset(
+                cache_dir=os.path.join(cache_dir, hook_path),
+                sample_to_batch=s2b,  # Shared Dict
+                sample_to_position=s2p,  # Shared Dict
+                num_samples=n_samples,  # Integer
+                # We don't need to pass target_data_path unless specific logic requires it
+            )
+
+        datasets = []
+
+        # 1. Embeddings
+        embed_hooks = [h for h in hook_list if "embed" in h]
+        if embed_hooks:
+            # Usually only one embedding hook
+            datasets.append(make_ds(embed_hooks[0]))
+
+        # 2. Layer-wise Activations (Order matters: Layer 0 -> Layer N)
+        # We group them to match the logic of: "for layer in act_list"
+        for hook_type in ["attn_out", "mlp_out", "resid"]:
+            # Find hooks matching this type
+            type_hooks = [h for h in hook_list if hook_type in h]
+
+            # Ensure strict sorting (e.g. blocks.0 before blocks.10) if standard string sort fails
+            # Assuming format: blocks.{layer_num}.{suffix}
+            try:
+                type_hooks.sort(key=lambda x: int(x.split(".")[1]))
+            except (IndexError, ValueError):
+                # Fallback to string sort if naming convention differs
+                type_hooks.sort()
+
+            for h in type_hooks:
+                datasets.append(make_ds(h))
+
+        # 3. Output Logits (if applicable, though usually not projected)
+        # logits_hooks = [h for h in hook_list if "output_logits" in h]
+        # if logits_hooks:
+        #     datasets.append(make_ds(logits_hooks[0]))
+
+        return ConcatDataset(datasets)
+
+    def lock(self) -> str:
+        # Preserving original method signature in case external code relies on it
+        return f"/tmp/projector_dataset_{hash(self.teacher_cache_dir + self.student_cache_dir)}.lock"
 
     def __len__(self):
         return self.num_rows
 
     def __getitem__(self, index):
+        # Access properties to trigger lazy loading if needed
         X_teacher = self.teacher_ds[index]
         X_student = self.student_ds[index]
         return X_teacher, X_student

@@ -3,7 +3,7 @@ from typing import List, Optional
 from kdfp.schemas.configBase import ConfigBase
 
 
-class ExperimentFilter(ConfigBase):
+class ExperimentFilters(ConfigBase):
     """
     Allows for string matching to select a subset of particular experiments to run
     from the full specified suite. Experiments are matched by their name. Useful for debugging.

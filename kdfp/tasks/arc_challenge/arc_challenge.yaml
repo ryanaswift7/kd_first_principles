@@ -1,11 +1,11 @@
 tag:
   - ai2_arc
-task: arc_easy
+task: arc_challenge
 dataset_path: allenai/ai2_arc
-dataset_name: ARC-Easy
+dataset_name: ARC-Challenge
 output_type: multiple_choice
 training_split: train
-# validation_split: validation
+validation_split: validation
 test_split: test
 doc_to_text: "Question: {{question}}\nAnswer:"
 doc_to_target: "{{choices.label.index(answerKey)}}"
