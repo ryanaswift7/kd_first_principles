@@ -302,7 +302,7 @@ class ExperimentInstance(ConfigBase):
                     # include_path="kdfp/tasks"
                     tasks=[task_name],
                     num_fewshot=n,
-                    batch_size="auto",
+                    batch_size=16,
                     device="cuda:0",
                 )
 

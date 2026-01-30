@@ -252,6 +252,8 @@ def activation_caching(
         num_workers=train_params.resources.projector.num_data_workers,
     )
 
+    # token_dl_len = len(token_dl)
+
     lm_hook_points = lm_cfg.hook_list
     hook_caches = [f"{lm_act_cache_dir}/{hp}" for hp in lm_hook_points]
 
@@ -292,7 +294,13 @@ def activation_caching(
     else:
         print(f"\nUsing existing lm activations cache at {lm_act_cache_dir}.")
 
-    cached_tokens = n_samples * train_params.seq_len  # type: ignore
+    if n_samples is not None:
+        cached_tokens = n_samples * train_params.seq_len
+    else:
+        # cached_tokens = train_params.seq_len * train_params.offline_projection.cache_batch_size * token_dl_len
+        raise NotImplementedError(
+            "Total cached tokens calculation not implemented for streaming datasets without n_samples."
+        )
 
     summary = {
         "lm_hook_points": lm_hook_points,
