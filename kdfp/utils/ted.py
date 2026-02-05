@@ -296,14 +296,9 @@ def run_evaluation(model_path, tasks):
         print(f"Error: No valid model found at {model_path}")
         return
 
-    # lm_obj = HFLM(
-    #     pretrained=model_path,
-    #     device=device,
-    #     batch_size="auto",
-    #     dtype="bfloat16" if torch.cuda.is_bf16_supported() else "float16",
-    # )
+    # Dictionary to store only the final scores
+    scores_only = {}
 
-    full_report = {}
     for shot_count in [0, 5]:
         print(f"\n--- Running {shot_count}-Shot Evaluation ---")
         results = lm_eval.simple_evaluate(
@@ -314,19 +309,27 @@ def run_evaluation(model_path, tasks):
             batch_size="auto",
             device=device,
         )
-        full_report[f"{shot_count}_shot"] = results
+
+        shot_key = f"{shot_count}_shot"
+        scores_only[shot_key] = {}
 
         print(f"Results for {shot_count}-Shot:")
         if "results" in results:
             for task, metrics in results["results"].items():
                 acc = metrics.get("acc,none", metrics.get("acc", 0.0))
                 norm = metrics.get("acc_norm,none", metrics.get("acc_norm", 0.0))
+
+                # Save only the essential metrics to our dictionary
+                scores_only[shot_key][task] = {"acc": acc, "acc_norm": norm}
+
                 print(f"{task:<20} | Acc: {acc:.4f} | Norm: {norm:.4f}")
 
-    out_file = os.path.join(model_path, "eval_results.json")
+    # Save only the extracted scores
+    out_file = os.path.join(model_path, "eval_scores.json")
     with open(out_file, "w") as f:
-        json.dump(full_report, f, indent=2, default=str)
-    print(f"\nFull results saved to {out_file}")
+        json.dump(scores_only, f, indent=4)
+
+    print(f"\nScores saved to {out_file}")
 
 
 def main():
