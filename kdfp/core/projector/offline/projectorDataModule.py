@@ -54,6 +54,9 @@ class ProjectorDataModule(pl.LightningDataModule):
         )
 
         total_size = len(self.dataset)
+        print(
+            f"======================= Total dataset size: {total_size} samples ======================="
+        )
         test_size = int(total_size * self.test_split)
         val_size = int(total_size * self.val_split)
         train_size = total_size - val_size - test_size

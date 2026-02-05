@@ -259,7 +259,7 @@ class TeacherModule(pl.LightningModule, MCEvalMixin):
                 learning_rate=config["learning_rate"],
                 weight_decay=config["weight_decay"],
                 max_grad_norm=config["max_grad_norm"],
-                n_samples=training_params.num_samples,
+                n_samples=training_params.total_tokens,
                 num_data_workers=training_params.resources.teacher.num_data_workers,
                 seed=seed,
                 torch_dtype=training_params.torch_dtype,

@@ -82,7 +82,8 @@ class StudentModuleConfig(ConfigBase, DtypeSerializerMixin):
     seed: int
     torch_dtype: torch.dtype
     num_data_workers: int = 0
-    n_samples: Optional[int] = None
+    total_tokens: Optional[int]
+    num_samples: Optional[int]
     objective_weights: Optional[ObjectiveWeights]
     jsd_beta: Optional[float]
     total_steps: int
@@ -126,6 +127,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             mlm=False,  # Causal LM, not masked LM
             return_tensors="pt",
         )
+        self.mse = nn.MSELoss()
 
         # self.val_metrics = torchmetrics.MetricCollection(
         #     {"ppl": torchmetrics.Perplexity(ignore_index=self.tokenizer.eos_token_id)},
@@ -220,7 +222,8 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         )
 
     def training_step(self, batch, batch_idx):
-        mse = torch.nn.MSELoss()
+        input_ids = batch["input_ids"]
+
         student_hooks = self.train_config.distill_pair.student.hook_list
         teacher_hooks = self.train_config.distill_pair.teacher.hook_list
         obj_weights = self.train_config.objective_weights
@@ -228,7 +231,6 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             "Objective weights must be provided for training."
         )
 
-        input_ids = batch["input_ids"]
         total_loss = 0
 
         if teacher_hooks:
@@ -299,7 +301,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                             self.train_config.projection.direction
                             == ProjectionDirection.UP
                         ):
-                            raw_loss = mse(
+                            raw_loss = self.mse(
                                 teacher_cache[teacher_hooks[i]],
                                 self.projector(student_cache[student_hooks[i]]),
                             )
@@ -307,7 +309,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                             self.train_config.projection.direction
                             == ProjectionDirection.DOWN
                         ):
-                            raw_loss = mse(
+                            raw_loss = self.mse(
                                 self.projector(teacher_cache[teacher_hooks[i]]),
                                 student_cache[student_hooks[i]],
                             )
@@ -316,7 +318,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                                 f"Unrecognized projection direction: {self.train_config.projection.direction.value.upper()}"
                             )
                     else:
-                        raw_loss = mse(
+                        raw_loss = self.mse(
                             teacher_cache[teacher_hooks[i]],
                             student_cache[student_hooks[i]],
                         )
@@ -327,6 +329,8 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         return total_loss
 
     def validation_step(self, batch, batch_idx):
+        target_device = next(self.student.parameters()).device
+        batch = batch.to(target_device)
         logits = self.student(batch["input_ids"], return_type="logits")
 
         # 2. Align Logits and Labels
@@ -359,6 +363,9 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
     #     self.val_metrics.reset()
 
     def test_step(self, batch, batch_idx):
+        target_device = next(self.student.parameters()).device
+        batch = batch.to(target_device)
+
         logits = self.student(batch["input_ids"], return_type="logits")
 
         # 2. Align Logits and Labels
@@ -430,7 +437,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             tokenizer=self.tokenizer,
             seq_len=self.train_config.seq_len,
             split="train",
-            n_samples=self.train_config.n_samples,
+            n_samples=self.train_config.num_samples,
             streaming=self.train_config.streaming,
         )
 
@@ -445,45 +452,45 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
             pin_memory=True,
         )
 
-    def val_dataloader(self):
-        dataset = load_data(
-            dataset_name=self.train_config.dataset.name,
-            subset=self.train_config.dataset.subset,
-            tokenizer=self.tokenizer,
-            seq_len=self.train_config.seq_len,
-            split="validation",
-            n_samples=self.train_config.n_samples,
-            streaming=self.train_config.streaming,
-        )
+    # def val_dataloader(self):
+    #     dataset = load_data(
+    #         dataset_name=self.train_config.dataset.name,
+    #         subset=self.train_config.dataset.subset,
+    #         tokenizer=self.tokenizer,
+    #         seq_len=self.train_config.seq_len,
+    #         split="validation",
+    #         n_samples=self.train_config.n_samples,
+    #         streaming=self.train_config.streaming,
+    #     )
 
-        return DataLoader(
-            dataset,
-            batch_size=self.train_config.batch_size,
-            shuffle=False,
-            num_workers=self.train_config.num_data_workers,
-            collate_fn=self.data_collator,
-            pin_memory=True,
-        )
+    #     return DataLoader(
+    #         dataset,
+    #         batch_size=self.train_config.batch_size,
+    #         shuffle=False,
+    #         num_workers=self.train_config.num_data_workers,
+    #         collate_fn=self.data_collator,
+    #         pin_memory=True,
+    #     )
 
-    def test_dataloader(self):
-        dataset = load_data(
-            dataset_name=self.train_config.dataset.name,
-            subset=self.train_config.dataset.subset,
-            tokenizer=self.tokenizer,
-            seq_len=self.train_config.seq_len,
-            split="test",
-            n_samples=self.train_config.n_samples,
-            streaming=self.train_config.streaming,
-        )
+    # def test_dataloader(self):
+    #     dataset = load_data(
+    #         dataset_name=self.train_config.dataset.name,
+    #         subset=self.train_config.dataset.subset,
+    #         tokenizer=self.tokenizer,
+    #         seq_len=self.train_config.seq_len,
+    #         split="test",
+    #         n_samples=self.train_config.n_samples,
+    #         streaming=self.train_config.streaming,
+    #     )
 
-        return DataLoader(
-            dataset,
-            batch_size=self.train_config.batch_size,
-            shuffle=False,
-            num_workers=self.train_config.num_data_workers,
-            collate_fn=self.data_collator,
-            pin_memory=True,
-        )
+    #     return DataLoader(
+    #         dataset,
+    #         batch_size=self.train_config.batch_size,
+    #         shuffle=False,
+    #         num_workers=self.train_config.num_data_workers,
+    #         collate_fn=self.data_collator,
+    #         pin_memory=True,
+    #     )
 
     @classmethod
     def create(
@@ -512,10 +519,11 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 seed=cfg.seed,
                 torch_dtype=training_params.torch_dtype,
                 num_data_workers=training_params.resources.student.num_data_workers,
-                n_samples=training_params.num_samples,
+                total_tokens=training_params.total_tokens,
                 jsd_beta=None,
                 objective_weights=None,
                 total_steps=no_train_param,
+                num_samples=no_train_param,
                 finetune_teacher=training_params.controls.finetune_teacher,
                 training_type=cfg.training_type,
                 streaming=training_params.resources.stream_task_data,
@@ -526,7 +534,12 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         builder = load_dataset_builder(
             training_params.dataset.name, training_params.dataset.subset
         )
-        n_train_samples = builder.info.splits["train"].num_examples  # type: ignore
+        n_total_train_samples = builder.info.splits["train"].num_examples  # type: ignore
+        n_train_samples = (
+            min(n_total_train_samples, training_params.num_samples)
+            if training_params.num_samples
+            else n_total_train_samples
+        )
         total_steps = math.ceil(
             (n_train_samples * training_params.num_epochs)
             / training_params.train_batch_size
@@ -558,10 +571,11 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
                 seed=cfg.seed,
                 torch_dtype=training_params.torch_dtype,
                 num_data_workers=training_params.resources.student.num_data_workers,
-                n_samples=training_params.num_samples,
+                total_tokens=training_params.total_tokens,
                 jsd_beta=cfg.objective.jsd_beta,
                 objective_weights=cfg.objective.weights,
                 total_steps=total_steps,
+                num_samples=n_train_samples,
                 finetune_teacher=training_params.controls.finetune_teacher,
                 training_type=cfg.training_type,
                 streaming=training_params.resources.stream_task_data,

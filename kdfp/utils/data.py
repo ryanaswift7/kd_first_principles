@@ -649,6 +649,10 @@ class CachedActivationsDataset(Dataset):
         # Max index + 1 is the count (assuming 0-indexed contiguous)
         num_samples = max(sample_to_batch.keys()) + 1
 
+        print(
+            f"Loaded metadata from {mapping_path}: {num_samples} samples across "
+            f"{len(set(sample_to_batch.values()))} batches."
+        )
         return sample_to_batch, sample_to_position, num_samples
 
     def __len__(self):
@@ -850,130 +854,142 @@ class ProjectorDataset(Dataset):
         self.student_cache_dir = os.path.abspath(student_cache_dir)
 
         # -------------------------------------------------------------
-        # 1. OPTIMIZATION: Pre-load all metadata in the Main Process
+        # 1. Load Metadata & Config
         # -------------------------------------------------------------
-        # This prevents every worker from re-reading and parsing the same CSVs/JSONs.
-
-        # A. Load Configuration (Hook Lists)
         self.teacher_config = self._load_json(self.teacher_cache_dir)
         self.student_config = self._load_json(self.student_cache_dir)
 
-        # B. Load Heavy Mappings (Sample -> Batch assignments)
-        # We store these as attributes so they are pickled/copied to workers automatically.
-        print("Loading Teacher Metadata...")
+        # print("Loading Teacher Metadata...")
         self.teacher_meta = CachedActivationsDataset.load_metadata(
             self.teacher_cache_dir
         )
 
-        print("Loading Student Metadata...")
+        # print("Loading Student Metadata...")
         self.student_meta = CachedActivationsDataset.load_metadata(
             self.student_cache_dir
         )
 
         # -------------------------------------------------------------
-        # 2. OPTIMIZATION: Calculate length immediately
+        # 2. VALIDATION: Ensure strict alignment
         # -------------------------------------------------------------
-        # The metadata tuple is (sample_to_batch, sample_to_position, num_samples)
-        teacher_len = self.teacher_meta[2]
-        student_len = self.student_meta[2]
+        # A. Resolve the specific hooks to be used
+        self.teacher_hooks = self._get_hook_list(self.teacher_config)
+        self.student_hooks = self._get_hook_list(self.student_config)
 
-        if teacher_len == 0 or student_len == 0:
-            print("Warning: One of the datasets appears empty based on metadata.")
+        # Check 1: Hooks must be identical (same hooks, same order)
+        if len(self.teacher_hooks) != len(self.student_hooks):
+            # diff_t = set(self.teacher_hooks) - set(self.student_hooks)
+            # diff_s = set(self.student_hooks) - set(self.teacher_hooks)
+            raise ValueError(
+                f"Hook mismatch detected!\n"
+                f"Teacher has {len(self.teacher_hooks)} hooks, Student has {len(self.student_hooks)} hooks.\n"
+                # f"In Teacher but not Student: {diff_t}\n"
+                # f"In Student but not Teacher: {diff_s}"
+            )
 
-        self.num_rows = min(teacher_len, student_len)
+        # Check 2: Number of raw samples must be identical
+        # metadata tuple is (sample_to_batch, sample_to_position, num_samples)
+        teacher_samples = self.teacher_meta[2]
+        student_samples = self.student_meta[2]
+
+        if teacher_samples != student_samples:
+            raise ValueError(
+                f"Sample count mismatch! Teacher has {teacher_samples} samples, "
+                f"but Student has {student_samples} samples."
+            )
 
         # -------------------------------------------------------------
-        # 3. Lazy Initialization Placeholders
+        # 3. Calculate Total Length
         # -------------------------------------------------------------
-        # We don't build the actual Dataset objects yet.
-        # This keeps the __init__ fast and lightweight.
+        # Length = (Number of Samples) * (Number of Hooks)
+        self.num_rows = teacher_samples * len(self.teacher_hooks)
+
+        # -------------------------------------------------------------
+        # 4. Lazy Initialization Placeholders
+        # -------------------------------------------------------------
         self._teacher_ds = None
         self._student_ds = None
 
     def _load_json(self, cache_dir: str) -> Dict:
-        """Helper to load the summary JSON."""
         path = Path(cache_dir) / "caching_summary.json"
         if not path.exists():
             raise FileNotFoundError(f"Config not found at {path}")
         with open(path, "r") as f:
             return json.load(f)
 
+    def _get_hook_list(self, config: Dict) -> List[str]:
+        """
+        Parses the config to determine exactly which hooks will be turned into datasets.
+        """
+        hook_list = config.get("lm_hook_points", [])
+        valid_hooks = []
+
+        # 1. Embeddings
+        embed_hooks = [h for h in hook_list if "embed" in h]
+        if embed_hooks:
+            valid_hooks.append(embed_hooks[0])
+
+        # 2. Layer-wise Activations
+        for hook_type in ["attn_out", "mlp_out", "resid"]:
+            type_hooks = [h for h in hook_list if hook_type in h]
+            try:
+                # Sort by layer number: blocks.{layer}.{type}
+                type_hooks.sort(key=lambda x: int(x.split(".")[1]))
+            except (IndexError, ValueError):
+                type_hooks.sort()
+
+            valid_hooks.extend(type_hooks)
+
+        return valid_hooks
+
     @property
     def teacher_ds(self):
-        # Lazy initialization happens on the worker
         if self._teacher_ds is None:
+            # print(f"Building Teacher Dataset from: {self.teacher_cache_dir}")
             self._teacher_ds = self._build_concat_dataset(
-                self.teacher_cache_dir, self.teacher_config, self.teacher_meta
+                self.teacher_cache_dir, self.teacher_hooks, self.teacher_meta
             )
         return self._teacher_ds
 
     @property
     def student_ds(self):
         if self._student_ds is None:
+            # print(f"Building Student Dataset from: {self.student_cache_dir}")
             self._student_ds = self._build_concat_dataset(
-                self.student_cache_dir, self.student_config, self.student_meta
+                self.student_cache_dir, self.student_hooks, self.student_meta
             )
         return self._student_ds
 
-    def _build_concat_dataset(self, cache_dir: str, config: Dict, metadata: Tuple):
+    def _build_concat_dataset(
+        self, cache_dir: str, hook_paths: List[str], metadata: Tuple
+    ):
         """
-        Reconstructs the HookCache logic manually to build the dataset list.
-        This is faster than instantiating the HookCache Pydantic model on every worker.
+        Instantiates a list of datasets for the provided hook paths.
         """
-        hook_list = config.get("lm_hook_points", [])
         s2b, s2p, n_samples = metadata
 
-        # Helper to create a single dataset instance using pre-loaded metadata
-        def make_ds(hook_path):
-            return CachedActivationsDataset(
-                cache_dir=os.path.join(cache_dir, hook_path),
-                sample_to_batch=s2b,  # Shared Dict
-                sample_to_position=s2p,  # Shared Dict
-                num_samples=n_samples,  # Integer
-                # We don't need to pass target_data_path unless specific logic requires it
-            )
-
         datasets = []
+        for hook_path in hook_paths:
+            # --- PRINT HOOK NAME AS IT LOADS ---
+            # print(f"Loading cached hook dataset: {hook_path}")
 
-        # 1. Embeddings
-        embed_hooks = [h for h in hook_list if "embed" in h]
-        if embed_hooks:
-            # Usually only one embedding hook
-            datasets.append(make_ds(embed_hooks[0]))
-
-        # 2. Layer-wise Activations (Order matters: Layer 0 -> Layer N)
-        # We group them to match the logic of: "for layer in act_list"
-        for hook_type in ["attn_out", "mlp_out", "resid"]:
-            # Find hooks matching this type
-            type_hooks = [h for h in hook_list if hook_type in h]
-
-            # Ensure strict sorting (e.g. blocks.0 before blocks.10) if standard string sort fails
-            # Assuming format: blocks.{layer_num}.{suffix}
-            try:
-                type_hooks.sort(key=lambda x: int(x.split(".")[1]))
-            except (IndexError, ValueError):
-                # Fallback to string sort if naming convention differs
-                type_hooks.sort()
-
-            for h in type_hooks:
-                datasets.append(make_ds(h))
-
-        # 3. Output Logits (if applicable, though usually not projected)
-        # logits_hooks = [h for h in hook_list if "output_logits" in h]
-        # if logits_hooks:
-        #     datasets.append(make_ds(logits_hooks[0]))
+            ds = CachedActivationsDataset(
+                cache_dir=os.path.join(cache_dir, hook_path),
+                sample_to_batch=s2b,
+                sample_to_position=s2p,
+                num_samples=n_samples,
+            )
+            datasets.append(ds)
 
         return ConcatDataset(datasets)
 
     def lock(self) -> str:
-        # Preserving original method signature in case external code relies on it
         return f"/tmp/projector_dataset_{hash(self.teacher_cache_dir + self.student_cache_dir)}.lock"
 
     def __len__(self):
         return self.num_rows
 
     def __getitem__(self, index):
-        # Access properties to trigger lazy loading if needed
         X_teacher = self.teacher_ds[index]
         X_student = self.student_ds[index]
         return X_teacher, X_student

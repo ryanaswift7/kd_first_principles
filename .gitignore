@@ -4,3 +4,4 @@ kdfp.egg-info/
 .pytest_cache/
 results/
 results.old/
+ray_results/

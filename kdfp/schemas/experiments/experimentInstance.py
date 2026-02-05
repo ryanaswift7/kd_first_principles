@@ -279,16 +279,19 @@ class ExperimentInstance(ConfigBase):
 
         student_module = StudentModule.load_pretrained(str(self.dirs.student_model))
 
-        results = self.test_trainer_factory().test(model=student_module, verbose=True)
+        """ 
+        FIXME: need to figure out how to get a test split for fineweb edu if I want to get test perplexity
+        """
+        # results = self.test_trainer_factory().test(model=student_module, verbose=True)
 
-        new_result = generate_result(
-            name=self.cfg.name,
-            model=student_module.student,
-            task_name=self.training_params.dataset.name.split("/")[-1],
-            metric_name="perplexity",
-            score=results[0]["test_ppl"],
-        )
-        results_list.append(new_result)
+        # new_result = generate_result(
+        #     name=self.cfg.name,
+        #     model=student_module.student,
+        #     task_name=self.training_params.dataset.name.split("/")[-1],
+        #     metric_name="perplexity",
+        #     score=results[0]["test_ppl"],
+        # )
+        # results_list.append(new_result)
 
         for i, task_name in enumerate(self.tasks.names):
             print(
@@ -302,8 +305,8 @@ class ExperimentInstance(ConfigBase):
                     # include_path="kdfp/tasks"
                     tasks=[task_name],
                     num_fewshot=n,
-                    batch_size=16,
-                    device="cuda:0",
+                    batch_size=self.training_params.test_batch_size,
+                    device="cuda",
                 )
 
                 new_result = generate_result(

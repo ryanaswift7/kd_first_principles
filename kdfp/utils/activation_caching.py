@@ -227,6 +227,7 @@ def is_cache_complete(
     return True
 
 
+# NOTE: seq_len overridden to 256 for caching to save disk space
 def activation_caching(
     lm_cfg: DistillationModelConfig,
     cache_dir: str,
@@ -242,7 +243,7 @@ def activation_caching(
         dataset_name=train_params.offline_projection.dataset.name,
         dataset_subset=train_params.offline_projection.dataset.subset,
         split=train_params.offline_projection.dataset.split,
-        seq_len=train_params.seq_len,
+        seq_len=256,  # train_params.seq_len,
         batch_size=train_params.offline_projection.cache_batch_size,
         torch_dtype=train_params.torch_dtype,
         token_rename=train_params.offline_projection.dataset.token_rename,

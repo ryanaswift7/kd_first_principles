@@ -47,6 +47,7 @@ def train_projector_per_worker(
         pin_memory=True,
         prefetch_factor=4,
     )
+    datamodule.setup(stage="fit")
     cfg = OffProjModuleConfig(
         teacher_dim=teacher_dim,
         student_dim=student_dim,
@@ -65,10 +66,10 @@ def train_projector_per_worker(
         callbacks=[RayTrainReportCallback()],
         max_epochs=max_epochs,
         accelerator="auto",
-        enable_progress_bar=False,
+        enable_progress_bar=True,
         enable_checkpointing=False,
         deterministic=training_params.reproducible_backend,
-        check_val_every_n_epoch=1,
+        val_check_interval=10,
         logger=WandbLogger(
             name=config["wandb_run_name"],
             project=training_params.wandb.project,

@@ -125,6 +125,9 @@ class OfflineProjectorModule(LightningModule):
         }
 
     def training_step(self, batch, batch_idx):
+        # current_batch_size = batch[0].shape[0]
+        # print(f"DEBUG: Actual Batch Size is {current_batch_size}")
+
         X_teacher, X_student = batch
         losses = self.compute_losses(X_teacher, X_student)
 
