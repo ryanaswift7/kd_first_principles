@@ -1,4 +1,4 @@
-suite_title: &suite 'base'
+suite_title: &suite 'off_proj_search'
 models: 
   teacher:
     name: &teacher_name EleutherAI/pythia-2.8b-deduped
@@ -19,7 +19,7 @@ directories:
 
 experiment_space:
   seeds: [3] # [3, 27, 44]
-  student_types: ["pretrained", "shallow"]
+  student_types: ["pretrained"]
   objective:
     jsd_betas: [0.5]  # [0.0, 0.25, 0.5, 0.75, 1.0]
     weight_variants:
@@ -37,23 +37,23 @@ experiment_space:
       # - "with_resid"
   projection:
     directions: ["up", "down"]
-    training_methods: ["offline", "online", "randomized"]
-    offline_alignment_betas: [0.5]  # [0.0, 0.25, 0.5, 0.75, 1.0]
+    training_methods: ["offline"]
+    offline_alignment_betas: [0.0, 0.25, 0.5, 0.75, 1.0]
   filters:
     include: null
     exclude: null
 
 training_params:
   dataset: 
-      name: ryanaswift7/fineweb-edu-pythia-kdfp-subsets
-      subset: "v2"  # "v2", "v3", or "v4"
+      name: ryanaswift7/fineweb-edu-pythia-kdfp-subsets-100m
+      subset: v1
       split: train
       shuffle: false
       token_rename: false
-  seq_len: 256
-  train_batch_size: 8  # 48
-  test_batch_size: 16  # 128
-  num_samples: null
+  seq_len: 2048
+  train_batch_size: 1
+  test_batch_size: 16
+  total_tokens: 100000000
   num_epochs: 1
   n_trials: 5  # 25
   reproducible_backend: true
@@ -65,7 +65,7 @@ training_params:
     # also ft versions if requested below [FIXME]), finetuned
     # students, and students with no training
     finetune_teacher: false
-    get_baselines: true
+    get_baselines: false
     run_or_test: run
 
   resources:
@@ -73,9 +73,9 @@ training_params:
     num_available_gpus: 2
     stream_task_data: true
     projector:
-      num_data_workers: 0
+      num_data_workers: 12
       num_ray_workers: 1
-      num_cpus_per_trial: 6
+      num_cpus_per_trial: 24
       num_gpus_per_trial: 1.0
     teacher:
       num_data_workers: 0
@@ -90,7 +90,7 @@ training_params:
 
   offline_projection:
     dataset: 
-      name: ryanaswift7/fineweb-edu-pythia-kdfp-subsets
+      name: ryanaswift7/fineweb-edu-pythia-kdfp-subsets-10m
       subset: v1
       split: train
       shuffle: false
@@ -103,7 +103,7 @@ training_params:
     force_cache_all: false
 
   wandb:
-    project: 'kdfp-ted-fineweb'
+    project: 'kdfp-ted-fineweb-100m-off-proj-search'
     group: *suite
 
 
@@ -142,7 +142,11 @@ hparams:
         weight_decay: 3e-4
         max_grad_norm: 0.4
         temperature: 3e-1
-      kd: null
+      kd:
+        lr: 4.3e-4
+        weight_decay: 4.9e-2
+        max_grad_norm: 3e-1
+        temperature: 0.5
 
     off_proj:
       lr: 4.5e-4
@@ -169,10 +173,9 @@ tasks:
     - arc_challenge
     - arc_easy
     - boolq
-    # - triviaqa
     - piqa
     - sciq
     - winogrande
-  num_fewshots: [0, 5, 25]
+  num_fewshots: [0, 5]
 
   

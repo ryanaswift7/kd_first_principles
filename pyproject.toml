@@ -19,4 +19,5 @@ packages = {find = {}}
 kdfp = "kdfp.main:main"
 data-gen = "kdfp.utils.data_gen:main"
 plot-gen = "kdfp.utils.plot_gen:main"
-ted = "kdfp.utils.ted:main"
+ted = "kdfp.comparisons.ted:main"
+minillm = "kdfp.comparisons.minillm:main"

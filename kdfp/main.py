@@ -8,7 +8,7 @@ import torch
 from kdfp.schemas.suite import Suite
 from kdfp.utils.general import get_timestamp
 
-DEFAULT_CONFIG = "kdfp/configs/base.yaml"
+DEFAULT_CONFIG = "kdfp/configs/base_100m_tokens.yaml"
 
 
 def run_suite(suite_config_path: str):
