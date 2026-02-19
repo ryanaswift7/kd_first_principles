@@ -69,7 +69,7 @@ def train_projector_per_worker(
         enable_progress_bar=True,
         enable_checkpointing=False,
         deterministic=training_params.reproducible_backend,
-        val_check_interval=10,
+        val_check_interval=500,
         logger=WandbLogger(
             name=config["wandb_run_name"],
             project=training_params.wandb.project,

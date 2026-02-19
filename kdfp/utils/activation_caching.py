@@ -32,7 +32,7 @@ def prepare_lm_and_dataloader(
     shuffle: bool = False,
     lm_dir: Optional[str] = None,
     total_tokens: Optional[int] = None,
-    num_workers: int = 0,
+    num_workers: int = 0,  # needs to be 0 for caching to work for some reason
 ):
     """Load model, sae, and dataset based on args."""
     if lm_dir:
@@ -250,7 +250,7 @@ def activation_caching(
         shuffle=train_params.offline_projection.dataset.shuffle,
         lm_dir=lm_dir,
         total_tokens=train_params.offline_projection.total_tokens,
-        num_workers=train_params.resources.projector.num_data_workers,
+        # num_workers=train_params.resources.projector.num_data_workers,
     )
 
     # token_dl_len = len(token_dl)

@@ -8,7 +8,7 @@ STUDENT_MODEL_ID = "EleutherAI/pythia-1.4b-deduped"
 TEACHER_MODEL_ID = "EleutherAI/pythia-2.8b-deduped"
 DATASET_ID = "ryanaswift7/fineweb-edu-pythia-kdfp-subsets-100m"
 DATASET_CONFIG = "v1"
-OUTPUT_DIR = "minillm-pythia-1.4b-100m"
+OUTPUT_DIR = "results/minillm-pythia-1.4b-100m"
 
 # MiniLLM / Training Hyperparameters
 MAX_LENGTH = 2048
@@ -22,7 +22,7 @@ def main():
     # MiniLLM requires the tokenizer to be passed clearly for decoding/encoding during generation
     tokenizer = AutoTokenizer.from_pretrained(STUDENT_MODEL_ID)
     tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"  # Crucial for generation-based training
+    # tokenizer.padding_side = "left"  # Crucial for generation-based training
 
     # 2. Load and Format Dataset
     # MiniLLM is an RL/Generation method (Reverse KLD).
@@ -86,7 +86,7 @@ def main():
         per_device_train_batch_size=1,  # Generation is memory heavy
         gradient_accumulation_steps=8,
         bf16=True,  # Essential for Ampere+
-        logging_steps=10,
+        logging_steps=100,
         save_strategy="epoch",
         report_to="none",
         gradient_checkpointing=True,

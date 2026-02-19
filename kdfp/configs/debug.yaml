@@ -173,5 +173,9 @@ tasks:
     - piqa
     - sciq
     - winogrande
+    - mmlu
+    - bbh  # bigbench hard
+    - drop
+    - triviaqa  # may not work
   num_fewshots: [0]
   

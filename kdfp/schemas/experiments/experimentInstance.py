@@ -1,3 +1,4 @@
+import gc
 import os
 import shutil
 import warnings
@@ -7,6 +8,7 @@ from typing import List, Optional
 import lightning.pytorch as pl
 import lm_eval
 import pandas as pd
+import torch
 
 from kdfp.core.projector import OfflineProjectorModule
 from kdfp.core.projector.offline.offlineProjector import gen_off_proj_weights_filename
@@ -307,6 +309,7 @@ class ExperimentInstance(ConfigBase):
                     num_fewshot=n,
                     batch_size=self.training_params.test_batch_size,
                     device="cuda",
+                    # limit=1,
                 )
 
                 new_result = generate_result(
@@ -330,6 +333,8 @@ class ExperimentInstance(ConfigBase):
         print(f"Testing of student {self.cfg.name} complete!")
         print(f"Test scores can be found at: {scores_dir}")
         print("=========================================")
+        torch.cuda.empty_cache()
+        gc.collect()
         return results_list
 
     # def test_teachers(self, mode: Literal["pl", "hf"]) -> List[dict]:
