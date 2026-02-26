@@ -14,8 +14,8 @@ directories:
   root: results
   cache: cache
   models: models
-  ray: ray
-  lightning: lightning
+  ray: ray-debug
+  lightning: lightning-debug
 
 experiment_space:
   seeds: [3] # [3, 27, 44]
@@ -45,15 +45,15 @@ experiment_space:
 
 training_params:
   dataset: 
-      name: ryanaswift7/fineweb-edu-pythia-kdfp-subsets
-      subset: "v2"  # "v2", "v3", or "v4"
+      name: ryanaswift7/fineweb-edu-pythia-kdfp-subsets-100m
+      subset: "v1"  # "v2", "v3", or "v4"
       split: train
       shuffle: false
       token_rename: false
-  seq_len: 256
+  seq_len: 8
   train_batch_size: 1  # 48
   test_batch_size: 1  # 128
-  num_samples: 1
+  total_tokens: 8
   num_epochs: 1
   n_trials: 1  # 25
   reproducible_backend: true
@@ -90,7 +90,7 @@ training_params:
 
   offline_projection:
     dataset: 
-      name: ryanaswift7/fineweb-edu-pythia-kdfp-subsets
+      name: ryanaswift7/fineweb-edu-pythia-kdfp-subsets-10m
       subset: v1
       split: train
       shuffle: false
@@ -103,7 +103,7 @@ training_params:
     force_cache_all: false
 
   wandb:
-    project: 'kdfp-ted-fineweb'
+    project: 'kdfp-ted-fineweb-debug'
     group: *suite
 
 
@@ -174,8 +174,7 @@ tasks:
     - sciq
     - winogrande
     - mmlu
-    - bbh  # bigbench hard
+    - bbh
     - drop
-    - triviaqa  # may not work
   num_fewshots: [0]
   

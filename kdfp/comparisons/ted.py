@@ -2,6 +2,7 @@ import argparse
 import gc
 import json
 import os
+from pathlib import Path
 import shutil
 import tempfile
 from typing import Dict
@@ -23,6 +24,21 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm  # Import tqdm
 from transformers import AutoTokenizer, GPTNeoXForCausalLM
 
+
+
+EVAL_TASKS = [
+    "hellaswag",
+    "arc_challenge",
+    "arc_easy",
+    "boolq",
+    "triviaqa",
+    "piqa",
+    "sciq",
+    "winogrande",
+    "mmlu",
+    "bbh",
+    "drop",
+]
 
 # ==========================================
 # 1. UTILITIES & ARCHITECTURE
@@ -288,8 +304,8 @@ def train_ted_ray(config: Dict):
 # ==========================================
 # 3. EVALUATION
 # ==========================================
-def run_evaluation(model_path, tasks):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def run_evaluation(model_path, tasks, eval_limit):
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"\n=== Running Eval on {model_path} ===")
 
     if not is_valid_model_dir(model_path):
@@ -299,30 +315,71 @@ def run_evaluation(model_path, tasks):
     # Dictionary to store only the final scores
     scores_only = {}
 
-    for shot_count in [0, 5]:
-        print(f"\n--- Running {shot_count}-Shot Evaluation ---")
-        results = lm_eval.simple_evaluate(
-            model="hf",
-            model_args=f"pretrained={model_path},dtype=auto",
-            tasks=tasks,
-            num_fewshot=shot_count,
-            batch_size="auto",
-            device=device,
-        )
+    eval_args = {
+        "model": "hf",
+        "model_args": f"pretrained={model_path},dtype=auto",  # ,gpu_memory_utilization=0.8",
+        "tasks": tasks,
+        "batch_size": "auto"
+    }
 
-        shot_key = f"{shot_count}_shot"
-        scores_only[shot_key] = {}
+    if eval_limit is not None:
+        eval_args.update({"limit": eval_limit})
 
-        print(f"Results for {shot_count}-Shot:")
-        if "results" in results:
-            for task, metrics in results["results"].items():
-                acc = metrics.get("acc,none", metrics.get("acc", 0.0))
-                norm = metrics.get("acc_norm,none", metrics.get("acc_norm", 0.0))
 
-                # Save only the essential metrics to our dictionary
-                scores_only[shot_key][task] = {"acc": acc, "acc_norm": norm}
+    print("\n--- Running Evaluation ---")
+    results = lm_eval.simple_evaluate(**eval_args)
+    raw_out_file = Path(model_path) / "raw_eval_scores.json"
+    with open(raw_out_file, "w") as f:
+        json.dump(results["results"], f, indent=4)
 
-                print(f"{task:<20} | Acc: {acc:.4f} | Norm: {norm:.4f}")
+    print("\nEvaluation Results:")
+    if "results" in results:
+        for task, metrics in results["results"].items():
+            # filter out granular scores
+            if "bbh" in task and task != "bbh":
+                continue
+            if "mmlu" in task and task != "mmlu":
+                continue
+
+            # Safely pull the standard metrics if they exist
+            acc = metrics.get("acc,none", metrics.get("acc"))
+            norm = metrics.get("acc_norm,none", metrics.get("acc_norm"))
+            em = metrics.get("exact_match,get-answer",
+                             metrics.get("exact_match,remove_whitespace",
+                                         metrics.get("exact_match,none",
+                                                     metrics.get("exact_match"))))
+            f1 = metrics.get("f1,none", metrics.get("f1"))
+            inst = metrics.get("inst_level_strict_acc,none", metrics.get("inst_level_strict_acc"))
+
+            # Save only the valid metrics found for this specific task
+            task_scores = {}
+            if acc is not None:
+                task_scores["acc"] = acc
+            if norm is not None:
+                task_scores["acc_norm"] = norm
+            if em is not None:
+                task_scores["exact_match"] = em
+            if f1 is not None:
+                task_scores["f1"] = f1
+            if inst is not None:
+                task_scores["inst_level_strict_acc"] = inst
+
+            scores_only[task] = task_scores
+
+            # Build a dynamic string for printing
+            print_str = f"{task:<20} | "
+            if norm is not None:
+                print_str += f"Norm: {norm:.4f}  "
+            if acc is not None:
+                print_str += f"Acc: {acc:.4f}  "
+            if em is not None:
+                print_str += f"EM: {em:.4f}  "
+            if f1 is not None:
+                print_str += f"F1: {f1:.4f}  "
+            if inst is not None:
+                print_str += f"Inst: {inst:.4f}  "
+
+            print(print_str.strip())
 
     # Save only the extracted scores
     out_file = os.path.join(model_path, "eval_scores.json")
@@ -358,18 +415,10 @@ def main():
     )
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--seq_len", type=int, default=2048)
+    parser.add_argument("--eval_limit", type=int, default=None)
 
     args = parser.parse_args()
 
-    eval_tasks = [
-        "hellaswag",
-        "arc_easy",
-        "arc_challenge",
-        "winogrande",
-        "boolq",
-        "piqa",
-        "sciq",
-    ]
 
     should_train = True
     if args.skip_train:
@@ -434,7 +483,7 @@ def main():
         torch.cuda.empty_cache()
         gc.collect()
 
-    run_evaluation(args.save_path, eval_tasks)
+    run_evaluation(args.save_path, EVAL_TASKS, args.eval_limit)
 
 
 # ==========================================
