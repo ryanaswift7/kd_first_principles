@@ -25,7 +25,7 @@ from kdfp.utils.activation_caching import (
 )
 from kdfp.utils.enums import ProjectionTraining
 from kdfp.utils.general import get_timestamp
-from kdfp.utils.results import generate_result
+from kdfp.utils.evals import generate_result
 
 
 class ExperimentInstance(ConfigBase):
@@ -281,19 +281,6 @@ class ExperimentInstance(ConfigBase):
 
         student_module = StudentModule.load_pretrained(str(self.dirs.student_model))
 
-        """ 
-        FIXME: need to figure out how to get a test split for fineweb edu if I want to get test perplexity
-        """
-        # results = self.test_trainer_factory().test(model=student_module, verbose=True)
-
-        # new_result = generate_result(
-        #     name=self.cfg.name,
-        #     model=student_module.student,
-        #     task_name=self.training_params.dataset.name.split("/")[-1],
-        #     metric_name="perplexity",
-        #     score=results[0]["test_ppl"],
-        # )
-        # results_list.append(new_result)
 
         for i, task_name in enumerate(self.tasks.names):
             print(
