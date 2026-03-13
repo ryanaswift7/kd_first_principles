@@ -46,6 +46,8 @@ def train_projector_per_worker(
         test_split=test_split,
         pin_memory=True,
         prefetch_factor=4,
+        seq_len=training_params.seq_len,
+        total_tokens=training_params.offline_projection.total_tokens,
     )
     datamodule.setup(stage="fit")
     cfg = OffProjModuleConfig(
@@ -69,7 +71,7 @@ def train_projector_per_worker(
         enable_progress_bar=True,
         enable_checkpointing=False,
         deterministic=training_params.reproducible_backend,
-        val_check_interval=500,
+        val_check_interval=100,
         logger=WandbLogger(
             name=config["wandb_run_name"],
             project=training_params.wandb.project,

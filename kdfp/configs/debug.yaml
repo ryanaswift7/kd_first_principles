@@ -37,7 +37,7 @@ experiment_space:
       # - "with_resid"
   projection:
     directions: ["up", "down"]
-    training_methods: ["offline", "online", "randomized"]
+    training_methods: ["online", "randomized"]
     offline_alignment_betas: [0.5]  # [0.0, 0.25, 0.5, 0.75, 1.0]
   filters:
     include: null
@@ -165,7 +165,7 @@ hparams:
 
 tasks:
   names: 
-    - hellaswag
+    # - hellaswag
     - arc_challenge
     - arc_easy
     - boolq
@@ -177,4 +177,5 @@ tasks:
     - bbh
     - drop
   num_fewshots: [0]
+  sample_limit: 1
   

@@ -1,4 +1,5 @@
 import gc
+import json
 import os
 import shutil
 import warnings
@@ -25,7 +26,7 @@ from kdfp.utils.activation_caching import (
 )
 from kdfp.utils.enums import ProjectionTraining
 from kdfp.utils.general import get_timestamp
-from kdfp.utils.evals import generate_result
+from kdfp.utils.evals import evaluate_model
 
 
 class ExperimentInstance(ConfigBase):
@@ -181,242 +182,66 @@ class ExperimentInstance(ConfigBase):
 
         return self.test_student()
 
-        # results = self.test_trainer_factory().test(model=student_module, verbose=True)
-
-        # new_result = generate_result(
-        #     name=self.cfg.name,
-        #     model=student_module.student,
-        #     task_name=self.training_params.dataset.name.split("/")[-1],
-        #     metric_name="perplexity",
-        #     score=results[0]["test_ppl"],
-        # )
-        # results_list.append(new_result)
-
-        # for i, task_name in enumerate(self.tasks.names):
-        #     print(
-        #         f"\nBenchmarking task {i + 1}/{len(self.tasks.names)}: '{task_name.upper()}'..."
-        #     )
-        #     for n in self.tasks.num_fewshots:
-        #         print(f"  - with {n} few-shots...")
-        #         task_result = lm_eval.simple_evaluate(
-        #             model="hf",
-        #             model_args=f"pretrained={model_save_dir},dtype=auto",
-        #             tasks=[task_name],
-        #             num_fewshot=n,
-        #             batch_size="auto",
-        #             device="cuda:0",
-        #         )
-
-        #         new_result = generate_result(
-        #             name=self.cfg.name,
-        #             model=student_module.student,
-        #             task_name=task_name,
-        #             metric_name="accuracy",
-        #             num_fewshot=n,
-        #             score=task_result["results"][task_name]["acc,none"],
-        #         )
-        #         results_list.append(new_result)
-        #     print(
-        #         f"\nFinished task {i + 1}/{len(self.tasks.names)}: '{task_name.upper()}'!"
-        #     )
-
-        # results_df = pd.DataFrame(results_list)
-        # scores_dir = Path(f"{self.dirs.student_model}/scores")
-        # scores_dir.mkdir(parents=True, exist_ok=True)
-        # results_df.to_markdown(scores_dir / f"results_df_{get_timestamp()}.md")
-        # self.cleanup_log_dirs()
-        # return results_list
-
-    # def test_student(self, mode: Literal["pl", "hf"]) -> List[dict]:
-    #     print(f"Running tests on student {self.cfg.name}...")
-    #     results_list = []
-
-    #     student_module = AutoModelForCausalLM.from_pretrained(self.dirs.student_model)
-    #     student_module.eval()
-
-    #     for i, task_name in enumerate(self.tasks.names):
-    #         print(
-    #             f"\nBenchmarking student {self.cfg.name} on task {task_name.upper()}..."
-    #         )
-    #         student_save_dir = f"{self.dirs.student_model}/{task_name}"
-    #         if mode == "pl":
-    #             student_module = StudentModule.load_pretrained(student_save_dir)
-    #         else:
-    #             student_test_cfg = HFTesterModuleConfig(
-    #                 model_path=student_save_dir,
-    #                 tokenizer_name=self.cfg.distill_pair.student.name,
-    #                 task=task_name,
-    #                 seq_len=self.training_params.seq_len,
-    #                 batch_size=self.training_params.test_batch_size,
-    #                 seed=self.cfg.seed,
-    #                 torch_dtype=self.training_params.torch_dtype,
-    #                 num_data_workers=self.training_params.resources.student.num_data_workers,
-    #                 n_samples=self.training_params.num_samples,
-    #             )
-    #             student_module = HFTesterModule(student_test_cfg)
-    #         results = self.test_trainer_factory().test(
-    #             model=student_module, verbose=True
-    #         )
-    #         new_result = generate_result(
-    #             name=self.cfg.name,
-    #             model=student_module.student,
-    #             task_name=task_name,
-    #             metric_name="accuracy",
-    #             score=results[0]["test_acc"],
-    #         )
-    #         results_list.append(new_result)
-    #         new_result_df = pd.DataFrame([new_result])
-
-    #         scores_dir = Path(f"{self.dirs.student_model}/scores")
-    #         scores_dir.mkdir(parents=True, exist_ok=True)
-    #         new_result_df.to_markdown(scores_dir / f"results_df_{get_timestamp()}.md")
-
-    #         print(f"Finished with task {task_name.upper()}!")
-    #     self.cleanup_log_dirs()
-    #     return results_list
-
     def test_student(self) -> List[dict]:
+        """Class method to evaluate a student model across multiple few-shot settings."""
         print(f"Running tests on student {self.cfg.name}...")
-        results_list = []
 
-        student_module = StudentModule.load_pretrained(str(self.dirs.student_model))
+        student_model_path = str(self.dirs.student_model)
+        
+        master_results_df = pd.DataFrame()
+        master_raw_dict = {}
+        master_extracted_dict = {}
 
-
-        for i, task_name in enumerate(self.tasks.names):
-            print(
-                f"\nBenchmarking task {i + 1}/{len(self.tasks.names)}: '{task_name.upper()}'..."
+        for n in self.tasks.num_fewshots:
+            print(f"\nBenchmarking all tasks with {n} few-shots...")
+            print(f"Tasks: {', '.join(self.tasks.names)}")
+            
+            extracted_dict, results_df, raw_results_dict = evaluate_model(
+                model_path=student_model_path,
+                tasks=self.tasks.names,
+                experiment_name=self.cfg.name,
+                num_fewshot=n,
+                batch_size=self.training_params.test_batch_size,
+                device="auto",
+                limit=self.tasks.sample_limit,
             )
-            for n in self.tasks.num_fewshots:
-                print(f"  - with {n} few-shots...")
-                task_result = lm_eval.simple_evaluate(
-                    model="hf",
-                    model_args=f"pretrained={self.dirs.student_model},dtype=auto",
-                    # include_path="kdfp/tasks"
-                    tasks=[task_name],
-                    num_fewshot=n,
-                    batch_size=self.training_params.test_batch_size,
-                    device="cuda",
-                    # limit=1,
-                )
+            
+            # Nest dictionaries to avoid overwriting across few-shot loops
+            fewshot_key = f"fewshot_{n}"
+            master_raw_dict[fewshot_key] = raw_results_dict
+            master_extracted_dict[fewshot_key] = extracted_dict
 
-                new_result = generate_result(
-                    name=self.cfg.name,
-                    model=student_module.student,
-                    task_name=task_name,
-                    metric_name="accuracy",
-                    num_fewshot=n,
-                    score=task_result["results"][task_name]["acc,none"],
-                )
-                results_list.append(new_result)
-            print(
-                f"\nFinished task {i + 1}/{len(self.tasks.names)}: '{task_name.upper()}'!"
-            )
+            if not results_df.empty:
+                if master_results_df.empty:
+                    master_results_df = results_df
+                else:
+                    master_results_df = pd.concat([master_results_df, results_df], ignore_index=True)
 
-        results_df = pd.DataFrame(results_list)
-        scores_dir = Path(f"{self.dirs.student_model}/scores")
-        scores_dir.mkdir(parents=True, exist_ok=True)
-        results_df.to_markdown(scores_dir / f"results_df_{get_timestamp()}.md")
-        self.cleanup_log_dirs()
+        print("\nFinished benchmarking all tasks!")
+
+        if not master_results_df.empty:
+            scores_dir = Path(f"{self.dirs.student_model}/scores")
+            scores_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = get_timestamp()
+            
+            # Dicts to JSON
+            with open(scores_dir / f"raw_eval_scores_{timestamp}.json", "w") as f:
+                json.dump(master_raw_dict, f, indent=4)
+                
+            with open(scores_dir / f"extracted_eval_scores_{timestamp}.json", "w") as f:
+                json.dump(master_extracted_dict, f, indent=4)
+
+            # DF to CSV/Parquet
+            master_results_df.to_csv(scores_dir / f"results_df_{timestamp}.csv", index=False)
+            master_results_df.to_parquet(scores_dir / f"results_df_{timestamp}.parquet", index=False)
+            
+            print(f"Test scores can be found at: {scores_dir}")
+        else:
+            print("No valid metrics were found to save.")
+            
+        self.cleanup_log_dirs() # Assumes this class method exists
         print(f"Testing of student {self.cfg.name} complete!")
-        print(f"Test scores can be found at: {scores_dir}")
         print("=========================================")
-        torch.cuda.empty_cache()
-        gc.collect()
-        return results_list
+        
+        return master_results_df.to_dict(orient="records") if not master_results_df.empty else []
 
-    # def test_teachers(self, mode: Literal["pl", "hf"]) -> List[dict]:
-    #     pl.seed_everything(seed=self.cfg.seed, workers=True)
-    #     results_list = []
-    #     base_teacher_results_list = []
-
-    #     base_teacher_scores_dir = self.dirs.suite_scores / "base_teacher"
-    #     base_teacher_scores_dir.mkdir(parents=True, exist_ok=True)
-
-    #     for i, task in enumerate(self.task_list):
-    #         print(f"Benchmarking baseline teacher on task {task.name.upper()}...")
-    #         base_teacher_cfg = BaselineModuleConfig(
-    #             model_name=self.cfg.distill_pair.teacher.name,
-    #             is_shallow=False,
-    #             task=task,
-    #             seq_len=self.training_params.seq_len,
-    #             batch_size=self.training_params.test_batch_size,
-    #             seed=self.cfg.seed,
-    #             torch_dtype=self.training_params.torch_dtype,
-    #             num_data_workers=self.training_params.resources.teacher.num_data_workers,
-    #             n_samples=self.training_params.num_samples,
-    #             layer_reduction_factor=None,
-    #             stream_data=self.training_params.resources.stream_task_data,
-    #         )
-    #         base_teacher_module = BaselineModule(base_teacher_cfg)
-    #         base_teacher_module.print_param_count("base_teacher")
-    #         base_teacher_results = self.test_trainer_factory().test(
-    #             model=base_teacher_module, verbose=True
-    #         )
-    #         base_teacher_results_list.append(
-    #             generate_result(
-    #                 name="base_teacher",
-    #                 model=base_teacher_module.model,
-    #                 task_name=task.name,
-    #                 metric_name="accuracy",
-    #                 score=base_teacher_results[0]["test_acc"],
-    #             )
-    #         )
-
-    #         if self.training_params.controls.finetune_teacher:
-    #             print(
-    #                 f"\nBenchmarking teacher finetuned on task {task.name.upper()}..."
-    #             )
-    #             teacher_save_dir = f"{self.dirs.teacher_model}/{task.name}"
-
-    #             if mode == "pl":
-    #                 teacher_module = TeacherModule.load_pretrained(teacher_save_dir)
-    #                 # adjust current n_samples to respect new config (used for quick debugging)
-    #                 teacher_module.train_config.n_samples = (
-    #                     self.training_params.num_samples
-    #                 )
-    #             else:
-    #                 teacher_test_cfg = HFTesterModuleConfig(
-    #                     model_path=teacher_save_dir,
-    #                     tokenizer_name=self.cfg.distill_pair.teacher.name,
-    #                     task=task,
-    #                     seq_len=self.training_params.seq_len,
-    #                     batch_size=self.training_params.test_batch_size,
-    #                     seed=self.cfg.seed,
-    #                     torch_dtype=self.training_params.torch_dtype,
-    #                     num_data_workers=self.training_params.resources.teacher.num_data_workers,
-    #                     n_samples=self.training_params.num_samples,
-    #                 )
-    #                 teacher_module = HFTesterModule(teacher_test_cfg)
-
-    #             results = self.test_trainer_factory().test(
-    #                 model=teacher_module, verbose=True
-    #             )
-    #             new_result = generate_result(
-    #                 name="teacher_ft",
-    #                 model=teacher_module.model,
-    #                 task_name=task.name,
-    #                 metric_name="accuracy",
-    #                 score=results[0]["test_acc"],
-    #             )
-    #             results_list.append(new_result)
-    #             new_result_df = pd.DataFrame([new_result])
-
-    #             scores_dir = Path(f"{self.dirs.teacher_model}/{task.name}/scores")
-    #             scores_dir.mkdir(parents=True, exist_ok=True)
-    #             new_result_df.to_parquet(
-    #                 scores_dir / f"results_df_{get_timestamp()}.parquet"
-    #             )
-    #             new_result_df.to_markdown(
-    #                 scores_dir / f"results_df_{get_timestamp()}.md"
-    #             )
-    #             print(f"Finished with task {task.name.upper()}!")
-
-    #     base_teacher_results_df = pd.DataFrame(base_teacher_results_list)
-    #     base_teacher_results_df.to_parquet(
-    #         base_teacher_scores_dir / f"results_df_{get_timestamp()}.parquet"
-    #     )
-    #     base_teacher_results_df.to_markdown(
-    #         base_teacher_scores_dir / f"results_df_{get_timestamp()}.md"
-    #     )
-    #     self.cleanup_log_dirs()
-    #     return results_list

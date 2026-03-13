@@ -57,7 +57,7 @@ from kdfp.schemas.trainingParams import TrainingParams
 from kdfp.utils.data import load_data
 from kdfp.utils.enums import ProjectionDirection, ProjectionTraining, TrainingType
 from kdfp.utils.shallow_model_loading import load_shallow
-from kdfp.utils.weight_conversion import (
+from kdfp.utils.weight_conversions.pythia_wc import (
     convert_hooked_to_neox_weights,
     convert_neox_to_hooked_weights,
 )

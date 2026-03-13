@@ -14,8 +14,8 @@ directories:
   root: results
   cache: cache
   models: models
-  ray: ray
-  lightning: lightning
+  ray: ray0
+  lightning: lightning0
 
 experiment_space:
   seeds: [3] # [3, 27, 44]
@@ -169,7 +169,6 @@ hparams:
 
 tasks:
   names: 
-    # - hellaswag
     - arc_challenge
     - arc_easy
     - boolq
@@ -180,6 +179,7 @@ tasks:
     - mmlu
     - bbh
     - drop
-  num_fewshots: [0, 5]
+  num_fewshots: [0, 3]
+  sample_limit: null
 
   

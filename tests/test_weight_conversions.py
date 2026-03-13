@@ -2,7 +2,7 @@ import pytest
 import torch
 from transformer_lens import HookedTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
-from kdfp.utils.weight_conversion import (
+from kdfp.utils.weight_conversions.pythia_wc import (
     convert_hooked_to_neox_weights,
     convert_hooked_to_gpt2_weights,
     convert_gpt2_to_hooked_weights,

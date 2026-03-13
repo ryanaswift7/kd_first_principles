@@ -4,7 +4,7 @@ from transformer_lens import HookedTransformer
 from transformers import AutoModelForCausalLM
 import torch
 from kdfp.utils.shallow_model_loading import get_indices_and_num_layers_to_keep
-import kdfp.utils.weight_conversion as wc
+import kdfp.utils.weight_conversions.pythia_wc as wc
 from kdfp.schemas.configBase import ConfigBase
 from lightning.pytorch import LightningModule
 

@@ -1,7 +1,11 @@
 .vscode/
 kdfp.egg-info/
+kd_first_principles.egg-info/
+.venv/
 *pycache*
 .pytest_cache/
 results/
 results.old/
 ray_results/
+*.pdf
+ted-redux/

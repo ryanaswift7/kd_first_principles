@@ -2,32 +2,30 @@ import argparse
 import gc
 import json
 import os
-from pathlib import Path
 import shutil
 import tempfile
+from pathlib import Path
 from typing import Dict
 
-# LM Eval imports
-import lm_eval
 import numpy as np
-
-# Ray Imports
 import ray
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import pandas as pd
 from datasets import load_dataset
 from ray import train, tune
 from ray.train import Checkpoint
 from ray.tune.schedulers import ASHAScheduler
 from torch.utils.data import DataLoader
-from tqdm import tqdm  # Import tqdm
-from transformers import AutoTokenizer, GPTNeoXForCausalLM
+from tqdm.auto import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from kdfp.utils.evals import evaluate_model
+from kdfp.utils.general import is_valid_model_dir
 
 
 EVAL_TASKS = [
-    "hellaswag",
     "arc_challenge",
     "arc_easy",
     "boolq",
@@ -36,21 +34,51 @@ EVAL_TASKS = [
     "sciq",
     "winogrande",
     "mmlu",
-    "bbh",
     "drop",
 ]
 
-# ==========================================
-# 1. UTILITIES & ARCHITECTURE
-# ==========================================
-def is_valid_model_dir(path: str) -> bool:
-    if not os.path.exists(path) or not os.path.isdir(path):
-        return False
-    files = set(os.listdir(path))
-    has_config = "config.json" in files
-    has_weights = any(f in files for f in ["model.safetensors", "pytorch_model.bin"])
-    return has_config and has_weights
-
+MODEL_CONFIGS = {
+    "pythia": {
+        "teacher": "EleutherAI/pythia-2.8b-deduped",
+        "student": "EleutherAI/pythia-1.4b-deduped",
+        "teacher_layers": 32,
+        "student_layers": 24,
+        "teacher_embedding_dim": 2560,
+        "student_embedding_dim": 2048,
+    },
+    "llama3.2": {
+        "teacher": "meta-llama/Llama-3.2-3B",
+        "student": "meta-llama/Llama-3.2-1B",
+        "teacher_layers": 28,
+        "student_layers": 16,
+        "teacher_embedding_dim": 3072,
+        "student_embedding_dim": 2048,
+    },
+    "qwen2.5": {
+        "teacher": "Qwen/Qwen2.5-3B",
+        "student": "Qwen/Qwen2.5-1.5B",
+        "teacher_layers": 36,
+        "student_layers": 28,
+        "teacher_embedding_dim": 2048,
+        "student_embedding_dim": 1536,
+    },
+    "gemma3": {
+        "teacher": "google/gemma-3-4b-pt",
+        "student": "google/gemma-3-1b-pt",
+        "teacher_layers": 34,
+        "student_layers": 26,
+        "teacher_embedding_dim": 2560,
+        "student_embedding_dim": 2304,
+    },
+    "qwen3": {
+        "teacher": "Qwen/Qwen3-4B",
+        "student": "Qwen/Qwen3-1.7B",
+        "teacher_layers": 36,
+        "student_layers": 28,
+        "teacher_embedding_dim": 2560,
+        "student_embedding_dim": 2048,
+    }
+}
 
 class TaskAwareFilter(nn.Module):
     def __init__(self, input_dim, output_dim, hidden_dim=None):
@@ -58,7 +86,6 @@ class TaskAwareFilter(nn.Module):
         if hidden_dim is None:
             hidden_dim = output_dim
 
-        # 2-Layer MLP with GeLU
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim, bias=False),
             nn.GELU(),
@@ -74,99 +101,106 @@ class TEDDistiller(nn.Module):
         self,
         teacher,
         student,
-        teacher_layers=32,
-        student_layers=24,
-        teacher_hidden=2560,
-        student_hidden=2048,
-        dtype=torch.float16,
+        teacher_layers,
+        student_layers,
+        teacher_embedding_dim,
+        student_embedding_dim,
+        dtype=torch.bfloat16,
     ):
         super().__init__()
         self.teacher = teacher
         self.student = student
 
+        # Freeze Teacher
         for param in self.teacher.parameters():
             param.requires_grad = False
+        self.teacher.eval() # Ensure dropout layers are disabled
 
         self.layer_map = np.linspace(0, teacher_layers - 1, student_layers, dtype=int)
 
-        # Filters
         self.teacher_filters = nn.ModuleDict(
             {
-                str(t_idx): TaskAwareFilter(teacher_hidden, teacher_hidden)
+                str(t_idx): TaskAwareFilter(teacher_embedding_dim, teacher_embedding_dim)
                 for t_idx in self.layer_map
             }
         ).to(dtype=dtype)
 
         self.student_filters = nn.ModuleList(
             [
-                TaskAwareFilter(student_hidden, teacher_hidden)
+                TaskAwareFilter(student_embedding_dim, teacher_embedding_dim)
                 for _ in range(student_layers)
             ]
         ).to(dtype=dtype)
 
+    def get_norm_and_head(self, model):
+        """Dynamically extract final layernorm and unembed head based on architecture."""
+        if hasattr(model, "model") and hasattr(model.model, "norm"):
+            return model.model.norm, model.lm_head
+        elif hasattr(model, "gpt_neox"):
+            return model.gpt_neox.final_layer_norm, model.embed_out
+        else:
+            raise ValueError(f"Unsupported model architecture for extracting norm/head: {type(model)}")
+
     def compute_teacher_head_loss(self, hidden_state, input_ids):
-        final_norm = self.teacher.gpt_neox.final_layer_norm
-        lm_head = self.teacher.embed_out
-        logits = lm_head(final_norm(hidden_state))
+        norm, head = self.get_norm_and_head(self.teacher)
+        
+        normed_state = norm(hidden_state)
+        logits = head(normed_state)
 
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = input_ids[..., 1:].contiguous()
+        
         return F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
         )
 
-    def forward(self, input_ids, attention_mask, stage="distill"):
+    def forward(self, input_ids, stage="distill"):
         with torch.no_grad():
-            t_out = self.teacher(
-                input_ids, attention_mask=attention_mask, output_hidden_states=True
+            t_outputs = self.teacher(
+                input_ids, 
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False # VRAM FIX: Stop KV cache allocation during training
             )
-            t_hiddens = t_out.hidden_states[1:]
-            t_logits = t_out.logits
+            t_logits = t_outputs.logits
+            t_hiddens = {int(l): t_outputs.hidden_states[int(l) + 1] for l in self.layer_map}
+            del t_outputs 
 
         if stage == "teacher_warmup":
-            s_hiddens, s_logits = None, None
+            s_hiddens, s_logits, s_loss = None, None, None
         else:
-            s_out = self.student(
-                input_ids, attention_mask=attention_mask, output_hidden_states=True
+            s_outputs = self.student(
+                input_ids, 
+                labels=input_ids,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False # VRAM FIX: Stop KV cache allocation during training
             )
-            s_logits, s_hiddens = s_out.logits, s_out.hidden_states[1:]
+            s_logits = s_outputs.logits
+            s_loss = s_outputs.loss
+            s_num_layers = self.student.config.num_hidden_layers
+            
+            s_hiddens = {l: s_outputs.hidden_states[l + 1] for l in range(s_num_layers)}
+            del s_outputs
 
-        # Stage 1: Teacher Filter Warmup
         if stage == "teacher_warmup":
             loss = 0.0
             for t_idx in self.layer_map:
-                t_filt = self.teacher_filters[str(t_idx)](t_hiddens[t_idx])
+                t_filt = self.teacher_filters[str(t_idx)](t_hiddens.pop(int(t_idx)))
                 loss += self.compute_teacher_head_loss(t_filt, input_ids)
             return loss / len(self.layer_map)
 
-        # Stage 2: Student Filter Warmup
         elif stage == "student_warmup":
             loss = 0.0
             for s_idx in range(len(self.student_filters)):
-                s_filt = self.student_filters[s_idx](s_hiddens[s_idx])
+                s_filt = self.student_filters[s_idx](s_hiddens.pop(s_idx))
                 loss += self.compute_teacher_head_loss(s_filt, input_ids)
             return loss / len(self.student_filters)
 
-        # Stage 3: Distillation (MSE + CE + KL)
         elif stage == "distill":
-            # A. Layer MSE
-            layer_loss = 0.0
-            mse = nn.MSELoss()
-            for s_idx, t_idx in enumerate(self.layer_map):
-                with torch.no_grad():
-                    t_target = self.teacher_filters[str(t_idx)](t_hiddens[t_idx])
-                s_mapped = self.student_filters[s_idx](s_hiddens[s_idx])
-                layer_loss += mse(s_mapped, t_target)
-            layer_loss = layer_loss / len(self.layer_map)
-
-            # B. Task CE
-            shift_logits = s_logits[..., :-1, :].contiguous()
-            shift_labels = input_ids[..., 1:].contiguous()
-            ce_loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-            )
-
-            # C. KL Divergence
+            # --- VRAM FIX: Calculate KL Divergence FIRST ---
+            # This allows us to delete the massive [batch, seq, vocab] logits early
+            ce_loss = s_loss
             T = 2.0
             kl_loss = F.kl_div(
                 F.log_softmax(s_logits / T, dim=-1),
@@ -174,40 +208,70 @@ class TEDDistiller(nn.Module):
                 reduction="batchmean",
             ) * (T**2)
 
-            return ce_loss + (0.1 * layer_loss) + (1.0 * kl_loss)
+            del t_logits, s_logits 
+            # --- END VRAM FIX ---
 
+            # Now that big memory is clear, compute layer MSE loss
+            layer_loss = 0.0
+            mse = nn.MSELoss()
+            for s_idx, t_idx in enumerate(self.layer_map):
+                with torch.no_grad():
+                    t_target = self.teacher_filters[str(t_idx)](t_hiddens.pop(int(t_idx)))
+                s_mapped = self.student_filters[s_idx](s_hiddens.pop(s_idx))
+                layer_loss += mse(s_mapped, t_target)
+            layer_loss = layer_loss / len(self.layer_map)
 
-# ==========================================
-# 2. RAY TUNE TRAINING FUNCTION (STREAMING)
-# ==========================================
+            return ce_loss + (0.1 * layer_loss) + (2.5 * kl_loss)
+                
+
 def train_ted_ray(config: Dict):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = (
-        torch.bfloat16
-        if (torch.cuda.is_available() and torch.cuda.is_bf16_supported())
-        else torch.float16
-    )
+    dtype = torch.bfloat16
 
-    # 1. Models
-    teacher = GPTNeoXForCausalLM.from_pretrained(
-        "EleutherAI/pythia-2.8b", torch_dtype=dtype, device_map="auto"
-    )
-    student = GPTNeoXForCausalLM.from_pretrained(
-        "EleutherAI/pythia-1.4b", torch_dtype=dtype
+    model_family = config["model_family"]
+    model_cfg = MODEL_CONFIGS[model_family]
+
+    print(f"Loading Teacher: {model_cfg['teacher']} from Hugging Face...")
+    teacher = AutoModelForCausalLM.from_pretrained(
+        model_cfg["teacher"], 
+        torch_dtype=dtype, 
+        attn_implementation="sdpa", # VRAM FIX: Native memory-efficient attention
     ).to(device)
-    student.gradient_checkpointing_enable()
-
-    model = TEDDistiller(teacher, student, dtype=dtype).to(device)
+    
+    print(f"Loading Student: {model_cfg['student']} from Hugging Face...")
+    student = AutoModelForCausalLM.from_pretrained(
+        model_cfg["student"], 
+        torch_dtype=dtype, 
+        attn_implementation="sdpa", # VRAM FIX: Native memory-efficient attention
+    ).to(device)
+    
+    # VRAM FIX: Enable Gradient Checkpointing
+    student.gradient_checkpointing_enable() 
+    
+    model = TEDDistiller(
+        teacher, 
+        student, 
+        teacher_layers=model_cfg["teacher_layers"],
+        student_layers=model_cfg["student_layers"],
+        teacher_embedding_dim=model_cfg["teacher_embedding_dim"],
+        student_embedding_dim=model_cfg["student_embedding_dim"],
+        dtype=dtype
+    ).to(device)
 
     # 2. Streaming Data Setup
-    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/pythia-1.4b")
+    tokenizer = AutoTokenizer.from_pretrained(model_cfg["student"])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Use streaming=True
-    dataset = load_dataset(
-        "HuggingFaceFW/fineweb-edu", "sample-10BT", split="train", streaming=True
-    )
+    dataset_name = config["dataset"]
+    if dataset_name == "fineweb-edu":
+        dataset = load_dataset("ryanaswift7/fineweb-edu-pythia-kdfp-subsets-100m", "v1", split="train", streaming=True)
+    elif dataset_name == "wikipedia":
+        dataset = load_dataset("ryanaswift7/wikipedia-pythia-kdfp-subsets-100m", "v1", split="train", streaming=True)
+    elif dataset_name == "dolma3":
+        dataset = load_dataset("ryanaswift7/dolma3-pythia-kdfp-subsets-100m", "v1", split="train", streaming=True)
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
 
     def tokenize(ex):
         return tokenizer(
@@ -221,15 +285,14 @@ def train_ted_ray(config: Dict):
     dataset = dataset.with_format("torch")
 
     loader = DataLoader(dataset, batch_size=config["batch_size"])
-    # Single iterator for the entire lifecycle ensures we move linearly through dataset
     data_iterator = iter(loader)
 
-    # 3. Training Loop Helper (with Progress Bar)
+    # 3. Training Loop Helper
     def run_stage_for_tokens(stage_name, target_tokens, optimizer):
         tokens_processed = 0
         last_loss = 0.0
+        step_count = 0
 
-        # Initialize Progress Bar
         pbar = tqdm(total=target_tokens, desc=f"[{stage_name}]", unit="tok", leave=True)
 
         while tokens_processed < target_tokens:
@@ -240,11 +303,9 @@ def train_ted_ray(config: Dict):
                 break
 
             input_ids = batch["input_ids"].to(device)
-            mask = batch["attention_mask"].to(device)
             current_tokens = input_ids.numel()
 
-            with torch.amp.autocast(device_type="cuda", dtype=dtype):
-                loss = model(input_ids, mask, stage_name)
+            loss = model(input_ids, stage_name)
 
             optimizer.zero_grad()
             loss.backward()
@@ -253,36 +314,32 @@ def train_ted_ray(config: Dict):
             tokens_processed += current_tokens
             last_loss = loss.item()
 
-            # Update Progress Bar
             pbar.update(current_tokens)
             pbar.set_postfix({"loss": f"{last_loss:.4f}"})
+            
+            del loss, input_ids, batch
+            
+            step_count += 1
+            if step_count % 50 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
 
         pbar.close()
         return last_loss
 
-    # --- STAGE 1: Teacher Warmup ---
-    # We use data 0 -> X
-    opt_t = torch.optim.AdamW(
-        model.teacher_filters.parameters(), lr=config["lr_filters"]
-    )
+    # VRAM FIX: Fused AdamW avoids creating intermediate copies of gradients
+    opt_t = torch.optim.AdamW(model.teacher_filters.parameters(), lr=config["lr_filters"], fused=True)
     model.train()
     run_stage_for_tokens("teacher_warmup", config["tokens_s1"], opt_t)
 
-    # --- STAGE 2: Student Warmup ---
-    # We use data X -> Y
-    opt_s = torch.optim.AdamW(
-        model.student_filters.parameters(), lr=config["lr_filters"]
-    )
+    opt_s = torch.optim.AdamW(model.student_filters.parameters(), lr=config["lr_filters"], fused=True)
     run_stage_for_tokens("student_warmup", config["tokens_s2"], opt_s)
 
-    # --- STAGE 3: Distillation ---
-    # We use data Y -> Z
     params = list(model.student.parameters()) + list(model.student_filters.parameters())
-    opt_d = torch.optim.AdamW(params, lr=config["lr_student"])
+    opt_d = torch.optim.AdamW(params, lr=config["lr_student"], fused=True)
 
-    # Pruning reports every 25% of the distill budget
     chunk_size = config["tokens_s3"] // 4
-    cumulative_tokens = 0  # Tracker for ASHA
+    cumulative_tokens = 0  
 
     for i in range(4):
         loss_val = run_stage_for_tokens("distill", chunk_size, opt_d)
@@ -295,130 +352,97 @@ def train_ted_ray(config: Dict):
             train.report(
                 {
                     "loss": loss_val,
-                    "tokens_processed": cumulative_tokens,  # Report explicit metric
+                    "tokens_processed": cumulative_tokens,
                 },
                 checkpoint=Checkpoint.from_directory(temp_checkpoint_dir),
             )
+        gc.collect()
+        torch.cuda.empty_cache()
+            
+    del model
+    del teacher
+    del student
+    del opt_t
+    del opt_s
+    del opt_d
+    
+    gc.collect()
+    torch.cuda.empty_cache()
 
-
-# ==========================================
-# 3. EVALUATION
-# ==========================================
-def run_evaluation(model_path, tasks, eval_limit):
-    # device = "cuda" if torch.cuda.is_available() else "cpu"
+def run_evaluation(model_path: str | Path, tasks: list, eval_limit: int = None, device: str = "cuda"):
+    model_path = Path(model_path)
     print(f"\n=== Running Eval on {model_path} ===")
 
     if not is_valid_model_dir(model_path):
         print(f"Error: No valid model found at {model_path}")
         return
 
-    # Dictionary to store only the final scores
-    scores_only = {}
+    experiment_name = model_path.name 
+    master_results_df = pd.DataFrame()
+    master_raw_dict = {}
+    master_extracted_dict = {}
 
-    eval_args = {
-        "model": "hf",
-        "model_args": f"pretrained={model_path},dtype=auto",  # ,gpu_memory_utilization=0.8",
-        "tasks": tasks,
-        "batch_size": "auto"
-    }
+    for n in [0]:
+        print(f"\n--- Benchmarking all tasks with {n} few-shots ---")
+        extracted_dict, results_df, raw_results_dict = evaluate_model(
+            model_path=str(model_path), 
+            tasks=tasks,
+            experiment_name=experiment_name,
+            num_fewshot=n,
+            batch_size="auto",
+            limit=eval_limit,
+            device=device
+        )
 
-    if eval_limit is not None:
-        eval_args.update({"limit": eval_limit})
+        fewshot_key = f"fewshot_{n}"
+        master_raw_dict[fewshot_key] = raw_results_dict
+        master_extracted_dict[fewshot_key] = extracted_dict
 
+        if not results_df.empty:
+            if master_results_df.empty:
+                master_results_df = results_df
+            else:
+                master_results_df = pd.concat([master_results_df, results_df], ignore_index=True)
 
-    print("\n--- Running Evaluation ---")
-    results = lm_eval.simple_evaluate(**eval_args)
-    raw_out_file = Path(model_path) / "raw_eval_scores.json"
-    with open(raw_out_file, "w") as f:
-        json.dump(results["results"], f, indent=4)
+    out_dir = model_path
+    
+    with open(out_dir / "raw_eval_scores.json", "w") as f:
+        json.dump(master_raw_dict, f, indent=4)
+        
+    with open(out_dir / "extracted_eval_scores.json", "w") as f:
+        json.dump(master_extracted_dict, f, indent=4)
 
-    print("\nEvaluation Results:")
-    if "results" in results:
-        for task, metrics in results["results"].items():
-            # filter out granular scores
-            if "bbh" in task and task != "bbh":
-                continue
-            if "mmlu" in task and task != "mmlu":
-                continue
-
-            # Safely pull the standard metrics if they exist
-            acc = metrics.get("acc,none", metrics.get("acc"))
-            norm = metrics.get("acc_norm,none", metrics.get("acc_norm"))
-            em = metrics.get("exact_match,get-answer",
-                             metrics.get("exact_match,remove_whitespace",
-                                         metrics.get("exact_match,none",
-                                                     metrics.get("exact_match"))))
-            f1 = metrics.get("f1,none", metrics.get("f1"))
-            inst = metrics.get("inst_level_strict_acc,none", metrics.get("inst_level_strict_acc"))
-
-            # Save only the valid metrics found for this specific task
-            task_scores = {}
-            if acc is not None:
-                task_scores["acc"] = acc
-            if norm is not None:
-                task_scores["acc_norm"] = norm
-            if em is not None:
-                task_scores["exact_match"] = em
-            if f1 is not None:
-                task_scores["f1"] = f1
-            if inst is not None:
-                task_scores["inst_level_strict_acc"] = inst
-
-            scores_only[task] = task_scores
-
-            # Build a dynamic string for printing
-            print_str = f"{task:<20} | "
-            if norm is not None:
-                print_str += f"Norm: {norm:.4f}  "
-            if acc is not None:
-                print_str += f"Acc: {acc:.4f}  "
-            if em is not None:
-                print_str += f"EM: {em:.4f}  "
-            if f1 is not None:
-                print_str += f"F1: {f1:.4f}  "
-            if inst is not None:
-                print_str += f"Inst: {inst:.4f}  "
-
-            print(print_str.strip())
-
-    # Save only the extracted scores
-    out_file = os.path.join(model_path, "eval_scores.json")
-    with open(out_file, "w") as f:
-        json.dump(scores_only, f, indent=4)
-
-    print(f"\nScores saved to {out_file}")
+    if not master_results_df.empty:
+        master_results_df.to_csv(out_dir / "eval_scores.csv", index=False)
+        master_results_df.to_parquet(out_dir / "eval_scores.parquet", index=False)
+        print(f"\nScores successfully saved to {out_dir}")
+    else:
+        print("\nNo valid metrics were found to save.")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--skip_train", action="store_true")
-    parser.add_argument("--save_path", type=str, required=True)
+    parser.add_argument("--skip-train", action="store_true")
+    parser.add_argument("--save-path", type=str, required=True)
+    parser.add_argument("--model-family", type=str, choices=["pythia", "llama3.2", "qwen2.5", "gemma3", "qwen3"], required=True)
+    parser.add_argument("--dataset", type=str, choices=["fineweb-edu", "wikipedia", "dolma3"], required=True)
+    
+    parser.add_argument("--lr-filters", type=float, default=None, 
+                        help="Specify a fixed learning rate for the filters.")
+    parser.add_argument("--lr-student", type=float, default=None, 
+                        help="Specify a fixed learning rate for the student.")
+    
+    parser.add_argument("--force-lr-tune", action="store_true", 
+                        help="Force Ray Tune to run multiple trials even if exact learning rates are provided.")
 
-    # Token Budgets
-    parser.add_argument(
-        "--tokens_s1",
-        type=int,
-        default=10_000_000,
-        help="Tokens for Stage 1 (Teacher Warmup)",
-    )
-    parser.add_argument(
-        "--tokens_s2",
-        type=int,
-        default=10_000_000,
-        help="Tokens for Stage 2 (Student Warmup)",
-    )
-    parser.add_argument(
-        "--tokens_s3",
-        type=int,
-        default=100_000_000,
-        help="Tokens for Stage 3 (Distillation)",
-    )
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--seq_len", type=int, default=2048)
-    parser.add_argument("--eval_limit", type=int, default=None)
+    parser.add_argument("--tokens-s1", type=int, default=10_000_000)
+    parser.add_argument("--tokens-s2", type=int, default=10_000_000)
+    parser.add_argument("--tokens-s3", type=int, default=100_000_000)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--seq-len", type=int, default=2048)
+    parser.add_argument("--eval-limit", type=int, default=None)
 
     args = parser.parse_args()
-
 
     should_train = True
     if args.skip_train:
@@ -429,32 +453,35 @@ def main():
 
     if should_train:
         print("=== Starting Ray Tune Sweep (Streaming) ===")
-        print(
-            f"S1 Tokens: {args.tokens_s1:_}, S2 Tokens: {args.tokens_s2:_}, S3 Tokens: {args.tokens_s3:_}"
-        )
+        print(f"Model Family: {args.model_family} | Dataset: {args.dataset}")
 
         ray.init()
 
         search_space = {
-            "lr_filters": tune.loguniform(1e-4, 1e-2),
-            "lr_student": tune.loguniform(1e-6, 1e-4),
+            "lr_filters": args.lr_filters if args.lr_filters is not None else tune.qloguniform(1e-4, 1e-2, 1e-5),
+            "lr_student": args.lr_student if args.lr_student is not None else tune.qloguniform(1e-6, 1e-4, 1e-7),
             "tokens_s1": args.tokens_s1,
             "tokens_s2": args.tokens_s2,
             "tokens_s3": args.tokens_s3,
             "batch_size": args.batch_size,
             "seq_len": args.seq_len,
+            "model_family": args.model_family,
+            "dataset": args.dataset,
         }
 
-        # ASHA Scheduler configured for TOKENS
-        # time_attr: tells ASHA to look at 'tokens_processed' metric in report()
-        # max_t: max tokens for the run
-        # grace_period: minimum tokens before pruning (1 chunk / 25%)
         scheduler = ASHAScheduler(
             time_attr="tokens_processed",
             max_t=args.tokens_s3,
             grace_period=args.tokens_s3 // 4,
             reduction_factor=2,
         )
+
+        num_trials = 5
+        if args.lr_filters is not None and args.lr_student is not None and not args.force_lr_tune:
+            num_trials = 1
+            print("Explicit learning rates provided. Running a single training trial instead of a sweep.")
+        elif args.force_lr_tune and (args.lr_filters is not None and args.lr_student is not None):
+            print("WARNING: --force-lr-tune active with explicit learning rates. Running 10 trials with identical hyperparameters to test variance.")
 
         tuner = tune.Tuner(
             tune.with_resources(train_ted_ray, resources={"cpu": 4, "gpu": 1}),
@@ -463,7 +490,7 @@ def main():
                 metric="loss",
                 mode="min",
                 scheduler=scheduler,
-                num_samples=4,
+                num_samples=num_trials,
             ),
             run_config=train.RunConfig(
                 storage_path=os.path.abspath("./ray_results"), name="ted_stream_sweep"
@@ -479,15 +506,22 @@ def main():
         with best_result.checkpoint.as_directory() as checkpoint_dir:
             shutil.copytree(checkpoint_dir, args.save_path, dirs_exist_ok=True)
 
+        best_config = best_result.config
+        final_lrs = {
+            "lr_filters": best_config.get("lr_filters"),
+            "lr_student": best_config.get("lr_student")
+        }
+        
+        lr_save_path = Path(args.save_path) / "final_learning_rates.json"
+        with open(lr_save_path, "w") as f:
+            json.dump(final_lrs, f, indent=4)
+        print(f"Saved optimal learning rates to {lr_save_path}")
+
         ray.shutdown()
         torch.cuda.empty_cache()
         gc.collect()
 
     run_evaluation(args.save_path, EVAL_TASKS, args.eval_limit)
 
-
-# ==========================================
-# 4. MAIN
-# ==========================================
 if __name__ == "__main__":
     main()

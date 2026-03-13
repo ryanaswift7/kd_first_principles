@@ -9,7 +9,6 @@ import seaborn as sns
 
 def add_labels(ax, fmt="%.4f"):
     """Helper to add labels to the top of bars and adjust Y-axis height."""
-    # Add the labels
     for container in ax.containers:
         ax.bar_label(container, fmt=fmt, padding=3, fontsize=10)
 
@@ -28,55 +27,65 @@ def save_experiment_plots(df, output_root):
 
     print(f"Generating plots in: {output_root}")
 
-    # --- 1. INDIVIDUAL ACCURACY TASKS ---
-    acc_df = df[df["METRIC_CLEAN"] == "accuracy"].copy()
+    # Define metrics where "higher is better" (Accuracy, F1, Exact Match, etc.)
+    higher_is_better_metrics = ["acc", "acc_norm", "accuracy", "exact_match", "f1"]
+
+    # --- 1. INDIVIDUAL TASK PLOTS ---
+    acc_df = df[df["METRIC_CLEAN"].isin(higher_is_better_metrics)].copy()
 
     if not acc_df.empty:
+        # FILTER: If a task has 'acc_norm', drop the 'acc' metric for that task
+        tasks_with_acc_norm = acc_df[acc_df["METRIC_CLEAN"] == "acc_norm"]["TASK"].unique()
+        acc_df = acc_df[~((acc_df["TASK"].isin(tasks_with_acc_norm)) & (acc_df["METRIC_CLEAN"] == "acc"))]
+
+        # Group by both TASK and METRIC
         for task in acc_df["TASK"].unique():
-            task_data = acc_df[acc_df["TASK"] == task]
+            for metric in acc_df[acc_df["TASK"] == task]["METRIC_CLEAN"].unique():
+                task_data = acc_df[(acc_df["TASK"] == task) & (acc_df["METRIC_CLEAN"] == metric)]
 
-            # Create Folder for Task
-            safe_task = str(task).replace("/", "_").replace(" ", "_")
-            task_dir = output_root / "Accuracy_Per_Task" / safe_task
-            task_dir.mkdir(parents=True, exist_ok=True)
+                # Create Folder for Task
+                safe_task = f"{task}_{metric}".replace("/", "_").replace(" ", "_")
+                task_dir = output_root / "Scores_Per_Task" / safe_task
+                task_dir.mkdir(parents=True, exist_ok=True)
 
-            for fs in task_data["NUM_FEWSHOT"].unique():
-                is_nan = pd.isna(fs)
-                fs_label = "NaN" if is_nan else str(int(fs))
+                for fs in task_data["NUM_FEWSHOT"].unique():
+                    is_nan = pd.isna(fs)
+                    fs_label = "NaN" if is_nan else str(int(fs))
 
-                # Filter
-                plot_df = (
-                    task_data[task_data["NUM_FEWSHOT"].isna()]
-                    if is_nan
-                    else task_data[task_data["NUM_FEWSHOT"] == fs]
-                )
-                if plot_df.empty:
-                    continue
+                    # Filter by Few-shot count
+                    plot_df = (
+                        task_data[task_data["NUM_FEWSHOT"].isna()]
+                        if is_nan
+                        else task_data[task_data["NUM_FEWSHOT"] == fs]
+                    )
+                    if plot_df.empty:
+                        continue
 
-                # Plot
-                plt.figure(figsize=(12, 7))  # Larger size for labels
-                ax = sns.barplot(
-                    data=plot_df.sort_values("SCORE", ascending=False),
-                    x="EXPERIMENT",
-                    y="SCORE",
-                    palette="viridis",
-                )
+                    # Plot
+                    plt.figure(figsize=(12, 7))
+                    ax = sns.barplot(
+                        data=plot_df.sort_values("SCORE", ascending=False),
+                        x="EXPERIMENT",
+                        y="SCORE",
+                        palette="viridis",
+                    )
 
-                add_labels(ax, fmt="%.4f")  # Add 4-decimal precision
+                    add_labels(ax, fmt="%.4f")
 
-                plt.title(f"Accuracy: {task} (Few-shot: {fs_label})")
-                plt.xticks(rotation=45, ha="right")
-                plt.ylabel("Accuracy")
-                plt.tight_layout()
-                plt.savefig(task_dir / f"fewshot_{fs_label}.png")
-                plt.close()
+                    plt.title(f"{metric.upper()}: {task} (Few-shot: {fs_label})")
+                    plt.xticks(rotation=45, ha="right")
+                    plt.ylabel("Score")
+                    plt.tight_layout()
+                    plt.savefig(task_dir / f"fewshot_{fs_label}.png")
+                    plt.close()
 
-    # --- 2. AVERAGE ACCURACY (Aggregated) ---
+    # --- 2. AVERAGE SCORE (Aggregated) ---
     if not acc_df.empty:
-        avg_acc_dir = output_root / "Average_Accuracy"
+        avg_acc_dir = output_root / "Average_Score"
         avg_acc_dir.mkdir(parents=True, exist_ok=True)
 
         # Group by Fewshot + Experiment -> Mean Score
+        # (This now safely averages only acc_norm for tasks that had both)
         avg_df = (
             acc_df.groupby(["NUM_FEWSHOT", "EXPERIMENT"], dropna=False)["SCORE"]
             .mean()
@@ -105,9 +114,9 @@ def save_experiment_plots(df, output_root):
 
             add_labels(ax, fmt="%.4f")
 
-            plt.title(f"Average Accuracy Across All Tasks (Few-shot: {fs_label})")
+            plt.title(f"Average Score Across All Tasks (Few-shot: {fs_label})")
             plt.xticks(rotation=45, ha="right")
-            plt.ylabel("Mean Accuracy")
+            plt.ylabel("Mean Score")
             plt.tight_layout()
             plt.savefig(avg_acc_dir / f"average_fewshot_{fs_label}.png")
             plt.close()
@@ -120,7 +129,6 @@ def save_experiment_plots(df, output_root):
         ppl_dir.mkdir(parents=True, exist_ok=True)
 
         for task in ppl_df["TASK"].unique():
-            # Sort ascending for perplexity (lower is better)
             task_plot_df = ppl_df[ppl_df["TASK"] == task].sort_values(
                 "SCORE", ascending=True
             )
@@ -130,9 +138,7 @@ def save_experiment_plots(df, output_root):
                 data=task_plot_df, x="EXPERIMENT", y="SCORE", palette="rocket"
             )
 
-            add_labels(
-                ax, fmt="%.3f"
-            )  # Perplexity often needs slightly less precision, but readable
+            add_labels(ax, fmt="%.3f") 
 
             plt.title(f"Perplexity: {task}")
             plt.ylabel("Perplexity (Lower is Better)")

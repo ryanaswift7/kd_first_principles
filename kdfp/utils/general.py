@@ -1,6 +1,7 @@
 import datetime
 import gc
 import os
+from pathlib import Path
 import random
 import re
 import unicodedata
@@ -154,3 +155,8 @@ def get_timestamp() -> str:
 
 def get_hook_block_idx(hook_name: str) -> int:
     return int(hook_name.split(".")[1])
+
+def is_valid_model_dir(model_path: str | Path) -> bool:
+    """Checks if the directory contains a valid Hugging Face model."""
+    path = Path(model_path)
+    return path.exists() and (path / "config.json").exists()

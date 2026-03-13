@@ -8,6 +8,7 @@ from kdfp.schemas.configBase import ConfigBase
 class LMEvalTasks(ConfigBase):
     names: List[str]
     num_fewshots: List[int]
+    sample_limit: Optional[int] = None
 
 
 TASK_PROPERTIES = {
