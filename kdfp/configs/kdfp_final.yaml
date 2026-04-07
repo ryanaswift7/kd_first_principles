@@ -177,9 +177,8 @@ tasks:
     - sciq
     - winogrande
     - mmlu
-    - bbh
     - drop
-  num_fewshots: [0, 3]
+  num_fewshots: [0]
   sample_limit: null
 
   

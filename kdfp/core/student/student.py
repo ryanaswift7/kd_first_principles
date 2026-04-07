@@ -57,10 +57,7 @@ from kdfp.schemas.trainingParams import TrainingParams
 from kdfp.utils.data import load_data
 from kdfp.utils.enums import ProjectionDirection, ProjectionTraining, TrainingType
 from kdfp.utils.shallow_model_loading import load_shallow
-from kdfp.utils.weight_conversions.pythia_wc import (
-    convert_hooked_to_neox_weights,
-    convert_neox_to_hooked_weights,
-)
+from kdfp.utils.weight_conversions import convert_hf_to_hooked_weights, convert_hooked_to_hf_weights
 
 
 def gen_student_weights_filename() -> str:
@@ -148,8 +145,8 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
 
             print("Loading finetuned weights for teacher model...")
             # load finetuned weights, convert to transformer lens format, load into teacher
-            tl_teacher_weights = convert_neox_to_hooked_weights(
-                neox_model=teacher_hf, cfg=teacher_tl.cfg
+            tl_teacher_weights = convert_hf_to_hooked_weights(
+                teacher_hf, cfg=teacher_tl.cfg
             )
             teacher_tl.load_state_dict(tl_teacher_weights, strict=False)
         else:
@@ -769,7 +766,7 @@ class StudentModule(pl.LightningModule, MCEvalMixin):
         save_path = f"{path}/{self.model_file}"
         torch.save(student_tl_state_dict, save_path)
 
-        student_hf_state_dict, _ = convert_hooked_to_neox_weights(
+        student_hf_state_dict, _ = convert_hooked_to_hf_weights(
             self.student, cfg=self.student.cfg
         )
         if self.train_config.distill_pair.student.layer_reduction_factor:

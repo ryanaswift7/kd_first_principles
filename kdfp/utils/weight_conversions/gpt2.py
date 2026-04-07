@@ -3,7 +3,7 @@ import torch
 from transformer_lens.HookedTransformerConfig import HookedTransformerConfig
 
 
-def convert_hooked_to_gpt2_weights(tl_state_dict, cfg: HookedTransformerConfig):
+def convert_hooked_to_gpt2_weights(tl_state_dict, cfg: HookedTransformerConfig, verbose: bool = False):
     """
     Converts weights from HookedTransformer format back to GPT-2 format.
     This is the exact inverse of the convert_gpt2_weights function.

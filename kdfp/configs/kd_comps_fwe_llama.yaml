@@ -14,8 +14,8 @@ directories:
   root: results
   cache: cache
   models: models
-  ray: ray
-  lightning: lightning
+  ray: ray2
+  lightning: lightning2
 
 experiment_space:
   seeds: [3] # [3, 27, 44]

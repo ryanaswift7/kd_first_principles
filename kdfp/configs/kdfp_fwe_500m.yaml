@@ -103,7 +103,7 @@ training_params:
     force_cache_all: false
 
   wandb:
-    project: 'kdfp-fineweb-edu-500m'
+    project: 'kdfp-fwe-500m'
     group: *suite
 
 

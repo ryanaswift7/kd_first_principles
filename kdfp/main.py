@@ -1,7 +1,7 @@
 import os
 from argparse import ArgumentParser
 from typing import Optional
-
+import gc
 import pandas as pd
 import torch
 
@@ -57,6 +57,9 @@ def run_suite(suite_config_path: str):
             results_list.extend(experiment.test_student())
 
         print(f"Finished experiment {i + 1}/{n}: {experiment.cfg.name.upper()}")
+        
+        gc.collect()
+        torch.cuda.empty_cache()
 
     suite_scores_dir = suite.directories.get_suite_scores_dir(suite.suite_title)
     suite_scores_dir.mkdir(parents=True, exist_ok=True)

@@ -34,6 +34,11 @@ def jensen_shannon_divergence(
     Returns:
         torch.Tensor: A single scalar loss value with proper temperature compensation.
     """
+    # Step 0:   Cut off dead output rows
+    #           - Pythia 6.9b and 12b extend their output dim for GPU efficiency,
+    #              but still only use the same 50,277 tokens as the rest of the suite
+    teacher_logits = teacher_logits[:, :, :student_logits.shape[-1]]
+
     # Step 1: Input Validation
     assert temperature > 0, "Temperature must be positive."
     assert 0 <= beta <= 1, "Beta must be between 0 and 1."

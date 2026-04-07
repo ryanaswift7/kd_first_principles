@@ -14,8 +14,8 @@ directories:
   root: results
   cache: cache
   models: models
-  ray: ray
-  lightning: lightning
+  ray: ray0
+  lightning: lightning0
 
 experiment_space:
   seeds: [3] # [3, 27, 44]
@@ -36,7 +36,7 @@ experiment_space:
       # - "with_mlp"
       # - "with_resid"
   projection:
-    directions: ["up"]
+    directions: ["down"]
     training_methods: ["online"]
     offline_alignment_betas: [0.0]  # [0.0, 0.25, 0.5, 0.75, 1.0]
   filters:
