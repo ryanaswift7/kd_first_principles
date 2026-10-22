@@ -10,3 +10,10 @@ ray_results/
 *.pdf
 ted-redux/
 ted-results/
+iclr_fix/
+iclr_rep_sim/
+logs/
+rand_proj/
+rand_proj_redux/
+rebuttals/
+round2/
